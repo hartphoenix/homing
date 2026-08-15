@@ -116,8 +116,8 @@ p { margin: .5rem 0 1rem; }
 .detail-layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 28px; padding-bottom: 64px; }
 .detail-layout .page-heading { padding-top: 26px; }
 .detail-layout h1 { font-size: clamp(2.4rem, 5vw, 4.3rem); }
-.detail-facts { gap: 12px 24px; margin: 18px 0; }
-.detail-facts div { min-width: 110px; }
+.detail-facts { gap: 8px; margin: 18px 0; }
+.detail-facts div { min-width: 110px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255, 253, 248, .55); }
 .detail-facts dt, .attribute-list dt { color: var(--muted); font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; }
 .attribute-list div { display: grid; grid-template-columns: 150px 1fr; gap: 14px; padding: 7px 0; border-bottom: 1px solid var(--line); }
 .attribute-list dd { margin: 0; }
