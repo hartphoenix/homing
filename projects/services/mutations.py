@@ -2,7 +2,7 @@
 from django.db import transaction
 from django.utils import timezone
 from projects.models import Lead, LeadInterest, PromptRevision, Project, ProjectChange
-from .authorization import assert_editor, assert_viewer
+from .authorization import as_principal, assert_editor, assert_viewer
 
 class PromptRevisionConflict(Exception):
     def __init__(self, current_revision):
@@ -26,11 +26,33 @@ def update_project_prompt(project, *, editor, prompt, criteria, expected_revisio
 
 @transaction.atomic
 def set_interest(lead, *, user, interested=True):
-    assert_viewer(lead.project, user, scope="interest:write")
+    principal = as_principal(user)
+    assert_viewer(lead.project, principal, scope="interest:write")
+    user_obj = principal.user
     if interested:
-        obj, _ = LeadInterest.objects.get_or_create(lead=lead, user=user)
+        obj, created = LeadInterest.objects.get_or_create(lead=lead, user=user_obj)
+        # Interest is a first-class per-user change and must be visible to
+        # agents through the same durable project cursor as lead changes.
+        if created:
+            append_change(
+                lead.project,
+                "interest.set",
+                "lead",
+                str(lead.pk),
+                {"user_id": str(user_obj.pk), "interested": True},
+                principal,
+            )
         return obj
-    LeadInterest.objects.filter(lead=lead, user=user).delete()
+    deleted, _ = LeadInterest.objects.filter(lead=lead, user=user_obj).delete()
+    if deleted:
+        append_change(
+            lead.project,
+            "interest.set",
+            "lead",
+            str(lead.pk),
+            {"user_id": str(user_obj.pk), "interested": False},
+            principal,
+        )
     return None
 
 @transaction.atomic
@@ -61,13 +83,19 @@ def restore_lead(lead, *, actor):
     append_change(lead.project, "lead.restored", "lead", str(lead.pk), {}, actor)
     return lead
 
+@transaction.atomic
 def append_change(project, event_type, object_type, object_id, payload, actor=None, *, tombstone=False):
-    """Append a monotonic project cursor; caller should hold the project row lock."""
+    """Append a monotonic project cursor under a serialized project-row lock."""
+    # Lock here as a defense-in-depth guarantee.  A caller that forgot to
+    # lock the project must not be able to allocate duplicate/out-of-order
+    # sequences under concurrent writes.  The nested lock is safe for callers
+    # already inside their own atomic block.
+    locked = Project.objects.select_for_update().get(pk=project.pk)
     if actor is not None and hasattr(actor, "user"):
         user, token = actor.user, actor.token
         actor_kind = "agent" if token else "user"
     else:
         user, token, actor_kind = actor, None, "user"
-    project.latest_change_sequence += 1
-    project.save(update_fields=["latest_change_sequence", "updated_at"])
-    return ProjectChange.objects.create(project=project, sequence=project.latest_change_sequence, event_type=event_type, object_type=object_type, object_id=object_id, payload=payload or {}, tombstone=tombstone, actor=user, actor_kind=actor_kind, token_id=token.pk if token else None)
+    locked.latest_change_sequence += 1
+    locked.save(update_fields=["latest_change_sequence", "updated_at"])
+    return ProjectChange.objects.create(project=locked, sequence=locked.latest_change_sequence, event_type=event_type, object_type=object_type, object_id=object_id, payload=payload or {}, tombstone=tombstone, actor=user, actor_kind=actor_kind, token_id=token.pk if token else None)

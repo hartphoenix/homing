@@ -84,3 +84,23 @@ class AgentToken(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.token_prefix})"
+
+
+class AuthThrottle(models.Model):
+    """Hashed identity bucket used to rate-limit password endpoints.
+
+    ``key_digest`` is an HMAC-derived value; neither email addresses nor
+    client IP addresses are retained in the database.
+    """
+
+    key_digest = models.CharField(max_length=64, unique=True, editable=False)
+    failure_count = models.PositiveIntegerField(default=0)
+    window_started_at = models.DateTimeField()
+    blocked_until = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=("blocked_until",))]
+
+    def __str__(self):
+        return self.key_digest[:12]

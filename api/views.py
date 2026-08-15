@@ -1,5 +1,6 @@
 """Small, dependency-free JSON API.  All authorization is delegated to the project policy."""
 
+import hashlib
 import json
 import secrets
 import uuid
@@ -9,8 +10,9 @@ from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.contrib.auth import authenticate
+from django.contrib.auth.password_validation import validate_password
 from django.http import JsonResponse, Http404
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.utils import timezone
 from django.utils.text import slugify
 from django.db import IntegrityError, transaction
@@ -18,10 +20,12 @@ from django.db import IntegrityError, transaction
 from accounts.models import AgentToken, Profile, SavedPrompt, User
 from accounts.managers import normalize_email
 from accounts.services.tokens import create_agent_token, digest_token, revoke_agent_token
+from accounts.services.throttle import consume as consume_auth_attempt, request_keys, reset as reset_auth_attempts
 from projects.models import (
     Lead,
     LeadComment,
     Project,
+    IdempotencyKey,
     listing_identity_hash,
     ProjectInvitation,
     ProjectMembership,
@@ -34,6 +38,7 @@ from projects.services.authorization import (
     assert_editor,
     assert_owner,
     authorize_project,
+    project_is_restricted,
 )
 from projects.services.mutations import (
     PromptRevisionConflict,
@@ -75,6 +80,22 @@ def _error(request, code, message, status, fields=None):
     )
 
 
+def _rate_limited(request, retry_after):
+    return _response(
+        request,
+        {
+            "error": {
+                "code": "rate_limited",
+                "message": "Too many authentication attempts. Try again later.",
+                "fields": {},
+                "request_id": _request_id(request),
+            }
+        },
+        429,
+        {"Retry-After": str(max(1, retry_after))},
+    )
+
+
 def _body(request):
     if request.body and len(request.body) > 2_000_000:
         raise ValueError("request body is too large")
@@ -95,21 +116,46 @@ def _data(request):
 
 
 def _principal(request):
+    # A bearer credential is an explicit principal.  Never silently fall back
+    # to a browser session when an Authorization header is present: otherwise
+    # a browser carrying a session cookie could accidentally grant a scoped
+    # agent request the session user's full authority.
+    authorization = request.headers.get("Authorization", "")
+    if authorization:
+        if not authorization.startswith("Bearer "):
+            return None
+        raw = authorization[7:].strip()
+        if not raw or len(raw) > 256:
+            return None
+        token = AgentToken.objects.select_related("user").filter(digest=digest_token(raw)).first()
+        if not token or not token.is_valid:
+            return None
+        token.last_used_at = timezone.now()
+        token.save(update_fields=["last_used_at"])
+        return Principal(token.user, token)
     user = getattr(request, "user", None)
     if user is not None and user.is_authenticated:
         return Principal(user)
-    authorization = request.headers.get("Authorization", "")
-    if not authorization.startswith("Bearer "):
-        return None
-    raw = authorization[7:].strip()
-    if not raw or len(raw) > 256:
-        return None
-    token = AgentToken.objects.select_related("user").filter(digest=digest_token(raw)).first()
-    if not token or not token.is_valid:
-        return None
-    token.last_used_at = timezone.now()
-    token.save(update_fields=["last_used_at"])
-    return Principal(token.user, token)
+    return None
+
+
+def _human_only(principal):
+    """Reject account/project administration through scoped agent tokens."""
+    if principal.token:
+        raise PermissionDenied("This operation requires an authenticated session.")
+
+
+def _project_ids(value):
+    """Validate the JSON shape used for optional token restrictions."""
+    if value in (None, []):
+        return []
+    if not isinstance(value, list) or len(value) > 100:
+        raise ValueError("project_ids must be an array of at most 100 UUIDs")
+    try:
+        values = [str(uuid.UUID(str(item))) for item in value]
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("project_ids must contain UUIDs.")
+    return list(dict.fromkeys(values))
 
 
 def authenticated(view):
@@ -163,7 +209,7 @@ def _require(principal, project, role=ProjectMembership.Role.VIEWER, scope=None)
         return authorize_project(project, principal, minimum_role=role, scope=scope)
     except (Http404,):
         raise
-    except Exception as exc:
+    except ValidationError as exc:
         raise PermissionError(str(exc))
 
 
@@ -220,11 +266,14 @@ def project_json(project, membership=None):
 def lead_json(lead, viewer=None, include_interest=True):
     names = []
     if include_interest:
-        for interest in lead.interests.select_related("user__profile").all():
+        # Interest intentionally survives membership removal, but removed
+        # members must not remain visible in group projections.  It becomes
+        # visible again if the membership is later restored.
+        for interest in lead.interests.select_related("user__profile").filter(
+            user__project_memberships__project_id=lead.project_id
+        ).distinct():
             profile = getattr(interest.user, "profile", None)
-            names.append(
-                profile.display_name or interest.user.email if profile else interest.user.email
-            )
+            names.append(profile.display_name if profile and profile.display_name else "Member")
     return {
         "id": str(lead.pk),
         "project_id": str(lead.project_id),
@@ -249,6 +298,13 @@ def lead_json(lead, viewer=None, include_interest=True):
         "verification_notes": lead.verification_notes,
         "status": lead.status,
         "trash_reason": lead.trash_reason or None,
+        "trashed_at": _iso(lead.trashed_at),
+        "trashed_by": (
+            getattr(getattr(lead.trashed_by, "profile", None), "display_name", "")
+            or "Member"
+            if lead.trashed_by_id
+            else None
+        ),
         "interested_users": names,
         "comment_count": lead.comments.filter(deleted_at__isnull=True).count(),
         "revision": lead.revision,
@@ -278,6 +334,63 @@ def run_json(run):
     }
 
 
+def _completion_matches(run, data):
+    """Compare a retry with the durable completion representation."""
+    return (
+        run.status == data.get("status")
+        and run.output_cursor == str(data.get("output_cursor", ""))[:500]
+        and run.continuation == (data.get("continuation") or {})
+        and run.result_counts == (data.get("result_counts") or {})
+        and run.summary == str(data.get("summary", ""))[:10000]
+    )
+
+
+def _request_hash(data):
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _reserve_idempotency(request, principal, key, data):
+    """Reserve/replay a durable write response inside the caller's transaction."""
+    now = timezone.now()
+    digest = _request_hash(data)
+    record = (
+        IdempotencyKey.objects.select_for_update()
+        .filter(
+            user=principal.user,
+            token=principal.token,
+            endpoint=request.path[:200],
+            key=key,
+        )
+        .first()
+    )
+    if record:
+        if record.expires_at > now and record.request_hash != digest:
+            return None, _error(
+                request,
+                "idempotency_key_reused",
+                "The idempotency key was already used with a different request.",
+                409,
+            )
+        if record.expires_at > now and record.response_body is not None:
+            return record, _response(request, record.response_body, record.response_status or 200)
+        record.request_hash = digest
+        record.response_body = None
+        record.response_status = None
+        record.expires_at = now + timedelta(days=7)
+        record.save(update_fields=["request_hash", "response_body", "response_status", "expires_at"])
+        return record, None
+    record = IdempotencyKey.objects.create(
+        user=principal.user,
+        token=principal.token,
+        endpoint=request.path[:200],
+        key=key,
+        request_hash=digest,
+        expires_at=now + timedelta(days=7),
+    )
+    return record, None
+
+
 @_json(auth=False)
 def register(request):
     if request.method != "POST":
@@ -286,15 +399,32 @@ def register(request):
         return _error(request, "registration_disabled", "Registration is disabled.", 403)
     data, error = _data(request)
     if error:
+        blocked, retry_after = consume_auth_attempt(request_keys(request))
+        if blocked:
+            return _rate_limited(request, retry_after)
         return error
     email = normalize_email(str(data.get("email", "")))
     password = str(data.get("password", ""))
+    keys = request_keys(request, email)
+    blocked, retry_after = consume_auth_attempt(keys)
+    if blocked:
+        return _rate_limited(request, retry_after)
     if len(password) < 12 or "@" not in email:
         raise ValueError("A valid email and password of at least 12 characters are required.")
+    try:
+        validate_password(password, User(email=email))
+    except Exception as exc:
+        # Password validators expose only a safe validation message; never
+        # return a stack trace or account existence detail.
+        raise ValueError(str(exc)) from exc
     if User.objects.filter(email=email).exists():
-        return _error(request, "email_exists", "Unable to register with these details.", 409)
+        # Do not disclose whether an account exists.  Registration clients can
+        # treat this generic validation response the same as any other failed
+        # registration (invitation flows do not depend on this response).
+        return _error(request, "registration_unavailable", "Unable to register with these details.", 422)
     user = User.objects.create_user(email=email, password=password)
     Profile.objects.create(user=user, display_name=str(data.get("display_name", ""))[:120])
+    reset_auth_attempts(keys)
     return _response(request, user_json(user), 201)
 
 
@@ -304,14 +434,25 @@ def token_exchange(request):
         return _error(request, "method_not_allowed", "POST required", 405)
     data, error = _data(request)
     if error:
+        blocked, retry_after = consume_auth_attempt(request_keys(request))
+        if blocked:
+            return _rate_limited(request, retry_after)
         return error
+    email = normalize_email(str(data.get("email", "")))
+    keys = request_keys(request, email)
+    blocked, retry_after = consume_auth_attempt(keys)
+    if blocked:
+        return _rate_limited(request, retry_after)
     user = authenticate(
         request,
-        username=normalize_email(str(data.get("email", ""))),
+        username=email,
         password=data.get("password", ""),
     )
     if not user or not user.is_active:
+        # Consume has already recorded the failed attempt.  Keep the response
+        # generic so this endpoint cannot enumerate accounts.
         return _error(request, "unauthorized", "Invalid credentials.", 401)
+    reset_auth_attempts(keys)
     scopes = set(
         data.get("scopes")
         or [
@@ -328,11 +469,7 @@ def token_exchange(request):
     )
     if not scopes.issubset(SCOPES):
         raise ValueError("Unknown scope.")
-    project_ids = data.get("project_ids") or []
-    try:
-        [uuid.UUID(str(v)) for v in project_ids]
-    except (ValueError, TypeError):
-        raise ValueError("project_ids must contain UUIDs.")
+    project_ids = _project_ids(data.get("project_ids"))
     token, raw = create_agent_token(
         user=user,
         name=str(data.get("name") or "password exchange")[:120],
@@ -355,6 +492,7 @@ def token_exchange(request):
 @authenticated
 @endpoint
 def tokens(request):
+    _human_only(request.principal)
     if request.method == "GET":
         if request.principal.token and "profile:read" not in request.principal.token.scopes:
             return _error(request, "forbidden", "Token lacks the required scope.", 403)
@@ -388,7 +526,7 @@ def tokens(request):
         user=request.principal.user,
         name=str(data["name"])[:120],
         scopes=scopes,
-        project_ids=data.get("project_ids"),
+        project_ids=_project_ids(data.get("project_ids")),
         expires_at=expires,
     )
     return _response(
@@ -432,6 +570,7 @@ def profile(request):
         return _response(request, profile_json(profile_obj))
     if request.method != "PATCH":
         return _error(request, "method_not_allowed", "GET or PATCH required", 405)
+    _human_only(request.principal)
     data, error = _data(request)
     if error:
         return error
@@ -471,6 +610,7 @@ def saved_prompts(request):
         )
     if request.method != "POST":
         return _error(request, "method_not_allowed", "GET or POST required", 405)
+    _human_only(request.principal)
     data, error = _data(request)
     if error:
         return error
@@ -497,6 +637,7 @@ def _project_list(request):
             project_json(m.project, m)
             for m in memberships
             if m.project.status != Project.Status.TRASHED
+            and not project_is_restricted(m.project, request.principal.token)
         ]
     }
 
@@ -516,6 +657,7 @@ def projects(request):
         return _response(request, _project_list(request))
     if request.method != "POST":
         return _error(request, "method_not_allowed", "GET or POST required", 405)
+    _human_only(request.principal)
     data, error = _data(request)
     if error:
         return error
@@ -559,18 +701,29 @@ def project_detail(request, project_id):
         )
     if request.method != "PATCH":
         return _error(request, "method_not_allowed", "GET or PATCH required", 405)
+    _human_only(request.principal)
     assert_editor(project, request.principal)
     data, error = _data(request)
     if error:
         return error
-    for field in ("name", "description"):
-        if field in data:
-            setattr(project, field, str(data[field])[: 10000 if field == "description" else 200])
-    if "status" in data:
-        if data["status"] not in ("active", "trashed"):
-            raise ValueError("invalid status")
-        project.status = data["status"]
-    project.save()
+    with transaction.atomic():
+        project = Project.objects.select_for_update().get(pk=project.pk)
+        for field in ("name", "description"):
+            if field in data:
+                setattr(project, field, str(data[field])[: 10000 if field == "description" else 200])
+        if "status" in data:
+            if data["status"] not in ("active", "trashed"):
+                raise ValueError("invalid status")
+            project.status = data["status"]
+        project.save()
+        append_change(
+            project,
+            "project.updated",
+            "project",
+            str(project.pk),
+            {"fields": sorted(k for k in data if k in {"name", "description", "status"})},
+            request.principal,
+        )
     return _response(
         request, project_json(project, project.memberships.get(user=request.principal.user))
     )
@@ -587,7 +740,10 @@ def members(request, project_id):
                 "items": [
                     {
                         "user_id": str(m.user_id),
-                        "display_name": getattr(m.user.profile, "display_name", "") or m.user.email,
+                        "display_name": (
+                            getattr(getattr(m.user, "profile", None), "display_name", "")
+                            or "Member"
+                        ),
                         "role": m.role,
                     }
                     for m in project.memberships.select_related("user__profile")
@@ -596,25 +752,40 @@ def members(request, project_id):
         )
     if request.method != "PATCH":
         return _error(request, "method_not_allowed", "GET or PATCH required", 405)
+    _human_only(request.principal)
     assert_owner(project, request.principal)
     data, error = _data(request)
     if error:
         return error
     try:
-        member = project.memberships.get(user_id=data["user_id"])
-    except (KeyError, ProjectMembership.DoesNotExist):
+        member_id = data["user_id"]
+    except KeyError:
         raise Http404
     role = data.get("role")
     if role not in ProjectMembership.Role.values:
         raise ValueError("invalid role")
-    if (
-        member.role == ProjectMembership.Role.OWNER
-        and role != member.role
-        and project.memberships.filter(role="owner").count() == 1
-    ):
-        return _error(request, "final_owner", "A project must retain an owner.", 409)
-    member.role = role
-    member.save(update_fields=["role"])
+    with transaction.atomic():
+        project = Project.objects.select_for_update().get(pk=project.pk)
+        try:
+            member = project.memberships.select_for_update().get(user_id=member_id)
+        except ProjectMembership.DoesNotExist:
+            raise Http404
+        if (
+            member.role == ProjectMembership.Role.OWNER
+            and role != member.role
+            and project.memberships.filter(role="owner").count() == 1
+        ):
+            return _error(request, "final_owner", "A project must retain an owner.", 409)
+        member.role = role
+        member.save(update_fields=["role"])
+        append_change(
+            project,
+            "membership.role_changed",
+            "membership",
+            str(member.user_id),
+            {"user_id": str(member.user_id), "role": role},
+            request.principal,
+        )
     return _response(request, {"user_id": str(member.user_id), "role": member.role})
 
 
@@ -626,6 +797,7 @@ def invitations(request, project_id):
     )
     if request.method != "POST":
         return _error(request, "method_not_allowed", "POST required", 405)
+    _human_only(request.principal)
     data, error = _data(request)
     if error:
         return error
@@ -633,14 +805,24 @@ def invitations(request, project_id):
     if "@" not in email or role not in ("editor", "viewer"):
         raise ValueError("valid email and role are required")
     raw = secrets.token_urlsafe(32)
-    invitation = ProjectInvitation.objects.create(
-        project=project,
-        invited_email=email,
-        role=role,
-        inviter=request.principal.user,
-        token_digest=digest_token(raw),
-        expires_at=timezone.now() + timedelta(days=7),
-    )
+    with transaction.atomic():
+        locked = Project.objects.select_for_update().get(pk=project.pk)
+        invitation = ProjectInvitation.objects.create(
+            project=locked,
+            invited_email=email,
+            role=role,
+            inviter=request.principal.user,
+            token_digest=digest_token(raw),
+            expires_at=timezone.now() + timedelta(days=7),
+        )
+        append_change(
+            locked,
+            "invitation.created",
+            "invitation",
+            str(invitation.pk),
+            {"role": role},
+            request.principal,
+        )
     return _response(
         request,
         {
@@ -658,6 +840,7 @@ def invitations(request, project_id):
 def accept_invitation(request, invitation_token):
     if request.method != "POST":
         return _error(request, "method_not_allowed", "POST required", 405)
+    _human_only(request.principal)
     with transaction.atomic():
         invitation = (
             ProjectInvitation.objects.select_for_update()
@@ -667,18 +850,36 @@ def accept_invitation(request, invitation_token):
         if not invitation or not invitation.is_pending:
             raise Http404
         if normalize_email(request.principal.user.email) != invitation.invited_email:
-            return _error(
-                request,
-                "invited_email_mismatch",
-                "This invitation belongs to another account.",
-                409,
-            )
-        if not invitation.project.memberships.filter(user=request.principal.user).exists():
+            # A valid invitation token is still a secret.  Do not let a
+            # logged-in non-recipient use it as an oracle.
+            raise Http404
+        project = Project.objects.select_for_update().get(pk=invitation.project_id)
+        if not invitation.inviter.is_active or not project.memberships.filter(
+            user_id=invitation.inviter_id, role=ProjectMembership.Role.OWNER
+        ).exists():
+            raise Http404
+        if not project.memberships.filter(user=request.principal.user).exists():
             ProjectMembership.objects.create(
-                project=invitation.project, user=request.principal.user, role=invitation.role
+                project=project, user=request.principal.user, role=invitation.role
+            )
+            append_change(
+                project,
+                "membership.joined",
+                "membership",
+                str(request.principal.user.pk),
+                {"user_id": str(request.principal.user.pk), "role": invitation.role},
+                request.principal,
             )
         invitation.accepted_at = timezone.now()
         invitation.save(update_fields=["accepted_at"])
+        append_change(
+            project,
+            "invitation.accepted",
+            "invitation",
+            str(invitation.pk),
+            {"user_id": str(request.principal.user.pk)},
+            request.principal,
+        )
     return _response(request, None, 204)
 
 
@@ -698,6 +899,7 @@ def prompt(request, project_id):
         )
     if request.method != "PUT":
         return _error(request, "method_not_allowed", "GET or PUT required", 405)
+    _human_only(request.principal)
     data, error = _data(request)
     if error:
         return error
@@ -805,18 +1007,37 @@ def search_runs(request, project_id):
             user=request.principal.user, idempotency_key=idem
         ).first()
         if existing:
+            requested_label = str(data.get("agent_label", ""))[:160]
+            requested_cursor = str(data.get("input_cursor", ""))[:500]
+            if existing.agent_label != requested_label or existing.input_cursor != requested_cursor:
+                return _error(
+                    request,
+                    "idempotency_key_reused",
+                    "The idempotency key was already used with a different request.",
+                    409,
+                )
             return _response(request, run_json(existing), 201)
-    run = SearchRun.objects.create(
-        project=project,
-        user=request.principal.user,
-        agent_token=request.principal.token,
-        agent_label=str(data.get("agent_label", ""))[:160],
-        prompt_revision=project.prompt_revision,
-        prompt_snapshot=project.prompt,
-        criteria_snapshot=project.criteria,
-        input_cursor=str(data.get("input_cursor", ""))[:500],
-        idempotency_key=idem,
-    )
+    with transaction.atomic():
+        project = Project.objects.select_for_update().get(pk=project.pk)
+        run = SearchRun.objects.create(
+            project=project,
+            user=request.principal.user,
+            agent_token=request.principal.token,
+            agent_label=str(data.get("agent_label", ""))[:160],
+            prompt_revision=project.prompt_revision,
+            prompt_snapshot=project.prompt,
+            criteria_snapshot=project.criteria,
+            input_cursor=str(data.get("input_cursor", ""))[:500],
+            idempotency_key=idem,
+        )
+        append_change(
+            project,
+            "run.created",
+            "search_run",
+            str(run.pk),
+            {"status": run.status, "prompt_revision": run.prompt_revision},
+            request.principal,
+        )
     return _response(request, run_json(run), 201)
 
 
@@ -831,6 +1052,9 @@ def search_run_detail(request, project_id, run_id):
 
 def _check_run(request, project_id, run_id):
     project = _project(request, project_id, role=ProjectMembership.Role.VIEWER, scope="runs:write")
+    # Serialize lease decisions on the project row.  Locking only the target
+    # run allows two workers to claim different runs concurrently.
+    project = Project.objects.select_for_update().get(pk=project.pk)
     try:
         run = project.search_runs.select_for_update().get(pk=run_id)
     except SearchRun.DoesNotExist:
@@ -874,6 +1098,14 @@ def claim_run(request, project_id, run_id):
                 "updated_at",
             ]
         )
+        append_change(
+            project,
+            "run.claimed",
+            "search_run",
+            str(run.pk),
+            {"status": run.status, "attempt_count": run.attempt_count},
+            request.principal,
+        )
     return _response(
         request, {"claim_token": run.claim_token, "lease_expires_at": _iso(run.lease_expires_at)}
     )
@@ -907,6 +1139,14 @@ def heartbeat_run(request, project_id, run_id):
         run.status = SearchRun.Status.RUNNING
         run.lease_expires_at = timezone.now() + timedelta(minutes=5)
         run.save(update_fields=["status", "lease_expires_at", "updated_at"])
+        append_change(
+            project,
+            "run.heartbeat",
+            "search_run",
+            str(run.pk),
+            {"status": run.status},
+            request.principal,
+        )
     return _response(
         request, {"lease_expires_at": _iso(run.lease_expires_at), "status": run.status}
     )
@@ -922,10 +1162,29 @@ def complete_run(request, project_id, run_id):
         return error
     if data.get("status") not in ("completed", "failed"):
         raise ValueError("status must be completed or failed")
+    idem = request.headers.get("Idempotency-Key", "")[:200]
+    if not idem:
+        raise ValueError("Idempotency-Key is required when completing a run")
     with transaction.atomic():
         project, run = _check_run(request, project_id, run_id)
+        idempotency, replay = _reserve_idempotency(
+            request, request.principal, idem, data
+        )
+        if replay is not None:
+            return replay
         if run.status in ("completed", "failed"):
-            return _response(request, run_json(run))
+            if not _completion_matches(run, data):
+                return _error(
+                    request,
+                    "idempotency_key_reused",
+                    "The run was already completed with a different payload.",
+                    409,
+                )
+            body = run_json(run)
+            idempotency.response_status = 200
+            idempotency.response_body = body
+            idempotency.save(update_fields=["response_status", "response_body"])
+            return _response(request, body)
         if (
             run.claim_token != data["claim_token"]
             or not run.lease_expires_at
@@ -951,7 +1210,19 @@ def complete_run(request, project_id, run_id):
                 "updated_at",
             ]
         )
-    return _response(request, run_json(run))
+        append_change(
+            project,
+            "run.completed",
+            "search_run",
+            str(run.pk),
+            {"status": run.status},
+            request.principal,
+        )
+        body = run_json(run)
+        idempotency.response_status = 200
+        idempotency.response_body = body
+        idempotency.save(update_fields=["response_status", "response_body"])
+    return _response(request, body)
 
 
 def _lead_for(request, project_id, lead_id, scope="leads:read", role=ProjectMembership.Role.VIEWER):
@@ -1037,7 +1308,11 @@ def leads(request, project_id):
     project = _project(
         request,
         project_id,
-        role=ProjectMembership.Role.VIEWER,
+        role=(
+            ProjectMembership.Role.VIEWER
+            if request.method == "GET"
+            else ProjectMembership.Role.EDITOR
+        ),
         scope="leads:read" if request.method == "GET" else "leads:write",
     )
     if request.method == "GET":
@@ -1077,10 +1352,10 @@ def leads(request, project_id):
         return _error(
             request, "identity_conflict", "A lead with this source identity already exists.", 409
         )
-    vals.update(project=project, creator=request.principal.user)
-    lead = Lead.objects.create(**vals)
     with transaction.atomic():
         locked = Project.objects.select_for_update().get(pk=project.pk)
+        vals.update(project=locked, creator=request.principal.user)
+        lead = Lead.objects.create(**vals)
         append_change(
             locked,
             "lead.created",
@@ -1123,6 +1398,15 @@ def bulk_upsert(request, project_id):
                 continue
             if lead:
                 expected = item.get("if_match")
+                if not expected:
+                    results.append(
+                        {
+                            "index": index,
+                            "outcome": "conflict",
+                            "error": {"code": "if_match_required", "message": "if_match is required when updating an existing lead."},
+                        }
+                    )
+                    continue
                 if expected and expected.strip('"') != str(lead.revision):
                     results.append(
                         {
@@ -1132,20 +1416,50 @@ def bulk_upsert(request, project_id):
                         }
                     )
                     continue
-                changed = any(getattr(lead, k) != v for k, v in vals.items())
-                if changed:
-                    for key, value in vals.items():
-                        setattr(lead, key, value)
-                    lead.revision += 1
-                    lead.save()
-                    results.append({"index": index, "outcome": "updated", "lead": lead_json(lead)})
-                else:
-                    results.append(
-                        {"index": index, "outcome": "unchanged", "lead": lead_json(lead)}
-                    )
+                with transaction.atomic():
+                    lead = Lead.objects.select_for_update().get(pk=lead.pk)
+                    # Re-check after locking so an interleaved human edit
+                    # cannot be silently overwritten.
+                    if expected and expected.strip('"') != str(lead.revision):
+                        results.append(
+                            {
+                                "index": index,
+                                "outcome": "conflict",
+                                "error": {"code": "stale_write", "message": "Revision mismatch."},
+                            }
+                        )
+                        continue
+                    changed = any(getattr(lead, k) != v for k, v in vals.items())
+                    if changed:
+                        for key, value in vals.items():
+                            setattr(lead, key, value)
+                        lead.revision += 1
+                        lead.save()
+                        append_change(
+                            lead.project,
+                            "lead.updated",
+                            "lead",
+                            str(lead.pk),
+                            {"revision": lead.revision},
+                            request.principal,
+                        )
+                        results.append({"index": index, "outcome": "updated", "lead": lead_json(lead)})
+                    else:
+                        results.append(
+                            {"index": index, "outcome": "unchanged", "lead": lead_json(lead)}
+                        )
             else:
-                lead = Lead.objects.create(project=project, creator=request.principal.user, **vals)
-                results.append({"index": index, "outcome": "created", "lead": lead_json(lead)})
+                with transaction.atomic():
+                    lead = Lead.objects.create(project=project, creator=request.principal.user, **vals)
+                    append_change(
+                        project,
+                        "lead.created",
+                        "lead",
+                        str(lead.pk),
+                        {"revision": lead.revision},
+                        request.principal,
+                    )
+                    results.append({"index": index, "outcome": "created", "lead": lead_json(lead)})
         except (ValueError, IntegrityError) as exc:
             results.append(
                 {
@@ -1161,7 +1475,13 @@ def bulk_upsert(request, project_id):
 @endpoint
 def lead_detail(request, project_id, lead_id):
     project, lead = _lead_for(
-        request, project_id, lead_id, "leads:read" if request.method == "GET" else "leads:write"
+        request,
+        project_id,
+        lead_id,
+        "leads:read" if request.method == "GET" else "leads:write",
+        ProjectMembership.Role.VIEWER
+        if request.method == "GET"
+        else ProjectMembership.Role.EDITOR,
     )
     if request.method == "GET":
         return _response(request, lead_json(lead, request.principal), headers={"ETag": lead.etag})
@@ -1187,10 +1507,22 @@ def lead_detail(request, project_id, lead_id):
     vals = _lead_values(data, partial=True)
     vals.pop("source", None)
     vals.pop("source_listing_id", None)
-    for key, value in vals.items():
-        setattr(lead, key, value)
-    lead.revision += 1
-    lead.save()
+    with transaction.atomic():
+        lead = Lead.objects.select_for_update().get(pk=lead.pk)
+        if lead.revision != int(request.headers["If-Match"].strip('"')):
+            return _error(request, "stale_write", "Lead changed since it was read.", 409)
+        for key, value in vals.items():
+            setattr(lead, key, value)
+        lead.revision += 1
+        lead.save()
+        append_change(
+            project,
+            "lead.updated",
+            "lead",
+            str(lead.pk),
+            {"revision": lead.revision},
+            request.principal,
+        )
     return _response(request, lead_json(lead), headers={"ETag": lead.etag})
 
 
@@ -1213,9 +1545,7 @@ def comment_json(comment):
         "id": comment.id,
         "body": comment.body,
         "author_id": str(comment.author_id),
-        "author_display_name": profile.display_name or comment.author.email
-        if profile
-        else comment.author.email,
+        "author_display_name": profile.display_name if profile and profile.display_name else "Member",
         "created_at": _iso(comment.created_at),
         "edited_at": _iso(comment.edited_at),
         "deleted_at": _iso(comment.deleted_at),
@@ -1251,9 +1581,9 @@ def comments(request, project_id, lead_id):
     body = str(data.get("body", ""))
     if not body.strip() or len(body) > 10000:
         raise ValueError("body must contain 1 to 10000 characters")
-    comment = LeadComment.objects.create(lead=lead, author=request.principal.user, body=body)
     with transaction.atomic():
         locked = Project.objects.select_for_update().get(pk=project.pk)
+        comment = LeadComment.objects.create(lead=lead, author=request.principal.user, body=body)
         append_change(locked, "comment.created", "comment", str(comment.pk), {}, request.principal)
     return _response(request, comment_json(comment), 201)
 
@@ -1266,6 +1596,8 @@ def comment_detail(request, project_id, lead_id, comment_id):
         comment = lead.comments.get(pk=comment_id)
     except LeadComment.DoesNotExist:
         raise Http404
+    if comment.deleted_at:
+        raise Http404
     owner = comment.author_id == request.principal.user.pk
     membership = project.memberships.get(user=request.principal.user)
     if not owner and membership.role != ProjectMembership.Role.OWNER:
@@ -1277,13 +1609,29 @@ def comment_detail(request, project_id, lead_id, comment_id):
         body = str(data.get("body", ""))
         if not body.strip() or len(body) > 10000:
             raise ValueError("body must contain 1 to 10000 characters")
-        comment.body = body
-        comment.edited_at = timezone.now()
-        comment.save(update_fields=["body", "edited_at"])
+        with transaction.atomic():
+            locked = Project.objects.select_for_update().get(pk=project.pk)
+            comment = LeadComment.objects.select_for_update().get(pk=comment.pk)
+            comment.body = body
+            comment.edited_at = timezone.now()
+            comment.save(update_fields=["body", "edited_at"])
+            append_change(locked, "comment.updated", "comment", str(comment.pk), {}, request.principal)
         return _response(request, comment_json(comment))
     if request.method == "DELETE":
-        comment.deleted_at = timezone.now()
-        comment.save(update_fields=["deleted_at"])
+        with transaction.atomic():
+            locked = Project.objects.select_for_update().get(pk=project.pk)
+            comment = LeadComment.objects.select_for_update().get(pk=comment.pk)
+            comment.deleted_at = timezone.now()
+            comment.save(update_fields=["deleted_at"])
+            append_change(
+                locked,
+                "comment.deleted",
+                "comment",
+                str(comment.pk),
+                {},
+                request.principal,
+                tombstone=True,
+            )
         return _response(request, None, 204)
     return _error(request, "method_not_allowed", "PATCH or DELETE required", 405)
 
@@ -1291,7 +1639,7 @@ def comment_detail(request, project_id, lead_id, comment_id):
 @authenticated
 @endpoint
 def interested(request, project_id):
-    project = _project(request, project_id, scope="leads:read")
+    project = _project(request, project_id, scope="interest:read")
     if request.method != "GET":
         return _error(request, "method_not_allowed", "GET required", 405)
     query = project.leads.filter(status=Lead.Status.ACTIVE)
@@ -1299,7 +1647,9 @@ def interested(request, project_id):
     if by == "me":
         query = query.filter(interests__user=request.principal.user)
     elif by == "any":
-        query = query.filter(interests__isnull=False)
+        query = query.filter(
+            interests__user__project_memberships__project_id=project.pk
+        )
     else:
         if not by.startswith("user:"):
             raise ValueError("interested_by must be me, any, or user:UUID")
