@@ -7,7 +7,7 @@
 		output stdout
 		format json
 		sampling {
-			interval 1m
+			interval 60s
 			first 100
 			thereafter 100
 		}
