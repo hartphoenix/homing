@@ -7,7 +7,7 @@ case "$base_url" in
   *) echo "base URL must begin with http:// or https://" >&2; exit 2 ;;
 esac
 
-python - "$base_url" <<'PY'
+python3 - "$base_url" <<'PY'
 import sys
 import urllib.error
 import urllib.request
@@ -22,4 +22,3 @@ for path in ("/health/live", "/health/ready"):
         raise SystemExit(f"{path}: HTTP {error.code}")
 print("health checks passed")
 PY
-

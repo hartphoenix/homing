@@ -6,11 +6,6 @@
 	log {
 		output stdout
 		format json
-		sampling {
-			interval 60s
-			first 100
-			thereafter 100
-		}
 	}
 
 	header {
