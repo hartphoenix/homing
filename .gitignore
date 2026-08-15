@@ -11,10 +11,10 @@ __pycache__/
 .coverage
 htmlcov/
 .venv/
+*.egg-info/
 backups/
 staticfiles/
 media/
 *.age
 *.dump
 *.sql
-

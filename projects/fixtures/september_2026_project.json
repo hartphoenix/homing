@@ -1,0 +1,19 @@
+{
+  "name": "September 2026 sublet",
+  "slug": "september-2026-sublet",
+  "description": "An ongoing search for an exactly-September 2026 sublet.",
+  "prompt": "Find as many qualifying September 2026 sublet leads as possible. The stay must be exactly September 1–30, 2026, with very little move-in/move-out flexibility. Prefer a location near 39 Saint Felix St in Brooklyn or near 124th St and Manhattan Ave; the workplace is 302 W 124th St. A one-bedroom should be $2,500/month or less. A shared apartment is welcome when roommates can be vetted and seem nice and chill, with below $2,000/month ideal. Consider radically different neighborhoods when the commute to work is 45 minutes or less. A guest or crashing arrangement must be possible. Proximity to parks is a bonus. Do not disqualify a lead when a criterion is unknown; disqualify only an explicit contradiction. Record the direct listing URL, source, price, dates, location, housing type, commute/guest unknowns, and park proximity. Continue this project in later search runs and preserve existing leads and user annotations.",
+  "criteria": {
+    "stay_start": "2026-09-01",
+    "stay_end": "2026-09-30",
+    "move_in_out_flexibility": "very little",
+    "preferred_locations": ["39 Saint Felix St, Brooklyn 11217", "124th St and Manhattan Ave"],
+    "workplace": "302 W 124th St, New York, NY",
+    "max_entire_monthly_usd": 2500,
+    "ideal_shared_monthly_usd": 2000,
+    "max_commute_minutes": 45,
+    "guests_required": true,
+    "parks_preferred": true,
+    "unknowns_are_allowed": true
+  }
+}
