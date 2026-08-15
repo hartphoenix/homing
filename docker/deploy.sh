@@ -23,6 +23,8 @@ docker compose --env-file .env build --pull web
 # here rather than assuming the database process is accepting connections.
 docker compose --env-file .env up --detach --wait db
 docker compose --env-file .env run --rm --no-deps web /opt/app/docker/migrate-with-lock.sh python manage.py migrate --noinput
-docker compose --env-file .env run --rm --no-deps web /opt/app/docker/migrate-with-lock.sh python manage.py collectstatic --noinput
+# Static assets are collected and fingerprinted during the image build. The
+# runtime container is intentionally read-only, so repeating collectstatic here
+# would fail as soon as post-processing needs to replace an existing asset.
 docker compose --env-file .env up --detach --remove-orphans web caddy
 docker compose --env-file .env ps
