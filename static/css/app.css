@@ -142,17 +142,38 @@ p { margin: .5rem 0 1rem; }
 .danger-link { color: var(--red); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 
+.agent-heading .muted { max-width: 720px; }
+.setup-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.setup-step { position: relative; padding: 26px; }
+.setup-step h2 { padding-right: 42px; font-size: 1.55rem; }
+.setup-wide { grid-column: 1 / -1; }
+.step-number { position: absolute; top: 20px; right: 22px; display: grid; width: 32px; height: 32px; place-items: center; color: var(--green); border: 1px solid #b8d4c5; border-radius: 50%; background: var(--green-soft); font: 800 .82rem system-ui, sans-serif; }
+.secret-callout { margin-top: 20px; padding: 16px; border: 1px solid #b8d4c5; border-radius: 9px; background: var(--green-soft); }
+.secret-callout p:last-of-type { margin-bottom: 10px; }
+.copy-field { display: flex; gap: 8px; }
+.copy-field input { flex: 1; min-width: 0; padding: 10px 12px; border: 1px solid #a5c7b5; border-radius: 8px; background: var(--card); }
+.agent-actions { display: flex; flex-wrap: wrap; gap: 9px; margin: 20px 0; }
+.prompt-preview { margin-top: 18px; border-top: 1px solid var(--line); }
+.prompt-preview summary { padding: 14px 0 4px; color: var(--green); font-weight: 700; cursor: pointer; }
+.prompt-preview textarea { width: 100%; margin-top: 10px; padding: 12px; color: #344139; border: 1px solid var(--line); border-radius: 8px; background: #faf9f4; font: .82rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; resize: vertical; }
+.token-panel { margin: 0 0 52px; }
+
 @media (max-width: 720px) {
   .shell { width: min(100% - 24px, 1180px); }
   .page-heading { align-items: start; flex-direction: column; padding-top: 34px; }
   h1 { font-size: clamp(2.6rem, 14vw, 4.5rem); }
   .lead-list { grid-template-columns: 1fr; }
   .detail-layout, .settings-grid { display: block; }
+  .setup-grid { grid-template-columns: 1fr; }
+  .setup-wide { grid-column: auto; }
   .comments { margin-top: 24px; padding: 22px 0 0; border-top: 1px solid var(--line); border-left: 0; }
   .stat-grid { gap: 8px; }
   .project-nav { gap: 13px; }
   .auth-card { margin: 32px auto; }
   .site-header nav a { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .header-inner { align-items: flex-start; padding: 12px 0; }
+  .site-header nav { justify-content: flex-end; flex-wrap: wrap; row-gap: 7px; }
+  .site-header nav a { max-width: 120px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

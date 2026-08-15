@@ -1,8 +1,10 @@
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
-from accounts.models import User
-from projects.models import Lead, LeadComment, LeadInterest, Project, ProjectMembership
+from accounts.models import AgentToken, User
+from accounts.services.tokens import digest_token
+from projects.models import AuditEvent, Lead, LeadComment, LeadInterest, Project, ProjectMembership
+from projects.services.authorization import SCOPES
 from tracker.forms import LeadForm, RegisterForm
 
 
@@ -83,6 +85,70 @@ class TrackerWebFlowTests(TestCase):
         self.login_as(self.outsider)
         response = self.client.get(reverse("tracker:lead-list", args=[self.project.slug]))
         self.assertEqual(response.status_code, 404)
+
+    def test_agent_setup_creates_user_wide_token_and_shows_secret_once(self):
+        self.login_as(self.owner)
+        response = self.client.post(
+            reverse("tracker:agent-setup"),
+            {"name": "Living-room agent", "expires_at": ""},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Cache-Control"], "private, no-store")
+        token = AgentToken.objects.get(user=self.owner, name="Living-room agent")
+        self.assertEqual(token.project_ids, [])
+        self.assertEqual(set(token.scopes), SCOPES)
+        audit = AuditEvent.objects.get(action="agent_token.created", token_id=token.pk)
+        self.assertEqual(audit.actor, self.owner)
+        self.assertNotIn("token", audit.summary)
+
+        secret = response.context["new_token"]
+        self.assertTrue(secret)
+        self.assertEqual(token.digest, digest_token(secret))
+        self.assertNotIn(secret, response.context["agent_prompt"])
+
+        later_project = Project.objects.create(
+            name="Later search", slug="later-search", creator=self.owner
+        )
+        ProjectMembership.objects.create(
+            project=later_project, user=self.owner, role=ProjectMembership.Role.OWNER
+        )
+        portfolio = self.client.get(
+            "/api/v1/me/projects", HTTP_AUTHORIZATION=f"Bearer {secret}"
+        )
+        self.assertEqual(portfolio.status_code, 200)
+        self.assertEqual(
+            {item["id"] for item in portfolio.json()["items"]},
+            {str(self.project.pk), str(later_project.pk)},
+        )
+
+        later_page = self.client.get(reverse("tracker:agent-setup"))
+        self.assertIsNone(later_page.context["new_token"])
+        self.assertNotContains(later_page, secret)
+
+    @override_settings(PUBLIC_BASE_URL="https://homing.example")
+    def test_agent_skill_is_valid_secret_free_download(self):
+        self.login_as(self.owner)
+        response = self.client.get(reverse("tracker:agent-skill-download"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Disposition"], 'attachment; filename="SKILL.md"')
+        self.assertEqual(response["Cache-Control"], "private, no-store")
+        self.assertEqual(response["Vary"], "Cookie")
+        body = response.content.decode()
+        self.assertTrue(body.startswith("---\nname: use-homing\ndescription:"))
+        self.assertIn("HOMING_API_TOKEN", body)
+        self.assertIn("https://homing.example/api/v1", body)
+        self.assertIn("GET /me/projects", body)
+        self.assertIn("complete current and\nfuture project portfolio", body)
+        self.assertNotIn("owner@example.com", body)
+
+    def test_agent_setup_requires_login_and_old_token_route_redirects(self):
+        self.assertEqual(
+            self.client.get(reverse("tracker:agent-setup")).status_code,
+            302,
+        )
+        self.login_as(self.owner)
+        response = self.client.get(reverse("tracker:token-create"))
+        self.assertRedirects(response, reverse("tracker:agent-setup"))
 
     def test_interested_attribution_is_per_user_and_visible_to_members(self):
         self.login_as(self.viewer)

@@ -7,7 +7,7 @@ The original September 2026 sublet search is included as an idempotent 25-lead b
 ## What is implemented
 
 - Email/password registration and browser sessions.
-- Scoped, expiring, revocable bearer tokens for agents. An agent can exchange the user's email/password for a project-restricted token, but long-running cron jobs should store the token rather than the password.
+- Expiring, revocable bearer tokens for agents. **Equip an agent** creates a user-wide token that discovers the user's current and future project portfolio, so long-running agents never need to store the user's password.
 - Database-backed login throttling without storing raw attempted emails or IP addresses.
 - Owner/editor/viewer project roles and acceptance-based invitation links.
 - Private profiles and personal saved prompts.
@@ -59,7 +59,7 @@ Use `--dry-run` to validate without writing. Unknown legacy listing IDs are repo
 
 The REST API is mounted at `/api/v1/`. Start with:
 
-1. `POST /api/v1/auth/token` to exchange email/password for a scoped, project-restricted bearer token.
+1. Use **Equip an agent** in the browser to create a user-wide bearer token without storing a password.
 2. `GET /api/v1/me/projects` to discover current projects and change cursors.
 3. `GET /api/v1/projects/{id}/changes?cursor=...` to synchronize changes.
 4. Claim or continue a search run, bulk-upsert leads with an idempotency key, and complete the run with continuation state.

@@ -133,3 +133,6 @@ SECURE_HSTS_PRELOAD = SECURE_HSTS_SECONDS > 0
 
 ALLOW_PUBLIC_SIGNUP = env_bool("ALLOW_PUBLIC_SIGNUP", False)
 AGENT_TOKEN_DEFAULT_DAYS = int(os.environ.get("AGENT_TOKEN_DEFAULT_DAYS", "90"))
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+if not PUBLIC_BASE_URL and os.environ.get("APP_DOMAIN"):
+    PUBLIC_BASE_URL = f"https://{os.environ['APP_DOMAIN']}"

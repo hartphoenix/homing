@@ -21,6 +21,7 @@ from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.cache import patch_vary_headers
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
@@ -30,11 +31,12 @@ from projects.models import (
     Lead,
     LeadComment,
     LeadInterest,
+    AuditEvent,
     Project,
     ProjectInvitation,
     ProjectMembership,
 )
-from projects.services.authorization import ROLE_RANK, authorize_project
+from projects.services.authorization import ROLE_RANK, SCOPES, authorize_project
 from projects.services.mutations import (
     PromptRevisionConflict,
     append_change,
@@ -57,6 +59,7 @@ from .forms import (
     SavedPromptForm,
     TrashLeadForm,
 )
+from .agent_guidance import build_agent_prompt, build_skill_markdown
 
 
 def _safe_next(request, candidate, fallback):
@@ -88,6 +91,11 @@ def _project_flags(project, user):
 def _profile(user):
     profile, _ = Profile.objects.get_or_create(user=user)
     return profile
+
+
+def _agent_api_base_url(request):
+    public_base = getattr(settings, "PUBLIC_BASE_URL", "")
+    return f"{public_base}/api/v1" if public_base else request.build_absolute_uri("/api/v1").rstrip("/")
 
 
 def _lead_view(lead, user):
@@ -696,23 +704,56 @@ def profile(request):
 
 @login_required
 def token_create(request):
-    form = AgentTokenForm(request.POST or None, user=request.user)
+    return redirect("tracker:agent-setup")
+
+
+@login_required
+def agent_setup(request):
+    form = AgentTokenForm(request.POST or None)
     raw = None
     if request.method == "POST" and form.is_valid():
         token, raw = create_agent_token(
             user=request.user,
             name=form.cleaned_data["name"],
-            scopes=form.cleaned_data["scopes"],
-            project_ids=[p.pk for p in form.cleaned_data["projects"]],
+            scopes=SCOPES,
+            project_ids=[],
             expires_at=form.cleaned_data["expires_at"],
         )
-        messages.success(request, f"Token created. Copy it now; it will not be shown again: {raw}")
-        return redirect("tracker:profile")
-    return render(
+        AuditEvent.objects.create(
+            actor=request.user,
+            actor_kind="user",
+            token_id=token.pk,
+            action="agent_token.created",
+            object_type="agent_token",
+            object_id=str(token.pk),
+            summary={"name": token.name, "expires_at": token.expires_at.isoformat()},
+        )
+        form = AgentTokenForm()
+    api_base_url = _agent_api_base_url(request)
+    response = render(
         request,
-        "tracker/project_form.html",
-        {"form": form, "title": "Create agent token", "token_form": form, "new_token": raw},
+        "tracker/agent_setup.html",
+        {
+            "form": form,
+            "new_token": raw,
+            "agent_prompt": build_agent_prompt(api_base_url),
+            "tokens": AgentToken.objects.filter(user=request.user),
+        },
     )
+    response["Cache-Control"] = "private, no-store"
+    response["Pragma"] = "no-cache"
+    return response
+
+
+@login_required
+def agent_skill_download(request):
+    api_base_url = _agent_api_base_url(request)
+    response = HttpResponse(build_skill_markdown(api_base_url), content_type="text/markdown; charset=utf-8")
+    response["Content-Disposition"] = 'attachment; filename="SKILL.md"'
+    response["Cache-Control"] = "private, no-store"
+    response["Pragma"] = "no-cache"
+    patch_vary_headers(response, ("Cookie",))
+    return response
 
 
 @login_required
@@ -720,8 +761,22 @@ def token_create(request):
 def token_revoke(request, token_id):
     token = get_object_or_404(AgentToken, pk=token_id, user=request.user)
     revoke_agent_token(token)
+    AuditEvent.objects.create(
+        actor=request.user,
+        actor_kind="user",
+        token_id=token.pk,
+        action="agent_token.revoked",
+        object_type="agent_token",
+        object_id=str(token.pk),
+        summary={"name": token.name},
+    )
     messages.success(request, "Agent token revoked.")
-    return redirect("tracker:profile")
+    destination = _safe_next(
+        request,
+        request.POST.get("next"),
+        reverse("tracker:profile"),
+    )
+    return redirect(destination)
 
 
 @login_required

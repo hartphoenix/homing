@@ -19,12 +19,13 @@ Authorization: Bearer st_live_redacted-example
 ```
 
 `POST /auth/token` accepts the user's email/password and returns a token. For
-long-running cron, create a project-restricted token in the authenticated UI;
-storing a reusable password on a cron host is discouraged. Tokens are digest
-stored, expire after 90 days by default, and can be revoked. A token's
-effective authority is the intersection of its scopes, project restriction,
-and the user's current project role. Changing/removing a role takes effect on
-the next request. Password change revokes tokens unless explicitly retained.
+long-running cron, use **Equip an agent** in the authenticated UI instead of
+storing a reusable password. The UI issues one user-wide token so the agent can
+discover every project the user can access now or later. Tokens are digest
+stored, shown once, expire after 90 days by default, and can be revoked. The
+user's current role in each project still controls allowed operations;
+changing or removing a role takes effect on the next request. Password change
+revokes tokens unless explicitly retained.
 
 Scopes:
 
@@ -64,7 +65,7 @@ At every cron invocation, begin with:
 
 ```sh
 curl --fail-with-body -sS \
-  -H "Authorization: Bearer $HERMES_TOKEN" \
+  -H "Authorization: Bearer $HOMING_API_TOKEN" \
   https://homing.hartphoenix.com/api/v1/me/projects
 ```
 
@@ -75,7 +76,7 @@ read changes:
 
 ```sh
 curl --fail-with-body -sS \
-  -H "Authorization: Bearer $HERMES_TOKEN" \
+  -H "Authorization: Bearer $HOMING_API_TOKEN" \
   'https://homing.hartphoenix.com/api/v1/projects/PROJECT_UUID/changes?cursor=123&limit=100'
 ```
 
@@ -258,13 +259,14 @@ secrets in URLs.
 
 ## Hermes cron recipe
 
-Store `HERMES_API_BASE` and a project-restricted `HERMES_TOKEN` in the agent's
-secret store, not in a repository. A minimal shell control flow is:
+Store `HOMING_API_TOKEN` in the agent's secret store, not in a repository. The
+token discovers the user's complete project portfolio. A minimal shell control
+flow is:
 
 ```sh
 set -eu
-auth="Authorization: Bearer $HERMES_TOKEN"
-projects=$(curl --fail-with-body -sS -H "$auth" "$HERMES_API_BASE/me/projects")
+auth="Authorization: Bearer $HOMING_API_TOKEN"
+projects=$(curl --fail-with-body -sS -H "$auth" "https://homing.hartphoenix.com/api/v1/me/projects")
 # For each active project: GET /projects/{id}, GET /changes?cursor=..., then
 # create+claim one run. Read comments/current prompt before searching.
 # Upsert findings in batches of <=100 with a fresh Idempotency-Key.

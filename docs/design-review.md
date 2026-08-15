@@ -8,7 +8,7 @@ The initial architecture was challenged by a separate adversarial design agent b
 | --- | --- |
 | Cron agents could not reliably discover projects or resume work | Added `me/projects`, monotonic project changes, exact run snapshots, atomic claims, leases, retries, cursors, and idempotent completion. |
 | Adding an existing email created membership without consent | Every share creates a single-use expiring invitation requiring exact-email acceptance, with revoke/reissue and authority recheck. |
-| Agent tokens inherited the user's whole account | Tokens are scoped, optionally project-restricted, expiring, and revocable. Effective authority intersects token scope with membership role. |
+| User-wide agent tokens could outlive intended access | Tokens are expiring and revocable. They discover the user's current and future portfolio by design, while effective authority still intersects with each current membership role. |
 | Object authorization was a convention | Central project policy/services, uniform 404/403 rules, transactional checks, an endpoint role matrix, and cross-project negative tests are required. |
 
 ## Additional accepted changes
@@ -26,7 +26,7 @@ The initial architecture was challenged by a separate adversarial design agent b
 ## Product decisions
 
 - Invitations always require acceptance.
-- Agents may exchange email/password for a scoped token; long-running cron should store a revocable project-restricted token instead of a password.
+- Agents may exchange email/password for a token; long-running agents should use a revocable user-wide token from **Equip an agent** instead of storing a password.
 - Owners/editors edit criteria. Viewers read, express interest, and comment.
 - Agents write comments only with `comments:write`.
 - September 2026 is imported project data, not application behavior.

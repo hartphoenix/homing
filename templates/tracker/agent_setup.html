@@ -1,0 +1,45 @@
+{% extends 'tracker/base.html' %}
+{% block title %}Equip an agent · Homing{% endblock %}
+{% block content %}
+<div class="page-heading agent-heading"><div><p class="eyebrow">Agent access</p><h1>Equip an agent</h1><p class="muted">Connect a search agent once. It can discover and maintain every Homing project you can access, including projects added later.</p></div></div>
+
+<div class="setup-grid">
+  <section class="panel setup-step">
+    <span class="step-number">1</span>
+    <h2>Create an access token</h2>
+    <p class="muted">This is safer than giving an agent your password. You can revoke it at any time.</p>
+    <form method="post">{% csrf_token %}{% include 'tracker/_form_fields.html' with form=form %}<button class="button button-primary">Create access token</button></form>
+    {% if new_token %}
+    <div class="secret-callout" role="status">
+      <p class="eyebrow">Shown once</p>
+      <strong>Your access token is ready.</strong>
+      <p>Copy it now, then store it as <code>HOMING_API_TOKEN</code> when your agent guides you. Homing cannot show it again.</p>
+      <div class="copy-field"><input type="password" readonly value="{{ new_token }}" data-copy-target aria-label="New agent access token"><button type="button" class="button" data-copy data-copy-label="Copy token" aria-live="polite">Copy token</button></div>
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="panel setup-step">
+    <span class="step-number">2</span>
+    <h2>Give your agent instructions</h2>
+    <p class="muted">Choose either option. The instructions guide nontechnical users through saving the key safely and verify the connection.</p>
+    <div class="agent-actions">
+      <button type="button" class="button button-primary" data-copy data-copy-source="agent-prompt" data-copy-label="Copy setup prompt" aria-live="polite">Copy setup prompt</button>
+      <a class="button" href="{% url 'tracker:agent-skill-download' %}">Download SKILL.md</a>
+    </div>
+    <details class="prompt-preview"><summary>Preview the setup prompt</summary><label class="sr-only" for="agent-prompt">Agent setup prompt</label><textarea id="agent-prompt" readonly rows="18">{{ agent_prompt }}</textarea></details>
+  </section>
+
+  <section class="panel setup-step setup-wide">
+    <span class="step-number">3</span>
+    <h2>Let the agent guide you</h2>
+    <p>Paste the setup prompt into your agent, or ask it to install the downloaded skill. It will explain where to save the token for your particular setup, test the connection without changing anything, then discover your projects automatically. It can also help schedule recurring searches.</p>
+    <p class="muted">The prompt and downloaded file never contain your token. Avoid pasting the token directly into chat when your agent offers a secret or environment-variable setting.</p>
+  </section>
+</div>
+
+<section class="panel token-panel">
+  <div class="section-heading"><div><p class="eyebrow">Connections</p><h2>Agent tokens</h2></div></div>
+  <ul class="token-list">{% for token in tokens %}<li><span><strong>{{ token.name }}</strong><small>All projects · expires {{ token.expires_at }}</small></span>{% if token.revoked_at %}<span class="badge badge-trash">Revoked</span>{% else %}<form method="post" action="{% url 'tracker:token-revoke' token.id %}" class="inline-form">{% csrf_token %}<input type="hidden" name="next" value="{% url 'tracker:agent-setup' %}"><button class="link-button danger-link">Revoke</button></form>{% endif %}</li>{% empty %}<li class="muted">No agent tokens yet.</li>{% endfor %}</ul>
+</section>
+{% endblock %}

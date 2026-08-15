@@ -128,7 +128,8 @@ the newest remote artifact, not merely the host timer.
 
 The application does not email invitations or password resets in v1. Use its
 documented management command from the host for the initial owner, then create
-revocable, project-restricted agent tokens in the UI. For a cron agent, prefer
-that token over a stored password. If password exchange is required, use a
-dedicated account and the narrowest scopes/projects; rotate it after a suspected
-leak. Password changes revoke agent tokens by default.
+revocable user-wide agent tokens with **Equip an agent** in the UI. These tokens
+discover every current and future project available to that user, while the
+user's role in each project still limits operations. For a cron agent, prefer
+this token over a stored password and revoke it after a suspected leak. Password
+changes revoke agent tokens by default.

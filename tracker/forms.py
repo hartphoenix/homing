@@ -19,7 +19,6 @@ from projects.models import (
     Lead,
     LeadComment,
     Project,
-    ProjectMembership,
 )
 
 
@@ -233,50 +232,17 @@ class InvitationForm(forms.Form):
 
 
 class AgentTokenForm(forms.Form):
-    name = forms.CharField(max_length=120)
-    scopes = forms.MultipleChoiceField(
-        required=False,
-        choices=tuple(
-            (scope, scope)
-            for scope in (
-                "profile:read",
-                "projects:read",
-                "prompts:read",
-                "leads:read",
-                "leads:write",
-                "comments:read",
-                "comments:write",
-                "interest:read",
-                "interest:write",
-                "runs:write",
-            )
-        ),
-        widget=forms.CheckboxSelectMultiple,
+    name = forms.CharField(
+        max_length=120,
+        initial="My search agent",
+        help_text="A private label to help you recognize this connection later.",
     )
-    projects = forms.ModelMultipleChoiceField(queryset=Project.objects.none(), required=False)
     expires_at = forms.DateTimeField(
-        required=False, widget=forms.DateTimeInput(attrs={"type": "datetime-local"})
+        required=False,
+        label="Expiry (optional)",
+        help_text="Leave blank to use the site's default. You can revoke access at any time.",
+        widget=forms.DateTimeInput(attrs={"type": "datetime-local"}),
     )
-
-    def __init__(self, *args, user=None, **kwargs):
-        self.user = user
-        super().__init__(*args, **kwargs)
-        if not self.is_bound:
-            self.initial["scopes"] = [
-                "projects:read",
-                "prompts:read",
-                "leads:read",
-                "leads:write",
-                "comments:read",
-                "comments:write",
-                "interest:read",
-                "interest:write",
-                "runs:write",
-            ]
-        self.fields["projects"].queryset = Project.objects.filter(
-            memberships__user=user,
-            memberships__role__in=(ProjectMembership.Role.OWNER, ProjectMembership.Role.EDITOR),
-        ).distinct()
 
     def clean_expires_at(self):
         value = self.cleaned_data.get("expires_at")
