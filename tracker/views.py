@@ -271,7 +271,7 @@ def prompt_edit(request, slug):
             return render(
                 request,
                 "tracker/prompt_form.html",
-                {"project": project, "form": form, **flags},
+                {"project": project, "form": form, "title": "Search prompt", "is_prompt_form": True, **flags},
                 status=409,
             )
         try:
@@ -290,12 +290,12 @@ def prompt_edit(request, slug):
             return render(
                 request,
                 "tracker/prompt_form.html",
-                {"project": project, "form": form, **flags},
+                {"project": project, "form": form, "title": "Search prompt", "is_prompt_form": True, **flags},
                 status=409,
             )
         messages.success(request, "Search prompt saved.")
         return redirect("tracker:project-detail", project.slug)
-    return render(request, "tracker/prompt_form.html", {"project": project, "form": form, **flags})
+    return render(request, "tracker/prompt_form.html", {"project": project, "form": form, "title": "Search prompt", "is_prompt_form": True, **flags})
 
 
 def _filtered_leads(project, request):

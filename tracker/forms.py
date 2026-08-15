@@ -9,6 +9,7 @@ import json
 
 from django import forms
 from django.contrib.auth import authenticate
+from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
@@ -45,7 +46,12 @@ class JSONTextareaMixin:
 
 
 class RegisterForm(forms.ModelForm):
-    password1 = forms.CharField(label="Password", widget=forms.PasswordInput, min_length=10)
+    password1 = forms.CharField(
+        label="Password",
+        widget=forms.PasswordInput,
+        min_length=12,
+        help_text="Use at least 12 characters. Avoid common passwords.",
+    )
     password2 = forms.CharField(label="Confirm password", widget=forms.PasswordInput)
 
     class Meta:
@@ -60,6 +66,18 @@ class RegisterForm(forms.ModelForm):
 
     def clean(self):
         cleaned = super().clean()
+        password = cleaned.get("password1")
+        if password:
+            # Keep password policy in Django's configured validators so a
+            # deployment can add organization-specific checks without
+            # changing this form. The 12-character floor is enforced by the
+            # field above even when no validators are configured.
+            if cleaned.get("email"):
+                self.instance.email = cleaned["email"]
+            try:
+                validate_password(password, self.instance)
+            except ValidationError as error:
+                self.add_error("password1", error)
         if cleaned.get("password1") and cleaned.get("password1") != cleaned.get("password2"):
             self.add_error("password2", "The passwords do not match.")
         return cleaned
@@ -154,6 +172,8 @@ class LeadForm(JSONTextareaMixin, forms.ModelForm):
         help_text="Optional JSON attributes.",
     )
     json_fields = ("attributes",)
+    canonical_url = forms.URLField(max_length=2000, assume_scheme="https")
+    source_url = forms.URLField(max_length=2000, required=False, assume_scheme="https")
 
     class Meta:
         model = Lead

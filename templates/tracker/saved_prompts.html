@@ -1,1 +1,31 @@
-{% extends 'tracker/base.html' %}{% block title %}Saved prompts · leadboard{% endblock %}{% block content %}<div class="page-heading"><div><p class="eyebrow">Account</p><h1>Saved prompts</h1></div><a class="button button-primary" href="{% url 'tracker:saved-prompt-create' %}">New prompt</a></div>{% if prompts %}<div class="prompt-list">{% for prompt in prompts %}<article class="panel"><div class="section-heading"><h2>{{ prompt.title }}</h2><a href="{% url 'tracker:saved-prompt-edit' prompt.id %}">Edit</a></div><p class="prompt-text">{{ prompt.prompt }}</p><p class="form-help">Updated {{ prompt.updated_at }}</p></article>{% endfor %}</div>{% else %}<div class="empty-state"><h2>No saved prompts</h2><p>Save reusable research instructions for future projects.</p></div>{% endif %}{% endblock %}
+{% extends 'tracker/base.html' %}
+{% block title %}Saved prompts · leadboard{% endblock %}
+
+{% block content %}
+  <div class="page-heading">
+    <div><p class="eyebrow">Account</p><h1>Saved prompts</h1></div>
+    <a class="button button-primary" href="{% url 'tracker:saved-prompt-create' %}">New prompt</a>
+  </div>
+  {% if prompts %}
+    <div class="prompt-list">
+      {% for prompt in prompts %}
+        <article class="panel">
+          <div class="section-heading">
+            <h2>{{ prompt.title }}</h2>
+            <div class="item-actions">
+              <a href="{% url 'tracker:saved-prompt-edit' prompt.id %}">Edit</a>
+              <form method="post" action="{% url 'tracker:saved-prompt-edit' prompt.id %}" class="inline-form">
+                {% csrf_token %}<input type="hidden" name="action" value="delete">
+                <button class="link-button danger-link">Delete</button>
+              </form>
+            </div>
+          </div>
+          <p class="prompt-text">{{ prompt.prompt }}</p>
+          <p class="form-help">Updated {{ prompt.updated_at }}</p>
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty-state"><h2>No saved prompts</h2><p>Save reusable research instructions for future projects.</p></div>
+  {% endif %}
+{% endblock %}
