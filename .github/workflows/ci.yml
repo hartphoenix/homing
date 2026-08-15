@@ -32,7 +32,9 @@ jobs:
       DATABASE_URL: postgresql://sublet_tracker:ci-only-password@localhost:5432/sublet_tracker_test
       DJANGO_SETTINGS_MODULE: config.settings
       DJANGO_SECRET_KEY: ci-only-secret-not-used-in-production
+      DJANGO_DEBUG: "0"
       DJANGO_ALLOWED_HOSTS: localhost
+      SECURE_SSL_REDIRECT: "1"
       ALLOW_PUBLIC_SIGNUP: "true"
     steps:
       - uses: actions/checkout@v4
