@@ -395,7 +395,7 @@ def _reserve_idempotency(request, principal, key, data):
 def register(request):
     if request.method != "POST":
         return _error(request, "method_not_allowed", "POST required", 405)
-    if not getattr(settings, "ALLOW_PUBLIC_SIGNUP", True):
+    if not getattr(settings, "ALLOW_PUBLIC_SIGNUP", False):
         return _error(request, "registration_disabled", "Registration is disabled.", 403)
     data, error = _data(request)
     if error:

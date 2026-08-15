@@ -1,4 +1,4 @@
-name: sublet-tracker
+name: homing
 
 services:
   db:
@@ -24,7 +24,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: sublet-tracker-web:local
+    image: homing-web:local
     restart: unless-stopped
     init: true
     env_file:
@@ -94,15 +94,15 @@ services:
 
 volumes:
   postgres_data:
-    name: sublet-tracker-postgres
+    name: homing-postgres
   caddy_data:
-    name: sublet-tracker-caddy-data
+    name: homing-caddy-data
   caddy_config:
-    name: sublet-tracker-caddy-config
+    name: homing-caddy-config
 
 networks:
   edge:
-    name: sublet-tracker-edge
+    name: homing-edge
   database:
-    name: sublet-tracker-database
+    name: homing-database
     internal: true

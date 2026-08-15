@@ -5,7 +5,7 @@ umask 077
 project_dir=${PROJECT_DIR:-"$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"}
 backup=${1:-}
 if [ -z "$backup" ] || [ ! -f "$backup" ]; then
-  echo "usage: $0 /absolute/path/to/sublet-tracker-<timestamp>.dump.age" >&2
+  echo "usage: $0 /absolute/path/to/homing-<timestamp>.dump.age" >&2
   exit 2
 fi
 if [ "${RESTORE_CONFIRM:-}" != "YES" ]; then

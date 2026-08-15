@@ -13,7 +13,7 @@ policy. Then schedule, for example, a systemd timer or cron entry as the deploy
 user:
 
 ```cron
-17 2 * * * cd /srv/sublet-tracker && ./docker/backup.sh >>/var/log/sublet-tracker-backup.log 2>&1
+17 2 * * * cd /opt/homing && ./docker/backup.sh >>/var/log/homing-backup.log 2>&1
 ```
 
 The script uses `pg_dump --format=custom --no-owner --no-privileges`, encrypts
@@ -34,11 +34,11 @@ the application in a maintenance window; users and agents must not write while
 the database is replaced.
 
 ```sh
-cd /srv/sublet-tracker
-export AGE_IDENTITY_FILE=/secure/off-host/sublet-tracker.agekey
+cd /opt/homing
+export AGE_IDENTITY_FILE=/secure/off-host/homing.agekey
 export RESTORE_CONFIRM=YES
-./docker/restore.sh /secure/backup/sublet-tracker-20260815T021700Z.dump.age
-./docker/smoke.sh https://sublets.example.com
+./docker/restore.sh /secure/backup/homing-20260815T021700Z.dump.age
+./docker/smoke.sh https://homing.hartphoenix.com
 ```
 
 `restore.sh` stops web/Caddy, decrypts without writing a plaintext dump, uses
@@ -65,4 +65,3 @@ Record artifact ID, restore start/end, result, checks performed, operator, and
 any remediation. Never paste credentials or the decrypted database into the
 drill report. A failed drill is an incident: preserve the failed copy for
 diagnosis, fix the issue, and repeat before declaring recovery ready.
-

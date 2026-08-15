@@ -12,10 +12,22 @@ Before provisioning, supply:
 - a Hetzner Ubuntu/Debian VM with a fixed public IPv4 (and IPv6 if used);
 - a DNS `A`/`AAAA` record for the eventual `APP_DOMAIN`;
 - an SSH deploy user, key-only access, and a fixed directory such as
-  `/srv/sublet-tracker`;
+  `/opt/homing`;
 - an age encryption identity held off-host for restore, and its public recipient
   for backups; and
 - an off-host rclone remote with credentials readable only by the backup user.
+
+For the current PhoenixBot target, create an `A` record for
+`homing.hartphoenix.com` pointing to `204.168.138.83`. The apex domain remains
+on GitHub Pages. UFW currently allows only SSH, so add TCP 80 and 443 before
+starting Caddy; add UDP 443 only if HTTP/3 is desired. Re-check these facts at
+deploy time rather than assuming this audit remains current.
+
+Host audit on 2026-08-15: Docker 29.6.2 and Compose 5.3.1 are installed; ports
+80/443 are unused; the root filesystem has about 18 GB free; and clock sync and
+unattended upgrades are enabled. A dedicated `deploy` user does not yet exist,
+and `age` and `rclone` still need installation. Existing PhoenixBot services
+publish only loopback ports and do not require Homing to share their database.
 
 The VM firewall should permit TCP 22 only from the operator's IP(s), and TCP
 80/443 (plus UDP 443 for HTTP/3) from the Internet. Do not expose 5432,
@@ -36,19 +48,22 @@ all capabilities from web and Caddy except Caddy's `NET_BIND_SERVICE`.
 Clone the release into the fixed directory and create the secret file:
 
 ```sh
-sudo install -d -o deploy -g deploy -m 0750 /srv/sublet-tracker
-sudo -u deploy git clone <repository-url> /srv/sublet-tracker
-sudo -u deploy cp /srv/sublet-tracker/.env.example /srv/sublet-tracker/.env
-sudo chmod 600 /srv/sublet-tracker/.env
-sudoedit /srv/sublet-tracker/.env
+sudo install -d -o deploy -g deploy -m 0750 /opt/homing
+sudo -u deploy git clone <repository-url> /opt/homing
+sudo -u deploy cp /opt/homing/.env.example /opt/homing/.env
+sudo chmod 600 /opt/homing/.env
+sudoedit /opt/homing/.env
 ```
 
 Set a unique random `DJANGO_SECRET_KEY`, a unique random database password,
 the real domain and HTTPS origin, and a valid `DATABASE_URL` whose password
 matches `POSTGRES_PASSWORD`. Keep `ALLOW_PUBLIC_SIGNUP=false` after bootstrapping
-the intended accounts. Never commit `.env`, paste it into chat, or include it
-in an issue. `docker compose config` can render interpolated configuration, so
-do not redirect that output to logs or tickets.
+the intended accounts. Closed signup means an administrator must create a new
+collaborator's account before that person can accept a project invitation;
+invitations between existing accounts continue to work. Never commit `.env`,
+paste it into chat, or include it in an issue. `docker compose config` can
+render interpolated configuration, so do not redirect that output to logs or
+tickets.
 
 ## Deploy and upgrade
 
@@ -56,11 +71,11 @@ DNS must resolve before the first start so Caddy can obtain a certificate. From
 the deploy user's checkout:
 
 ```sh
-cd /srv/sublet-tracker
+cd /opt/homing
 git fetch --tags origin
 git checkout <reviewed-release-tag-or-commit>
 ./docker/deploy.sh
-./docker/smoke.sh https://sublets.example.com
+./docker/smoke.sh https://homing.hartphoenix.com
 ```
 
 `deploy.sh` uses a host `flock`, validates Compose interpolation, builds the
@@ -86,7 +101,7 @@ available; restore the database only using the documented restore drill.
 ```sh
 docker compose --env-file .env ps
 docker compose --env-file .env logs --since=15m web caddy
-./docker/smoke.sh https://sublets.example.com
+./docker/smoke.sh https://homing.hartphoenix.com
 ```
 
 Application logs are structured to stdout. Caddy emits JSON logs. Log shipping

@@ -5,7 +5,7 @@ umask 077
 project_dir=${PROJECT_DIR:-"$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"}
 backup_dir=${BACKUP_DIR:-"$project_dir/backups"}
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
-output="$backup_dir/sublet-tracker-$timestamp.dump.age"
+output="$backup_dir/homing-$timestamp.dump.age"
 mkdir -p "$backup_dir"
 
 test -f "$project_dir/.env" || { echo "missing .env" >&2; exit 1; }
@@ -50,6 +50,6 @@ fi
 
 # Local retention is a convenience; off-host retention is controlled by the
 # remote's lifecycle policy. Keep files only for the configured number of days.
-find "$backup_dir" -type f -name 'sublet-tracker-*.dump.age' \
+find "$backup_dir" -type f -name 'homing-*.dump.age' \
   -mtime "+${backup_retention_days:-35}" -delete
 printf '%s\n' "$output"

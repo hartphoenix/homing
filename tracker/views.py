@@ -127,6 +127,11 @@ class TrackerLoginView(LoginView):
     authentication_form = EmailAuthenticationForm
     redirect_authenticated_user = True
 
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["public_signup_enabled"] = settings.ALLOW_PUBLIC_SIGNUP
+        return context
+
     def get_success_url(self):
         return _safe_next(self.request, self.get_redirect_url(), reverse("tracker:project-list"))
 
@@ -138,7 +143,7 @@ class TrackerLogoutView(LogoutView):
 def register(request):
     if request.user.is_authenticated:
         return redirect("tracker:project-list")
-    if not getattr(settings, "ALLOW_PUBLIC_SIGNUP", True):
+    if not getattr(settings, "ALLOW_PUBLIC_SIGNUP", False):
         return render(
             request, "tracker/register.html", {"form": RegisterForm(), "disabled": True}, status=403
         )

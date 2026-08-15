@@ -1,4 +1,4 @@
-# Leadboard
+# Homing
 
 A self-hosted, multi-user research tracker for humans and recurring search agents. Users have private profiles and saved prompts, can belong to multiple collaborative projects, and can share projects through acceptance-based email invitations. Each project holds a versioned search prompt, structured criteria, resumable search runs, leads, shared comments/trash, and per-user interest.
 
@@ -76,7 +76,7 @@ Deployment uses Docker Compose with three services:
 
 Copy `.env.example` to `.env`, replace every placeholder, point the domain's DNS at the server, and follow [Deployment](docs/deployment.md). Backup and restore procedures are in [Backup and restore](docs/backup-restore.md).
 
-The live deployment still needs the Hetzner SSH target, domain, deploy path, and post-bootstrap public-registration preference.
+The deployment target is PhoenixBot (`204.168.138.83`) at `homing.hartphoenix.com`, using `/opt/homing`. Public registration is disabled by default; create initial accounts through the bootstrap command or Django admin.
 
 ## Verification
 

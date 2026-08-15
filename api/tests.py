@@ -181,6 +181,7 @@ class ApiSecurityTests(TestCase):
         )
 
     @override_settings(
+        ALLOW_PUBLIC_SIGNUP=True,
         AUTH_PASSWORD_VALIDATORS=[
             {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator", "OPTIONS": {"min_length": 14}}
         ]

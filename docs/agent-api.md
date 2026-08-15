@@ -65,7 +65,7 @@ At every cron invocation, begin with:
 ```sh
 curl --fail-with-body -sS \
   -H "Authorization: Bearer $HERMES_TOKEN" \
-  https://sublets.example.com/api/v1/me/projects
+  https://homing.hartphoenix.com/api/v1/me/projects
 ```
 
 The response includes each available project's role, status, current prompt
@@ -76,7 +76,7 @@ read changes:
 ```sh
 curl --fail-with-body -sS \
   -H "Authorization: Bearer $HERMES_TOKEN" \
-  'https://sublets.example.com/api/v1/projects/PROJECT_UUID/changes?cursor=123&limit=100'
+  'https://homing.hartphoenix.com/api/v1/projects/PROJECT_UUID/changes?cursor=123&limit=100'
 ```
 
 Changes are ordered by a per-project monotonic sequence and include prompt,
@@ -276,4 +276,3 @@ cron invocation can distinguish a deliberate failure from an expired worker.
 Persist each project's cursor and last completed run ID in Hermes state only
 after successful API responses. Treat `409 run_already_claimed` as “another
 worker owns this project” and move to the next project.
-

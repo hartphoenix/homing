@@ -176,6 +176,19 @@ class TrackerWebFlowTests(TestCase):
 
 
 class RegistrationFormTests(TestCase):
+    def test_public_signup_is_closed_by_default(self):
+        login_response = self.client.get(reverse("login"))
+        self.assertNotContains(login_response, "Create one")
+
+        register_response = self.client.get(reverse("tracker:register"))
+        self.assertEqual(register_response.status_code, 403)
+        self.assertContains(register_response, "Public signup is currently closed", status_code=403)
+
+    @override_settings(ALLOW_PUBLIC_SIGNUP=True)
+    def test_signup_link_is_visible_when_enabled(self):
+        response = self.client.get(reverse("login"))
+        self.assertContains(response, "Create one")
+
     def test_registration_requires_twelve_character_password(self):
         form = RegisterForm(
             data={

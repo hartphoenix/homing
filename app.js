@@ -1,4 +1,4 @@
-const STORAGE_KEY = "september-sublet-tracker-v1";
+const STORAGE_KEY = "homingLocalState";
 const listings = window.SUBLET_LISTINGS;
 
 function loadState() {

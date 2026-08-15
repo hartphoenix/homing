@@ -20,7 +20,7 @@ This is a self-hosted collaborative research tracker. Humans use a low-noise web
 - Agent tokens have explicit scopes and optional project restrictions. Scopes are `profile:read`, `projects:read`, `prompts:read`, `leads:read`, `leads:write`, `comments:read`, `comments:write`, `interest:read`, `interest:write`, and `runs:write`. Tokens can never manage users, membership, invitations, or tokens.
 - Password-exchange tokens require an allowed-project list, default to read plus lead/run write scopes, expire after 90 days, and show a blast-radius warning. Creation, rotation, revocation, expiry, and use are audited by non-secret token ID.
 - Auth responses are generic and throttled by IP plus normalized email using a shared database/cache backend. Secrets and Authorization headers never enter URLs or logs.
-- Public registration follows `ALLOW_PUBLIC_SIGNUP`; invited registration remains available. A bootstrap management command is the self-hosted recovery path.
+- Public registration follows `ALLOW_PUBLIC_SIGNUP` and is disabled by default. In the closed-signup release, an administrator creates collaborator accounts before they accept invitations. A bootstrap management command is the self-hosted recovery path.
 - Password changes rotate the browser session and revoke agent tokens unless explicitly retained. Deactivation invalidates sessions and tokens immediately.
 
 ## Authorization and sharing
