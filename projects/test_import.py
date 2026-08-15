@@ -38,6 +38,12 @@ class BootstrapSubletProjectTests(TestCase):
         project.refresh_from_db()
         self.assertEqual(project.prompt_revision, revision)
 
+    def test_dry_run_validates_without_creating_accounts_or_projects(self):
+        self.run_bootstrap(dry_run=True)
+        self.assertFalse(User.objects.exists())
+        self.assertFalse(Project.objects.exists())
+        self.assertFalse(Lead.objects.exists())
+
     def test_legacy_interest_and_trash_are_mapped_and_unknown_ids_reported(self):
         with TemporaryDirectory() as temporary_directory:
             tmp_path = Path(temporary_directory)

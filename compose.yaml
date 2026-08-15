@@ -32,6 +32,10 @@ services:
         required: false
     environment:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY in .env}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-0}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?set DJANGO_ALLOWED_HOSTS in .env}
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:?set DJANGO_CSRF_TRUSTED_ORIGINS in .env}
     expose: ["8000"]
     networks: [edge, database]
     depends_on:
@@ -44,7 +48,10 @@ services:
       - no-new-privileges:true
     cap_drop: [ALL]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
+      # Production redirects plain HTTP and only allows the configured public
+      # host. Mark the internal probe as HTTPS at the proxy boundary so the
+      # check exercises the same Django path that Caddy serves.
+      test: ["CMD", "python", "-c", "import urllib.request; request = urllib.request.Request('http://127.0.0.1:8000/health/live', headers={'Host': '127.0.0.1', 'X-Forwarded-Proto': 'https'}); urllib.request.urlopen(request, timeout=3)"]
       interval: 15s
       timeout: 5s
       retries: 4
@@ -58,6 +65,8 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN in .env}
     ports:
       - "80:80"
       - "443:443"

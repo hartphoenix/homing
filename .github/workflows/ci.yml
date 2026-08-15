@@ -72,3 +72,10 @@ jobs:
           rm -f .env
       - name: Build production image
         run: docker build --file Dockerfile --tag sublet-tracker-ci:check .
+      - name: Validate Caddy configuration
+        run: |
+          docker run --rm \
+            --env APP_DOMAIN=example.test \
+            --volume "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.9.1-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile

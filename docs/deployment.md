@@ -71,9 +71,9 @@ health check is liveness-only; `/health/ready` must report database readiness
 and is checked by the smoke script through Caddy.
 
 Images are pinned to `python:3.13.7-slim-bookworm`, `postgres:17.5-alpine`,
-`caddy:2.9.1-alpine`, and Gunicorn 23.0.0. Dependency versions belong in the
-reviewed `requirements.txt` lock. Update image tags and dependencies as one
-reviewed change, run CI, test a restore, then deploy. If a digest-pinned mirror
+`caddy:2.9.1-alpine`, and the application dependency ranges are constrained in
+`pyproject.toml` (with CI's `pip-audit` check). Update image tags and
+dependencies as one reviewed change, run CI, test a restore, then deploy. If a digest-pinned mirror
 is required by policy, replace these tags with the digest recorded by the
 release process.
 
@@ -117,4 +117,3 @@ revocable, project-restricted agent tokens in the UI. For a cron agent, prefer
 that token over a stored password. If password exchange is required, use a
 dedicated account and the narrowest scopes/projects; rotate it after a suspected
 leak. Password changes revoke agent tokens by default.
-

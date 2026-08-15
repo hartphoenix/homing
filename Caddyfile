@@ -6,10 +6,10 @@
 	log {
 		output stdout
 		format json
-		 sampling {
+		sampling {
 			interval 1m
 			first 100
-			after 100
+			thereafter 100
 		}
 	}
 
@@ -26,4 +26,3 @@
 		header_up X-Forwarded-Host {host}
 	}
 }
-

@@ -19,9 +19,10 @@ cd "$project_dir"
 test -f .env || { echo "missing $project_dir/.env (copy .env.example and fill secrets)" >&2; exit 1; }
 docker compose --env-file .env config --quiet
 docker compose --env-file .env build --pull web
-docker compose --env-file .env up --detach db
+# --no-deps is used for the one-shot web containers below, so explicitly wait
+# here rather than assuming the database process is accepting connections.
+docker compose --env-file .env up --detach --wait db
 docker compose --env-file .env run --rm --no-deps web /opt/app/docker/migrate-with-lock.sh python manage.py migrate --noinput
 docker compose --env-file .env run --rm --no-deps web /opt/app/docker/migrate-with-lock.sh python manage.py collectstatic --noinput
 docker compose --env-file .env up --detach --remove-orphans web caddy
 docker compose --env-file .env ps
-
