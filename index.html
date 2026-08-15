@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>September sublet leads</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="hero">
+    <div>
+      <p class="eyebrow">SEPTEMBER 1–30, 2026 · NYC</p>
+      <h1>Sublet shortlist</h1>
+      <p class="lede">Live leads at or below $2,500. Unknown details are flagged for follow-up, not treated as failures.</p>
+    </div>
+    <div class="summary" aria-label="Listing summary">
+      <div><strong id="active-count">0</strong><span>active</span></div>
+      <div><strong id="interested-count">0</strong><span>interested</span></div>
+      <div><strong id="trash-count">0</strong><span>in trash</span></div>
+    </div>
+  </header>
+
+  <main>
+    <section class="criteria" aria-labelledby="criteria-title">
+      <div>
+        <h2 id="criteria-title">The brief</h2>
+        <p>Near Fort Greene or West Harlem preferred; otherwise within roughly 45 minutes of <strong>302 W 124th St</strong>. Entire 1BR up to $2,500, or a shared place ideally under $2,000. Guests must be possible; roommate fit, exact dates, and guest policy should be confirmed directly.</p>
+      </div>
+      <p class="freshness">Researched <strong>August 14, 2026</strong><br>Availability changes quickly.</p>
+    </section>
+
+    <section class="controls" aria-label="Filters">
+      <input id="search" type="search" placeholder="Search neighborhood, source, notes…">
+      <select id="fit-filter" aria-label="Filter by date confidence">
+        <option value="all">All date confidence</option>
+        <option value="strong">Strong date fit</option>
+        <option value="verify">Dates to verify</option>
+      </select>
+      <select id="type-filter" aria-label="Filter by housing type">
+        <option value="all">All housing types</option>
+        <option value="entire">Entire place</option>
+        <option value="shared">Shared</option>
+      </select>
+      <label class="toggle"><input id="interested-only" type="checkbox"> Interested only</label>
+      <button id="trash-toggle" class="secondary" type="button">View trash</button>
+    </section>
+
+    <p id="result-note" class="result-note" aria-live="polite"></p>
+    <section id="listing-grid" class="listing-grid" aria-label="Sublet listings"></section>
+
+    <section id="trash-panel" class="trash-panel" hidden aria-labelledby="trash-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">ARCHIVE</p><h2 id="trash-title">Trash</h2></div>
+        <button id="close-trash" class="secondary" type="button">Back to leads</button>
+      </div>
+      <div id="trash-grid" class="listing-grid"></div>
+      <p id="empty-trash" class="empty">Trash is empty.</p>
+    </section>
+
+    <details class="add-guide">
+      <summary>How to add listings</summary>
+      <p>See <a href="README.md">README.md</a> for the field schema and verification rules. In short: add one object to <code>listings.js</code>, give it a unique stable <code>id</code>, and keep uncertain facts in <code>unknowns</code>. Never renumber existing IDs because browser state is stored against them.</p>
+    </details>
+  </main>
+
+  <template id="listing-template">
+    <article class="card">
+      <div class="card-topline">
+        <span class="fit-badge"></span>
+        <button class="delete-button" type="button" aria-label="Move listing to trash">Delete</button>
+      </div>
+      <h2 class="listing-title"></h2>
+      <p class="location"></p>
+      <div class="facts"></div>
+      <p class="summary-text"></p>
+      <div class="callouts"></div>
+      <div class="card-footer">
+        <label class="interest"><input class="interest-checkbox" type="checkbox"> Interested</label>
+        <a class="listing-link" target="_blank" rel="noopener noreferrer">Open listing ↗</a>
+      </div>
+    </article>
+  </template>
+
+  <script src="listings.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
