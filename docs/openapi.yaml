@@ -1,0 +1,614 @@
+openapi: 3.1.0
+info:
+  title: September Sublet Tracker API
+  version: 1.0.0
+  description: Scoped collaborative project API. See agent-api.md for sync, leases, bulk semantics, and Hermes examples.
+servers:
+  - url: https://{host}/api/v1
+    variables:
+      host: {default: sublets.example.com}
+security:
+  - bearerAuth: []
+paths:
+  /auth/register:
+    post:
+      security: []
+      tags: [auth]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RegisterRequest'}}}}
+      responses:
+        '201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/User'}}}}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Validation'}
+  /auth/token:
+    post:
+      security: []
+      tags: [auth]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TokenExchange'}}}}
+      responses:
+        '200': {description: Opaque token shown once, content: {application/json: {schema: {$ref: '#/components/schemas/TokenResponse'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /auth/tokens:
+    get:
+      tags: [auth]
+      security: [{bearerAuth: ['profile:read']}]
+      responses: {'200': {description: Token metadata, content: {application/json: {schema: {$ref: '#/components/schemas/TokenList'}}}}}
+    post:
+      tags: [auth]
+      security: [{bearerAuth: ['profile:read']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TokenCreate'}}}}
+      responses: {'201': {description: Token shown once, content: {application/json: {schema: {$ref: '#/components/schemas/TokenResponse'}}}}}
+  /auth/tokens/{token_id}:
+    parameters: [{$ref: '#/components/parameters/TokenId'}]
+    delete:
+      tags: [auth]
+      security: [{bearerAuth: ['profile:read']}]
+      responses: {'204': {description: Revoked}, '404': {$ref: '#/components/responses/NotFound'}}
+  /me:
+    get:
+      tags: [me]
+      security: [{bearerAuth: ['profile:read']}]
+      responses: {'200': {description: Current user, content: {application/json: {schema: {$ref: '#/components/schemas/User'}}}}}
+  /me/profile:
+    get:
+      tags: [me]
+      security: [{bearerAuth: ['profile:read']}]
+      responses: {'200': {description: Private profile, content: {application/json: {schema: {$ref: '#/components/schemas/Profile'}}}}}
+    patch:
+      tags: [me]
+      security: [{bearerAuth: ['profile:read']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Profile'}}}}
+      responses: {'200': {description: Updated profile, content: {application/json: {schema: {$ref: '#/components/schemas/Profile'}}}}, '422': {$ref: '#/components/responses/Validation'}}
+  /me/saved-prompts:
+    get:
+      tags: [me]
+      security: [{bearerAuth: ['profile:read']}]
+      responses: {'200': {description: Saved prompts, content: {application/json: {schema: {$ref: '#/components/schemas/SavedPromptList'}}}}}
+    post:
+      tags: [me]
+      security: [{bearerAuth: ['profile:read']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SavedPrompt'}}}}
+      responses: {'201': {description: Saved prompt, content: {application/json: {schema: {$ref: '#/components/schemas/SavedPrompt'}}}}}
+  /me/projects:
+    get:
+      tags: [me, projects]
+      security: [{bearerAuth: ['projects:read']}]
+      responses: {'200': {description: Every project available to the user, content: {application/json: {schema: {$ref: '#/components/schemas/ProjectList'}}}}}
+  /projects:
+    get:
+      tags: [projects]
+      security: [{bearerAuth: ['projects:read']}]
+      responses: {'200': {description: Projects, content: {application/json: {schema: {$ref: '#/components/schemas/ProjectList'}}}}}
+    post:
+      tags: [projects]
+      security: [{bearerAuth: ['projects:read']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ProjectCreate'}}}}
+      responses: {'201': {description: Created project, content: {application/json: {schema: {$ref: '#/components/schemas/Project'}}}}}
+  /projects/{project_id}:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    get:
+      tags: [projects]
+      security: [{bearerAuth: ['projects:read']}]
+      responses: {'200': {description: Project and current prompt, content: {application/json: {schema: {$ref: '#/components/schemas/Project'}}}}, '404': {$ref: '#/components/responses/NotFound'}}
+    patch:
+      tags: [projects]
+      security: [{bearerAuth: ['projects:read']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ProjectPatch'}}}}
+      responses: {'200': {description: Updated project, content: {application/json: {schema: {$ref: '#/components/schemas/Project'}}}}, '403': {$ref: '#/components/responses/Forbidden'}, '409': {$ref: '#/components/responses/Conflict'}}
+  /projects/{project_id}/members:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    get:
+      tags: [projects]
+      security: [{bearerAuth: ['projects:read']}]
+      responses: {'200': {description: Member display identities, content: {application/json: {schema: {$ref: '#/components/schemas/MemberList'}}}}}
+    patch:
+      tags: [projects]
+      description: Owner-only role changes/removals; final owner removal is rejected.
+      security: [{bearerAuth: ['projects:read']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MemberPatch'}}}}
+      responses: {'200': {description: Updated membership}, '403': {$ref: '#/components/responses/Forbidden'}, '409': {$ref: '#/components/responses/Conflict'}}
+  /projects/{project_id}/invitations:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    post:
+      tags: [projects]
+      description: Owner creates a single-use seven-day invite; account existence is not disclosed.
+      security: [{bearerAuth: ['projects:read']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/InvitationCreate'}}}}
+      responses: {'201': {description: Invitation link shown once, content: {application/json: {schema: {$ref: '#/components/schemas/Invitation'}}}}, '403': {$ref: '#/components/responses/Forbidden'}}
+  /invitations/{invitation_token}/accept:
+    parameters: [{$ref: '#/components/parameters/InvitationToken'}]
+    post:
+      tags: [projects]
+      security: [{bearerAuth: ['projects:read']}]
+      responses: {'204': {description: Accepted}, '404': {$ref: '#/components/responses/NotFound'}, '409': {$ref: '#/components/responses/Conflict'}}
+  /projects/{project_id}/prompt:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    get:
+      tags: [prompts]
+      security: [{bearerAuth: ['prompts:read']}]
+      responses: {'200': {description: Current prompt, content: {application/json: {schema: {$ref: '#/components/schemas/Prompt'}}}}}
+    put:
+      tags: [prompts]
+      description: Owner/editor write under row lock; expected_revision prevents stale overwrites.
+      security: [{bearerAuth: ['prompts:read']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PromptUpdate'}}}}
+      responses: {'200': {description: New revision, content: {application/json: {schema: {$ref: '#/components/schemas/Prompt'}}}}, '403': {$ref: '#/components/responses/Forbidden'}, '409': {$ref: '#/components/responses/Conflict'}}
+  /projects/{project_id}/prompt-revisions:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    get:
+      tags: [prompts]
+      security: [{bearerAuth: ['prompts:read']}]
+      responses: {'200': {description: Immutable revisions, content: {application/json: {schema: {$ref: '#/components/schemas/PromptRevisionList'}}}}}
+  /projects/{project_id}/changes:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    get:
+      tags: [changes]
+      description: Monotonic ordered changes and tombstones; a cursor older than 90 days returns 410.
+      security: [{bearerAuth: ['projects:read']}]
+      parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}]
+      responses: {'200': {description: Change page, content: {application/json: {schema: {$ref: '#/components/schemas/ChangePage'}}}}, '410': {$ref: '#/components/responses/CursorExpired'}}
+  /projects/{project_id}/search-runs:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    get:
+      tags: [search-runs]
+      security: [{bearerAuth: ['projects:read']}]
+      responses: {'200': {description: Search runs, content: {application/json: {schema: {$ref: '#/components/schemas/SearchRunList'}}}}}
+    post:
+      tags: [search-runs]
+      security: [{bearerAuth: ['runs:write']}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SearchRunCreate'}}}}
+      responses: {'201': {description: Queued run with exact prompt snapshot, content: {application/json: {schema: {$ref: '#/components/schemas/SearchRun'}}}}, '409': {$ref: '#/components/responses/Conflict'}}
+  /projects/{project_id}/search-runs/{run_id}:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/RunId'}]
+    get:
+      tags: [search-runs]
+      security: [{bearerAuth: ['projects:read']}]
+      responses: {'200': {description: Search run, content: {application/json: {schema: {$ref: '#/components/schemas/SearchRun'}}}}, '404': {$ref: '#/components/responses/NotFound'}}
+  /projects/{project_id}/search-runs/{run_id}/claim:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/RunId'}]
+    post:
+      tags: [search-runs]
+      security: [{bearerAuth: ['runs:write']}]
+      description: Atomic five-minute lease; only one claimed/running run per project in v1.
+      responses: {'200': {description: One-time claim token and lease, content: {application/json: {schema: {$ref: '#/components/schemas/Claim'}}}}, '409': {$ref: '#/components/responses/Conflict'}}
+  /projects/{project_id}/search-runs/{run_id}/heartbeat:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/RunId'}]
+    post:
+      tags: [search-runs]
+      security: [{bearerAuth: ['runs:write']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ClaimRequest'}}}}
+      responses: {'200': {description: Renewed lease}, '409': {$ref: '#/components/responses/Conflict'}}
+  /projects/{project_id}/search-runs/{run_id}/complete:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/RunId'}]
+    post:
+      tags: [search-runs]
+      security: [{bearerAuth: ['runs:write']}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RunComplete'}}}}
+      responses: {'200': {description: Completed/failed run, content: {application/json: {schema: {$ref: '#/components/schemas/SearchRun'}}}}, '409': {$ref: '#/components/responses/Conflict'}}
+  /projects/{project_id}/leads:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    get:
+      tags: [leads]
+      security: [{bearerAuth: ['leads:read']}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: status, in: query, schema: {type: string, enum: [active, trashed]}}
+        - {name: interested_by, in: query, schema: {type: string, example: me}}
+        - {name: date_confidence, in: query, schema: {type: string, enum: [strong, verify]}}
+        - {name: housing_type, in: query, schema: {type: string}}
+        - {name: q, in: query, schema: {type: string, maxLength: 200}}
+      responses: {'200': {description: Lead page, content: {application/json: {schema: {$ref: '#/components/schemas/LeadPage'}}}}}
+    post:
+      tags: [leads]
+      security: [{bearerAuth: ['leads:write']}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/LeadInput'}}}}
+      responses: {'201': {description: Created lead, content: {application/json: {schema: {$ref: '#/components/schemas/Lead'}}}}, '409': {$ref: '#/components/responses/Conflict'}, '422': {$ref: '#/components/responses/Validation'}}
+  /projects/{project_id}/leads/bulk-upsert:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    post:
+      tags: [leads]
+      security: [{bearerAuth: ['leads:write']}]
+      description: Maximum 100 items. Each item is transactional; omitted fields never clear values.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/BulkUpsertRequest'}}}}
+      responses: {'200': {description: Per-item created/updated/unchanged/conflict/error results, content: {application/json: {schema: {$ref: '#/components/schemas/BulkUpsertResponse'}}}}, '409': {$ref: '#/components/responses/Conflict'}, '422': {$ref: '#/components/responses/Validation'}}
+  /projects/{project_id}/leads/{lead_id}:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/LeadId'}]
+    get:
+      tags: [leads]
+      security: [{bearerAuth: ['leads:read']}]
+      responses: {'200': {description: Lead, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Lead'}}}}, '404': {$ref: '#/components/responses/NotFound'}}
+    patch:
+      tags: [leads]
+      security: [{bearerAuth: ['leads:write']}]
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/LeadPatch'}}}}
+      responses: {'200': {description: Updated lead, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Lead'}}}}, '404': {$ref: '#/components/responses/NotFound'}, '409': {$ref: '#/components/responses/Conflict'}}
+    delete:
+      tags: [leads]
+      description: DELETE means reversible shared trash; permanent delete is absent in v1.
+      security: [{bearerAuth: ['leads:write']}]
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TrashRequest'}}}}
+      responses: {'204': {description: Trashed}, '409': {$ref: '#/components/responses/Conflict'}}
+  /projects/{project_id}/leads/{lead_id}/interest:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/LeadId'}]
+    put:
+      tags: [interest]
+      security: [{bearerAuth: ['interest:write']}]
+      responses: {'204': {description: Current user's interest set, idempotently}}
+    delete:
+      tags: [interest]
+      security: [{bearerAuth: ['interest:write']}]
+      responses: {'204': {description: Current user's interest removed, idempotently}}
+  /projects/{project_id}/leads/{lead_id}/comments:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/LeadId'}]
+    get:
+      tags: [comments]
+      security: [{bearerAuth: ['comments:read']}]
+      responses: {'200': {description: Plain-text comments, content: {application/json: {schema: {$ref: '#/components/schemas/CommentList'}}}}}
+    post:
+      tags: [comments]
+      security: [{bearerAuth: ['comments:write']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CommentInput'}}}}
+      responses: {'201': {description: Comment, content: {application/json: {schema: {$ref: '#/components/schemas/Comment'}}}}, '422': {$ref: '#/components/responses/Validation'}}
+  /projects/{project_id}/leads/{lead_id}/comments/{comment_id}:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/LeadId'}, {$ref: '#/components/parameters/CommentId'}]
+    patch:
+      tags: [comments]
+      security: [{bearerAuth: ['comments:write']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CommentInput'}}}}
+      responses: {'200': {description: Updated comment, content: {application/json: {schema: {$ref: '#/components/schemas/Comment'}}}}, '403': {$ref: '#/components/responses/Forbidden'}}
+    delete:
+      tags: [comments]
+      security: [{bearerAuth: ['comments:write']}]
+      responses: {'204': {description: Soft-deleted}, '403': {$ref: '#/components/responses/Forbidden'}}
+  /projects/{project_id}/interested:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    get:
+      tags: [interest, leads]
+      description: Defaults to the current user's pile; interested_by=any is an explicit group view exposing display names only.
+      security: [{bearerAuth: ['interest:read', 'leads:read']}]
+      parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}, {name: interested_by, in: query, schema: {type: string, default: me}}]
+      responses: {'200': {description: Interested lead page, content: {application/json: {schema: {$ref: '#/components/schemas/LeadPage'}}}}}
+  /projects/{project_id}/trash:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    get:
+      tags: [leads]
+      security: [{bearerAuth: ['leads:read']}]
+      responses: {'200': {description: Shared trash, content: {application/json: {schema: {$ref: '#/components/schemas/LeadPage'}}}}}
+  /projects/{project_id}/trash/{lead_id}/restore:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/LeadId'}]
+    post:
+      tags: [leads]
+      security: [{bearerAuth: ['leads:write']}]
+      responses: {'200': {description: Restored lead, content: {application/json: {schema: {$ref: '#/components/schemas/Lead'}}}}, '403': {$ref: '#/components/responses/Forbidden'}, '409': {$ref: '#/components/responses/Conflict'}}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  parameters:
+    ProjectId: {name: project_id, in: path, required: true, schema: {type: string, format: uuid}}
+    LeadId: {name: lead_id, in: path, required: true, schema: {type: string, format: uuid}}
+    RunId: {name: run_id, in: path, required: true, schema: {type: string, format: uuid}}
+    CommentId: {name: comment_id, in: path, required: true, schema: {type: string, format: uuid}}
+    TokenId: {name: token_id, in: path, required: true, schema: {type: string, format: uuid}}
+    InvitationToken: {name: invitation_token, in: path, required: true, schema: {type: string, minLength: 32}}
+    Cursor: {name: cursor, in: query, schema: {type: string}}
+    Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+    IdempotencyKey: {name: Idempotency-Key, in: header, schema: {type: string, minLength: 8, maxLength: 200}}
+    IfMatch: {name: If-Match, in: header, required: true, schema: {type: string}}
+  headers:
+    ETag: {description: Opaque lead revision; send as If-Match, schema: {type: string}}
+  responses:
+    Unauthorized: {description: 401 invalid/expired/revoked credentials, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Forbidden: {description: 403 insufficient role or scope, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    NotFound: {description: 404 inaccessible object or absent object, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Conflict: {description: 409 stale ETag, lease, idempotency mismatch, identity collision, or lifecycle conflict, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    CursorExpired: {description: 410 cursor older than 90-day retention, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Validation: {description: 422 bounded validation/enum/URL error, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    RateLimited: {description: '429; honor Retry-After', content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  schemas:
+    Error:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code: {type: string, example: stale_write}
+        message: {type: string}
+        fields: {type: object, additionalProperties: {type: array, items: {type: string}}}
+        request_id: {type: string}
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties: {error: {$ref: '#/components/schemas/Error'}}
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: {type: string, format: email}
+        password: {type: string, format: password, minLength: 12}
+        display_name: {type: string, maxLength: 120}
+    TokenExchange:
+      type: object
+      required: [email, password]
+      properties:
+        email: {type: string, format: email}
+        password: {type: string, format: password}
+        name: {type: string, maxLength: 120}
+        scopes: {type: array, items: {type: string}}
+        project_ids: {type: array, items: {type: string, format: uuid}}
+    TokenCreate:
+      type: object
+      required: [name, scopes]
+      properties:
+        name: {type: string, maxLength: 120}
+        scopes: {type: array, items: {type: string}}
+        project_ids: {type: array, items: {type: string, format: uuid}}
+        expires_at: {type: string, format: date-time}
+    TokenResponse:
+      type: object
+      required: [id, token, expires_at]
+      properties:
+        id: {type: string, format: uuid}
+        token: {type: string, writeOnly: true}
+        scopes: {type: array, items: {type: string}}
+        expires_at: {type: string, format: date-time}
+    TokenList:
+      type: object
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/TokenMetadata'}}}
+    TokenMetadata:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        prefix: {type: string}
+        scopes: {type: array, items: {type: string}}
+        project_ids: {type: array, items: {type: string, format: uuid}}
+        expires_at: {type: string, format: date-time}
+        revoked_at: {type: string, format: date-time, nullable: true}
+    User:
+      type: object
+      required: [id, email]
+      properties:
+        id: {type: string, format: uuid}
+        email: {type: string, format: email}
+        display_name: {type: string}
+    Profile:
+      type: object
+      properties:
+        display_name: {type: string, maxLength: 120}
+        timezone: {type: string, maxLength: 80}
+        bio: {type: string, maxLength: 5000}
+        details: {type: object, additionalProperties: true}
+    SavedPrompt:
+      type: object
+      required: [title, prompt]
+      properties:
+        id: {type: string, format: uuid}
+        title: {type: string, maxLength: 200}
+        prompt: {type: string, maxLength: 20000}
+        updated_at: {type: string, format: date-time}
+    SavedPromptList:
+      type: object
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/SavedPrompt'}}}
+    ProjectCreate:
+      type: object
+      required: [name, prompt]
+      properties:
+        name: {type: string, maxLength: 200}
+        description: {type: string, maxLength: 5000}
+        prompt: {type: string, maxLength: 20000}
+        criteria: {type: object, additionalProperties: true}
+    ProjectPatch:
+      type: object
+      properties:
+        name: {type: string, maxLength: 200}
+        description: {type: string, maxLength: 5000}
+        status: {type: string, enum: [active, archived]}
+    Project:
+      allOf:
+        - $ref: '#/components/schemas/ProjectCreate'
+        - type: object
+          required: [id, role, prompt_revision, latest_change_sequence]
+          properties:
+            id: {type: string, format: uuid}
+            role: {type: string, enum: [owner, editor, viewer]}
+            prompt_revision: {type: integer}
+            latest_change_sequence: {type: integer}
+            created_at: {type: string, format: date-time}
+    ProjectList:
+      type: object
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/Project'}}}
+    Member:
+      type: object
+      properties:
+        user_id: {type: string, format: uuid}
+        display_name: {type: string}
+        role: {type: string, enum: [owner, editor, viewer]}
+    MemberList:
+      type: object
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/Member'}}}
+    MemberPatch:
+      type: object
+      required: [user_id, role]
+      properties: {user_id: {type: string, format: uuid}, role: {type: string, enum: [owner, editor, viewer]}}
+    InvitationCreate:
+      type: object
+      required: [email, role]
+      properties: {email: {type: string, format: email}, role: {type: string, enum: [editor, viewer]}}
+    Invitation:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        role: {type: string}
+        expires_at: {type: string, format: date-time}
+        invite_url: {type: string, format: uri, writeOnly: true}
+    Prompt:
+      type: object
+      required: [prompt, criteria, revision]
+      properties:
+        prompt: {type: string, maxLength: 20000}
+        criteria: {type: object, additionalProperties: true}
+        revision: {type: integer}
+        updated_at: {type: string, format: date-time}
+    PromptUpdate:
+      type: object
+      required: [prompt, expected_revision]
+      properties:
+        prompt: {type: string, maxLength: 20000}
+        criteria: {type: object, additionalProperties: true}
+        expected_revision: {type: integer}
+    PromptRevisionList:
+      type: object
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/Prompt'}}}
+    Change:
+      type: object
+      required: [sequence, event_type, occurred_at]
+      properties:
+        sequence: {type: integer}
+        event_type: {type: string}
+        object_id: {type: string}
+        payload: {type: object, additionalProperties: true}
+        tombstone: {type: boolean}
+        occurred_at: {type: string, format: date-time}
+    ChangePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Change'}}
+        next_cursor: {type: string}
+    SearchRunCreate:
+      type: object
+      properties:
+        agent_label: {type: string, maxLength: 120}
+        continuation_from_run_id: {type: string, format: uuid}
+        input_cursor: {type: string, maxLength: 2000}
+    SearchRun:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        status: {type: string, enum: [queued, claimed, running, completed, failed, cancelled]}
+        agent_label: {type: string}
+        prompt_revision: {type: integer}
+        prompt_snapshot: {type: string}
+        criteria_snapshot: {type: object, additionalProperties: true}
+        lease_expires_at: {type: string, format: date-time, nullable: true}
+        attempt_count: {type: integer}
+        result_counts: {type: object, additionalProperties: {type: integer}}
+        summary: {type: string}
+        created_at: {type: string, format: date-time}
+    SearchRunList:
+      type: object
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/SearchRun'}}}
+    ClaimRequest:
+      type: object
+      required: [claim_token]
+      properties: {claim_token: {type: string, writeOnly: true}}
+    Claim:
+      type: object
+      required: [claim_token, lease_expires_at]
+      properties:
+        claim_token: {type: string, writeOnly: true}
+        lease_expires_at: {type: string, format: date-time}
+    RunComplete:
+      allOf:
+        - $ref: '#/components/schemas/ClaimRequest'
+        - type: object
+          required: [status]
+          properties:
+            status: {type: string, enum: [completed, failed]}
+            output_cursor: {type: string, maxLength: 2000}
+            continuation: {type: object, additionalProperties: true}
+            result_counts: {type: object, additionalProperties: {type: integer}}
+            summary: {type: string, maxLength: 5000}
+    LeadInput:
+      type: object
+      required: [source, url, title]
+      properties:
+        source: {type: string, maxLength: 120}
+        source_listing_id: {type: string, maxLength: 300}
+        url: {type: string, format: uri, pattern: '^https?://'}
+        title: {type: string, maxLength: 500}
+        summary: {type: string, maxLength: 10000}
+        location: {type: string, maxLength: 500}
+        price_display: {type: string, maxLength: 200}
+        price_amount: {type: number, minimum: 0}
+        currency: {type: string, maxLength: 3}
+        availability: {type: string, maxLength: 200}
+        housing_type: {type: string, maxLength: 100}
+        date_confidence: {type: string, enum: [strong, verify, unknown]}
+        parks: {type: string, maxLength: 1000}
+        attributes: {type: object, additionalProperties: true}
+        verification_notes: {type: string, maxLength: 5000}
+        search_run_id: {type: string, format: uuid}
+        observed_at: {type: string, format: date-time}
+    LeadPatch:
+      allOf: [{$ref: '#/components/schemas/LeadInput'}]
+    Lead:
+      allOf:
+        - $ref: '#/components/schemas/LeadInput'
+        - type: object
+          required: [id, project_id, status, revision]
+          properties:
+            id: {type: string, format: uuid}
+            project_id: {type: string, format: uuid}
+            status: {type: string, enum: [active, trashed]}
+            trash_reason: {type: string, nullable: true}
+            interested_users: {type: array, items: {type: string}}
+            comment_count: {type: integer}
+            revision: {type: integer}
+            updated_at: {type: string, format: date-time}
+    LeadPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Lead'}}
+        next_cursor: {type: string}
+    BulkUpsertRequest:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, minItems: 1, maxItems: 100, items: {$ref: '#/components/schemas/BulkLeadItem'}}
+    BulkLeadItem:
+      allOf:
+        - $ref: '#/components/schemas/LeadInput'
+        - type: object
+          properties: {if_match: {type: string}}
+    BulkUpsertResponse:
+      type: object
+      properties: {results: {type: array, items: {$ref: '#/components/schemas/BulkResult'}}}
+    BulkResult:
+      type: object
+      required: [index, outcome]
+      properties:
+        index: {type: integer}
+        outcome: {type: string, enum: [created, updated, unchanged, conflict, error]}
+        lead: {$ref: '#/components/schemas/Lead'}
+        error: {$ref: '#/components/schemas/Error'}
+    TrashRequest:
+      type: object
+      required: [reason]
+      properties: {reason: {type: string, minLength: 1, maxLength: 500}}
+    CommentInput:
+      type: object
+      required: [body]
+      properties: {body: {type: string, minLength: 1, maxLength: 10000}}
+    Comment:
+      allOf:
+        - $ref: '#/components/schemas/CommentInput'
+        - type: object
+          properties:
+            id: {type: string, format: uuid}
+            author_id: {type: string, format: uuid}
+            author_display_name: {type: string}
+            created_at: {type: string, format: date-time}
+            edited_at: {type: string, format: date-time, nullable: true}
+    CommentList:
+      type: object
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/Comment'}}}

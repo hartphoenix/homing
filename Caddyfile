@@ -1,0 +1,29 @@
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	# Never pass credentials or cookies to access logs. Caddy's default request
+	# log fields are intentionally restricted to method/URI/status/timing.
+	log {
+		output stdout
+		format json
+		 sampling {
+			interval 1m
+			first 100
+			after 100
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	reverse_proxy web:8000 {
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+}
+
