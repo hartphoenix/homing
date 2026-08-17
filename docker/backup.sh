@@ -2,7 +2,7 @@
 set -eu
 umask 077
 
-project_dir=${PROJECT_DIR:-"$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"}
+project_dir=${PROJECT_DIR:-"$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"}
 backup_dir=${BACKUP_DIR:-"$project_dir/backups"}
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 output="$backup_dir/homing-$timestamp.dump.age"

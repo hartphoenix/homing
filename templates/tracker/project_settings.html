@@ -1,1 +1,72 @@
-{% extends 'tracker/base.html' %}{% block title %}Settings · {{ project.name }}{% endblock %}{% block content %}{% include 'tracker/_project_nav.html' %}<div class="page-heading"><div><p class="eyebrow">Project settings</p><h1>{{ project.name }}</h1></div></div><div class="settings-grid"><section class="panel"><div class="section-heading"><h2>Details</h2><a href="{% url 'tracker:project-edit' project.slug %}">Edit</a></div><dl class="detail-facts"><div><dt>Description</dt><dd>{{ project.description|default:'None' }}</dd></div><div><dt>Status</dt><dd>{{ project.status|default:'Active' }}</dd></div></dl></section><section class="panel"><div class="section-heading"><h2>Members</h2><a href="{% url 'tracker:member-invite' project.slug %}">Invite</a></div><ul class="member-list">{% for member in members %}<li><span><strong>{{ member.display_name }}</strong><small>{{ member.email|default:member.role }}</small></span><span class="badge">{{ member.role }}</span></li>{% empty %}<li class="muted">You are the only member.</li>{% endfor %}</ul>{% if invitations %}<h3>Pending invitations</h3><ul class="member-list">{% for invitation in invitations %}<li><span>{{ invitation.email }}<small>Expires {{ invitation.expires_at }}</small></span><span class="badge">{{ invitation.role }} · pending</span></li>{% endfor %}</ul>{% endif %}</section></div>{% endblock %}
+{% extends 'tracker/base.html' %}
+{% block title %}Settings · {{ project.name }}{% endblock %}
+{% block content %}
+{% include 'tracker/_project_nav.html' %}
+<div class="page-heading">
+  <div><p class="eyebrow">Project settings</p><h1>{{ project.name }}</h1></div>
+</div>
+<div class="settings-grid">
+  <section class="panel">
+    <div class="section-heading">
+      <h2>Details</h2>
+      {% if can_edit_project %}<a href="{% url 'tracker:project-edit' project.slug %}">Edit</a>{% endif %}
+    </div>
+    <dl class="detail-facts">
+      <div><dt>Description</dt><dd>{{ project.description|default:'None' }}</dd></div>
+      <div><dt>Status</dt><dd>{{ project.status|default:'Active' }}</dd></div>
+    </dl>
+  </section>
+  <section class="panel">
+    <div class="section-heading">
+      <h2>Members</h2>
+      <a href="{% url 'tracker:member-invite' project.slug %}">Invite</a>
+    </div>
+    <ul class="member-list">
+      {% for member in members %}
+      <li>
+        <span><strong>{{ member.display_name }}</strong><small>{{ member.email|default:member.role }}</small></span>
+        <span class="member-actions">
+          <span class="badge">{{ member.role }}</span>
+          {% if can_manage_project %}
+            {% if member.can_remove %}
+            <button
+              class="link-button danger-link"
+              type="button"
+              data-member-remove
+              data-member-name="{{ member.display_name }}"
+              data-remove-url="{% url 'tracker:member-remove' project.slug member.user_id %}"
+            >Remove</button>
+            {% else %}
+            <button class="link-button danger-link" type="button" disabled title="A project must retain an owner.">Remove</button>
+            {% endif %}
+          {% endif %}
+        </span>
+      </li>
+      {% empty %}
+      <li class="muted">You are the only member.</li>
+      {% endfor %}
+    </ul>
+    {% if invitations %}
+    <h3>Pending invitations</h3>
+    <ul class="member-list">
+      {% for invitation in invitations %}
+      <li><span>{{ invitation.email }}<small>Expires {{ invitation.expires_at }}</small></span><span class="badge">{{ invitation.role }} · pending</span></li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+</div>
+{% if can_manage_project %}
+<dialog class="trash-dialog" data-member-remove-dialog aria-labelledby="member-remove-title">
+  <form method="post" data-member-remove-form>
+    {% csrf_token %}
+    <h2 id="member-remove-title">Remove project member?</h2>
+    <p><strong data-member-remove-name>Selected member</strong> will lose access to this project. Their account will not be deleted.</p>
+    <div class="form-actions">
+      <button class="button danger-button" type="submit">Remove member</button>
+      <button class="button button-quiet" type="button" data-member-remove-cancel>Cancel</button>
+    </div>
+  </form>
+</dialog>
+{% endif %}
+{% endblock %}

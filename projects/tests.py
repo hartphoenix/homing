@@ -4,9 +4,9 @@ from django.http import Http404
 from django.test import TestCase
 
 from accounts.models import User
-from projects.models import Lead, Project, ProjectMembership
+from projects.models import Lead, LeadComment, Project, ProjectMembership
 from projects.services.authorization import authorize_project
-from projects.services.mutations import PromptRevisionConflict, trash_lead, update_project_prompt
+from projects.services.mutations import PromptRevisionConflict, restore_lead, trash_lead, update_project_prompt
 
 
 class ProjectFoundationTests(TestCase):
@@ -33,8 +33,10 @@ class ProjectFoundationTests(TestCase):
         with self.assertRaises(PromptRevisionConflict):
             update_project_prompt(self.project, editor=self.owner, prompt="stale", criteria={}, expected_revision=0)
 
-    def test_trash_requires_reason_and_is_reversible(self):
-        with self.assertRaises(ValueError):
-            trash_lead(self.lead, actor=self.owner, reason="")
-        trashed = trash_lead(self.lead, actor=self.owner, reason="Dates contradicted")
+    def test_trash_accepts_empty_or_optional_comment_and_is_reversible(self):
+        trashed = trash_lead(self.lead, actor=self.owner, comment="Dates contradicted")
         self.assertEqual(trashed.status, Lead.Status.TRASHED)
+        self.assertEqual(trashed.comments.get().body, "Dates contradicted")
+        restored = restore_lead(trashed, actor=self.viewer)
+        self.assertEqual(restored.status, Lead.Status.ACTIVE)
+        self.assertEqual(LeadComment.objects.count(), 1)

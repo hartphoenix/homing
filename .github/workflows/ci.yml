@@ -31,14 +31,16 @@ jobs:
     env:
       DATABASE_URL: postgresql://sublet_tracker:ci-only-password@localhost:5432/sublet_tracker_test
       DJANGO_SETTINGS_MODULE: config.settings
-      DJANGO_SECRET_KEY: ci-only-secret-not-used-in-production
+      DJANGO_SECRET_KEY: ci-only-7hG2vK9mQ4sT8xP3nR6wY1cF5jL0bD2uA9eZ7kN4-not-production
       DJANGO_DEBUG: "0"
       DJANGO_ALLOWED_HOSTS: localhost
-      SECURE_SSL_REDIRECT: "1"
+      # Django's test client uses HTTP unless a test explicitly requests HTTPS.
+      # Exercise redirects in the deploy check without redirecting the suite.
+      SECURE_SSL_REDIRECT: "0"
       ALLOW_PUBLIC_SIGNUP: "true"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
           cache: pip
@@ -48,7 +50,7 @@ jobs:
         run: python -m ruff check .
       - name: Django checks and migration drift
         run: |
-          python manage.py check --deploy
+          SECURE_SSL_REDIRECT=1 python manage.py check --deploy
           python manage.py makemigrations --check --dry-run
       - name: Tests
         run: python -m pytest -q
@@ -58,7 +60,7 @@ jobs:
   config:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Validate shell scripts
         run: shellcheck docker/*.sh
       - name: Validate OpenAPI and YAML
@@ -71,7 +73,7 @@ jobs:
           docker compose --env-file .env config --quiet
           rm -f .env
       - name: Build production image
-        run: docker build --file Dockerfile --tag sublet-tracker-ci:check .
+        run: docker build --file Dockerfile --tag homing-ci:check .
       - name: Validate Caddy configuration
         run: |
           docker run --rm \

@@ -21,7 +21,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from accounts.models import Profile, User
-from projects.models import Lead, LeadInterest, Project, ProjectMembership, PromptRevision, listing_identity_hash
+from projects.models import Lead, LeadComment, LeadInterest, Project, ProjectMembership, PromptRevision, listing_identity_hash
 
 
 DEFAULT_PROJECT_FIXTURE = Path(__file__).resolve().parents[2] / "fixtures" / "september_2026_project.json"
@@ -143,7 +143,10 @@ without writing to the database.
             elif password:
                 user.set_password(password)
                 user.save(update_fields=["password", "updated_at"])
-            Profile.objects.get_or_create(user=user)
+            Profile.objects.get_or_create(
+                user=user,
+                defaults={"display_name": email.partition("@")[0][:120] or "Member"},
+            )
 
             project, project_created = Project.objects.get_or_create(
                 slug=fixture["slug"],
@@ -271,11 +274,15 @@ without writing to the database.
             lead = imported["by_id"].get(legacy_id)
             if lead and lead.status != Lead.Status.TRASHED:
                 lead.status = Lead.Status.TRASHED
-                lead.trash_reason = "Imported from legacy browser trash"
                 lead.trashed_by = user
                 lead.trashed_at = timezone.now()
                 lead.revision += 1
-                lead.save(update_fields=["status", "trash_reason", "trashed_by", "trashed_at", "revision", "updated_at"])
+                lead.save(update_fields=["status", "trashed_by", "trashed_at", "revision", "updated_at"])
+                LeadComment.objects.create(
+                    lead=lead,
+                    author=user,
+                    body="Imported from legacy browser trash",
+                )
         known_ids = set(imported["by_id"])
         report = {
             "interested_ids": sorted(legacy["interested"]),

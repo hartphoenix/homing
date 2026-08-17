@@ -4,7 +4,7 @@ umask 077
 
 # Run as the unprivileged deploy user from the checked-out release directory.
 # Do not enable shell tracing: .env values and DATABASE_URL must never be logged.
-project_dir=${PROJECT_DIR:-"$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"}
+project_dir=${PROJECT_DIR:-"$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"}
 lock_file=${DEPLOY_LOCK_FILE:-"$project_dir/.deploy.lock"}
 
 if ! command -v flock >/dev/null 2>&1; then

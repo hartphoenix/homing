@@ -9,7 +9,12 @@ urlpatterns = [
     path("auth/token", views.token_exchange),
     path("auth/tokens", views.tokens),
     path("auth/tokens/<uuid:token_id>", views.token_detail),
+    # Device-code pairing.  Both are unauthenticated by design: the agent has no
+    # credential yet, and the human half of the handshake happens at /link/.
+    path("agent-link", views.agent_link_start),
+    path("agent-link/token", views.agent_link_poll),
     path("me", views.me),
+    path("me/token", views.me_token),
     path("me/profile", views.profile),
     path("me/saved-prompts", views.saved_prompts),
     path("me/projects", views.my_projects),
@@ -28,6 +33,7 @@ urlpatterns = [
     path("projects/<uuid:project_id>/search-runs/<uuid:run_id>/complete", views.complete_run),
     path("projects/<uuid:project_id>/leads", views.leads),
     path("projects/<uuid:project_id>/leads/bulk-upsert", views.bulk_upsert),
+    path("projects/<uuid:project_id>/leads/batch", views.lead_batch),
     path("projects/<uuid:project_id>/leads/<uuid:lead_id>", views.lead_detail),
     path("projects/<uuid:project_id>/leads/<uuid:lead_id>/interest", views.interest),
     path("projects/<uuid:project_id>/leads/<uuid:lead_id>/comments", views.comments),

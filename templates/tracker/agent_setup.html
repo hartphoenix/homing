@@ -1,45 +1,96 @@
 {% extends 'tracker/base.html' %}
-{% block title %}Equip an agent · Homing{% endblock %}
+{% block title %}Your search assistant · Homing{% endblock %}
 {% block content %}
-<div class="page-heading agent-heading"><div><p class="eyebrow">Agent access</p><h1>Equip an agent</h1><p class="muted">Connect a search agent once. It can discover and maintain every Homing project you can access, including projects added later.</p></div></div>
 
-<div class="setup-grid">
-  <section class="panel setup-step">
-    <span class="step-number">1</span>
-    <h2>Create an access token</h2>
-    <p class="muted">This is safer than giving an agent your password. You can revoke it at any time.</p>
-    <form method="post">{% csrf_token %}{% include 'tracker/_form_fields.html' with form=form %}<button class="button button-primary">Create access token</button></form>
-    {% if new_token %}
-    <div class="secret-callout" role="status">
-      <p class="eyebrow">Shown once</p>
-      <strong>Your access token is ready.</strong>
-      <p>Copy it now, then store it as <code>HOMING_API_TOKEN</code> when your agent guides you. Homing cannot show it again.</p>
-      <div class="copy-field"><input type="password" readonly value="{{ new_token }}" data-copy-target aria-label="New agent access token"><button type="button" class="button" data-copy data-copy-label="Copy token" aria-live="polite">Copy token</button></div>
-    </div>
-    {% endif %}
-  </section>
+{% if state == 'new' %}
+<div class="page-heading agent-heading"><div><p class="eyebrow">Your assistant</p><h1>Let an assistant do the searching</h1><p class="muted">Give your AI assistant this instruction once. It will set itself up, ask you to approve the connection, then keep checking for new places on its own.</p></div></div>
 
-  <section class="panel setup-step">
-    <span class="step-number">2</span>
-    <h2>Give your agent instructions</h2>
-    <p class="muted">Choose either option. The instructions guide nontechnical users through saving the key safely and verify the connection.</p>
-    <div class="agent-actions">
-      <button type="button" class="button button-primary" data-copy data-copy-source="agent-prompt" data-copy-label="Copy setup prompt" aria-live="polite">Copy setup prompt</button>
-      <a class="button" href="{% url 'tracker:agent-skill-download' %}">Download SKILL.md</a>
-    </div>
-    <details class="prompt-preview"><summary>Preview the setup prompt</summary><label class="sr-only" for="agent-prompt">Agent setup prompt</label><textarea id="agent-prompt" readonly rows="18">{{ agent_prompt }}</textarea></details>
-  </section>
-
-  <section class="panel setup-step setup-wide">
-    <span class="step-number">3</span>
-    <h2>Let the agent guide you</h2>
-    <p>Paste the setup prompt into your agent, or ask it to install the downloaded skill. It will explain where to save the token for your particular setup, test the connection without changing anything, then discover your projects automatically. It can also help schedule recurring searches.</p>
-    <p class="muted">The prompt and downloaded file never contain your token. Avoid pasting the token directly into chat when your agent offers a secret or environment-variable setting.</p>
-  </section>
-</div>
-
-<section class="panel token-panel">
-  <div class="section-heading"><div><p class="eyebrow">Connections</p><h2>Agent tokens</h2></div></div>
-  <ul class="token-list">{% for token in tokens %}<li><span><strong>{{ token.name }}</strong><small>All projects · expires {{ token.expires_at }}</small></span>{% if token.revoked_at %}<span class="badge badge-trash">Revoked</span>{% else %}<form method="post" action="{% url 'tracker:token-revoke' token.id %}" class="inline-form">{% csrf_token %}<input type="hidden" name="next" value="{% url 'tracker:agent-setup' %}"><button class="link-button danger-link">Revoke</button></form>{% endif %}</li>{% empty %}<li class="muted">No agent tokens yet.</li>{% endfor %}</ul>
+<section class="panel agent-primary" aria-labelledby="instruction-heading">
+  <h2 id="instruction-heading">Copy this to your assistant</h2>
+  <p>Paste it into ChatGPT, Claude, or whichever AI assistant you use, and send it. It will come back and ask you to approve the connection here.</p>
+  <p class="agent-actions"><button type="button" class="button button-primary" data-copy data-copy-source="agent-prompt" aria-live="polite">Copy the instruction</button></p>
+  <details class="prompt-preview"><summary>See what it says</summary><label class="sr-only" for="agent-prompt">The instruction for your assistant</label><textarea id="agent-prompt" readonly rows="14">{{ agent_prompt }}</textarea></details>
+  {% if approved_link %}<p class="agent-note" role="status">You approved <strong>{{ approved_link.agent_label }}</strong>. It will finish connecting the next time it checks in.</p>{% endif %}
+  <p class="muted">Your assistant showing you a six-character code? <a href="{% url 'tracker:agent-link' %}">Enter it here</a>.</p>
 </section>
+
+{% elif state == 'pending' %}
+<div class="page-heading agent-heading"><div><p class="eyebrow">Your assistant</p><h1>An assistant is asking to connect</h1><p class="muted">Check the code before you approve it. Nothing is shared until you do.</p></div></div>
+
+<section class="panel agent-primary" aria-labelledby="pending-heading">
+  <h2 id="pending-heading">{{ pending_link.agent_label }} wants to connect</h2>
+  {% if pending_link.environment_note %}<p class="muted">It says it is running: {{ pending_link.environment_note }}</p>{% endif %}
+  <p>It should be showing you the code <strong>{{ pending_link.user_code }}</strong>. If it isn't, or you didn't start this, deny it.</p>
+  <p class="agent-actions"><a class="button button-primary" href="{% url 'tracker:agent-link' %}?code={{ pending_link.user_code }}">Look at the request</a></p>
+</section>
+
+{% else %}
+{% if state == 'silent' %}
+<div class="page-heading agent-heading"><div><p class="eyebrow">Your assistant</p><h1>Your search hasn't checked in</h1><p class="muted">This usually means the computer it runs on was asleep, or the assistant was turned off. Nothing is lost.</p></div></div>
+{% else %}
+<div class="page-heading agent-heading"><div><p class="eyebrow">Your assistant</p><h1>Your search is running</h1><p class="muted">It only ever adds and updates places. It cannot delete or un-delete anything, and it keeps your access key to itself.</p></div></div>
+{% endif %}
+
+<section class="panel agent-status {% if state == 'silent' %}is-silent{% endif %}" aria-labelledby="status-heading">
+  <h2 id="status-heading">{{ agent.name }}{% if state == 'silent' %} last checked {% if last_check %}{{ last_check.happened_at|timesince }} ago{% else %}never{% endif %}{% else %} is connected{% endif %}</h2>
+  {% if paused_until %}<p class="agent-note" role="status"><strong>Paused.</strong> Nothing new will be added until you resume. It starts again on its own {{ paused_until|date:"j M Y" }}.</p>{% endif %}
+  <dl class="status-facts">
+    <div><dt>Searching</dt><dd>{% for name in searching %}{{ name }}{% if not forloop.last %} · {% endif %}{% empty %}Nothing yet — make a search first{% endfor %}</dd></div>
+    <div><dt>How often</dt><dd>{{ cadence_text }}</dd></div>
+    <div><dt>Where it runs</dt><dd>{{ agent.environment_note|default:"It didn't say" }}</dd></div>
+    <div><dt>Last check</dt><dd>{% if last_check %}{{ last_check.happened_at|timesince }} ago — {{ last_check.outcome }}{% else %}Not yet{% endif %}</dd></div>
+    <div><dt>Next check</dt><dd>{% if paused_until %}Paused{% elif next_check %}{{ next_check|date:"D j M, H:i" }}{% else %}When you ask{% endif %}</dd></div>
+  </dl>
+  <div class="agent-actions">
+    <form method="post" class="inline-form">{% csrf_token %}
+      {% if paused_until %}<button class="button button-primary" name="action" value="resume">Resume</button>{% else %}<button class="button" name="action" value="pause">Pause for now</button>{% endif %}
+    </form>
+    <form method="post" class="inline-form">{% csrf_token %}<input type="hidden" name="token_id" value="{{ agent.id }}"><button class="button danger-button" name="action" value="disconnect">Disconnect</button></form>
+  </div>
+  <p class="muted">Disconnecting stops it immediately. Everything it already found stays.</p>
+</section>
+
+{% if state == 'silent' %}
+<section class="panel agent-primary" aria-labelledby="repair-heading">
+  <h2 id="repair-heading">Ask it to fix itself</h2>
+  <p>Copy the instruction again and paste it to your assistant. It will check its own setup and start again.</p>
+  <p class="agent-actions"><button type="button" class="button button-primary" data-copy data-copy-source="agent-prompt" aria-live="polite">Copy the instruction again</button></p>
+  <details class="prompt-preview"><summary>See what it says</summary><label class="sr-only" for="agent-prompt">The instruction for your assistant</label><textarea id="agent-prompt" readonly rows="14">{{ agent_prompt }}</textarea></details>
+</section>
+{% else %}
+<details class="panel agent-more"><summary>Set up another assistant</summary>
+  <p>Paste this to any other AI assistant you use. Each one connects separately, and you can disconnect them one at a time.</p>
+  <p class="agent-actions"><button type="button" class="button" data-copy data-copy-source="agent-prompt" aria-live="polite">Copy the instruction</button></p>
+  <label class="sr-only" for="agent-prompt">The instruction for your assistant</label><textarea id="agent-prompt" class="prompt-text-area" readonly rows="10">{{ agent_prompt }}</textarea>
+</details>
+{% endif %}
+
+<section class="panel agent-checks" aria-labelledby="checks-heading">
+  <div class="section-heading"><div><p class="eyebrow">History</p><h2 id="checks-heading">Recent checks</h2></div></div>
+  <ul class="check-list">{% for check in checks %}<li><span><strong>{{ check.happened_at|date:"j M, H:i" }}</strong><small>{{ check.project.name }}</small></span><span>{{ check.outcome }}</span></li>{% empty %}<li class="muted">No checks yet. The first one happens after your assistant finishes setting itself up.</li>{% endfor %}</ul>
+</section>
+{% endif %}
+
+<details class="panel agent-more" {% if new_key %}open{% endif %}><summary>Other ways to connect</summary>
+  <p>Most people never need this. If your assistant cannot reach Homing on its own, make an access key and hand it over yourself. Anything you paste into a chat window can be read by anyone who can see that chat, so use the instruction above when you can.</p>
+  <form method="post">{% csrf_token %}
+    <input type="hidden" name="action" value="create-key">
+    <div class="field"><label for="key-name">Name this connection</label><span class="form-help">A private label so you can recognise it later.</span><input id="key-name" name="name" maxlength="120" value="My search assistant" autocomplete="off"></div>
+    <button class="button">Make an access key</button>
+  </form>
+  {% if new_key %}
+  <div class="key-callout" role="status">
+    <p class="eyebrow">Shown once</p>
+    <strong>Your access key is ready.</strong>
+    <p>Give it to your assistant now — Homing cannot show it again. It leaves this page when you do, so keep it out of anywhere you would not keep a house key.</p>
+    <label class="sr-only" for="new-key">Your new access key</label>
+    <input id="new-key" type="text" readonly value="{{ new_key }}" spellcheck="false" autocomplete="off">
+    <p class="muted">A key made this way can add and update places and leave comments. It cannot delete or restore anything, and it cannot change your account.</p>
+  </div>
+  {% endif %}
+  {% if tokens %}
+  <h3>Connections</h3>
+  <ul class="token-list">{% for token in tokens %}<li><span><strong>{{ token.name }}</strong><small>{% if token.revoked_at %}Disconnected {{ token.revoked_at|date:"j M Y" }}{% else %}All your searches · stops working {{ token.expires_at|date:"j M Y" }}{% if token.exposed_to_chat %} · you carried this key by hand{% endif %}{% endif %}</small></span>{% if token.revoked_at %}<span class="badge badge-trash">Disconnected</span>{% else %}<form method="post" class="inline-form">{% csrf_token %}<input type="hidden" name="token_id" value="{{ token.id }}"><button class="link-button danger-link" name="action" value="disconnect">Disconnect</button></form>{% endif %}</li>{% endfor %}</ul>
+  {% endif %}
+</details>
 {% endblock %}

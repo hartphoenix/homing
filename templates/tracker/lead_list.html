@@ -1,1 +1,63 @@
-{% extends 'tracker/base.html' %}{% block title %}{% if is_trash %}Trash{% else %}Leads{% endif %} · {{ project.name }}{% endblock %}{% block content %}{% include 'tracker/_project_nav.html' %}<div class="page-heading"><div><p class="eyebrow">{{ project.name }}</p><h1>{% if is_trash %}Trash{% else %}Leads{% endif %}</h1><p class="muted">{% if is_trash %}Trashed leads are hidden from active search results and can be restored by an editor.{% else %}Unknowns stay visible until someone verifies them.{% endif %}</p></div>{% if can_edit_leads and not is_trash %}<a class="button button-primary" href="{% url 'tracker:lead-create' project.slug %}">Add lead</a>{% endif %}</div><form class="filter-bar" method="get"><label>Search<input type="search" name="q" value="{{ filters.q }}" placeholder="Title, location, source"></label><label>Date confidence<select name="date_confidence"><option value="">Any confidence</option>{% for value,label in date_confidence_choices %}<option value="{{ value }}"{% if filters.date_confidence == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label><label>Housing<select name="housing_type"><option value="">Any type</option>{% for value,label in housing_choices %}<option value="{{ value }}"{% if filters.housing_type == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label><label class="check-label"><input type="checkbox" name="interested_by" value="me"{% if filters.interested_by == 'me' %} checked{% endif %}> Interested by me</label><button class="button">Filter</button>{% if filters.q or filters.date_confidence or filters.housing_type or filters.interested_by %}<a class="button button-quiet" href="{% url 'tracker:lead-list' project.slug %}{% if is_trash %}?status=trash{% endif %}">Clear</a>{% endif %}</form>{% if leads %}<div class="lead-list">{% for lead in leads %}{% include 'tracker/_lead_card.html' with lead=lead %}{% endfor %}</div>{% else %}<div class="empty-state"><h2>{% if is_trash %}Trash is empty{% else %}No leads match these filters{% endif %}</h2><p>{% if is_trash %}Deleted leads will appear here with their reason and can be restored.{% else %}Try clearing a filter or add the first lead to this project.{% endif %}</p></div>{% endif %}{% endblock %}
+{% extends 'tracker/base.html' %}
+{% block title %}{% if is_trash %}Trash{% else %}Leads{% endif %} · {{ project.name }}{% endblock %}
+{% block content %}
+  {% include 'tracker/_project_nav.html' %}
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">{{ project.name }}</p>
+      <h1>{% if is_trash %}Trash{% else %}Leads{% endif %}</h1>
+      <p class="muted">{% if is_trash %}Trashed leads stay here until a collaborator restores them.{% else %}Unknowns stay visible until someone verifies them.{% endif %}</p>
+    </div>
+    {% if can_edit_leads and not is_trash %}<a class="button button-primary" href="{% url 'tracker:lead-create' project.slug %}">Add lead</a>{% endif %}
+  </div>
+
+  <form class="filter-bar" method="get">
+    <input type="hidden" name="view" value="{{ view_mode }}">
+    {% if is_trash %}<input type="hidden" name="status" value="trash">{% endif %}
+    <label>Search<input type="search" name="q" value="{{ filters.q }}" placeholder="Title, location, source"></label>
+    <label>Date confidence<select name="date_confidence"><option value="">Any confidence</option>{% for value,label in date_confidence_choices %}<option value="{{ value }}"{% if filters.date_confidence == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <label>Housing<select name="housing_type"><option value="">Any type</option>{% for value,label in housing_choices %}<option value="{{ value }}"{% if filters.housing_type == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <label class="check-label"><input type="checkbox" name="interested_by" value="me"{% if filters.interested_by == 'me' %} checked{% endif %}> Interested by me</label>
+    <button class="button" type="submit">Filter</button>
+    {% if filters.q or filters.date_confidence or filters.housing_type or filters.interested_by %}<a class="button button-quiet" href="{{ clear_url }}">Clear</a>{% endif %}
+  </form>
+
+  <div class="list-controls">
+    <div class="view-switcher" aria-label="Lead view">
+      <span class="muted">View</span>
+      <a class="button{% if view_mode == 'cards' %} is-selected{% endif %}" href="{{ cards_url }}" aria-current="{% if view_mode == 'cards' %}page{% endif %}">Cards</a>
+      <a class="button{% if view_mode == 'list' %} is-selected{% endif %}" href="{{ list_url }}" aria-current="{% if view_mode == 'list' %}page{% endif %}">List</a>
+    </div>
+    {% if leads %}<label class="check-label select-all-label"><input type="checkbox" data-select-all aria-controls="lead-results"> Select all</label>{% endif %}
+  </div>
+
+  {% if can_edit_leads and leads %}
+    <form id="batch-form" class="batch-toolbar" method="post" action="{% url 'tracker:lead-batch' project.slug %}">
+      {% csrf_token %}<input type="hidden" name="next" value="{{ request.get_full_path }}"><input type="hidden" data-batch-action-value>
+      <span><strong><span data-selection-count>0</span></strong> selected</span>
+      <button class="button" type="submit" name="action" value="interest" data-batch-action="interest">♥ Interested</button>
+      <button class="button" type="submit" name="action" value="uninterest" data-batch-action="uninterest">♡ Remove interest</button>
+      {% if is_trash %}<button class="button" type="submit" name="action" value="restore" data-batch-action="restore">↩ Restore</button>{% else %}<button class="button danger-button" type="button" data-batch-trash>♲ Move to trash</button>{% endif %}
+    </form>
+    <dialog class="trash-dialog" data-batch-trash-dialog>
+      <form method="dialog" data-batch-trash-dialog-form>
+        <p class="eyebrow">Move selected leads to trash</p>
+        <h2>Add a comment (optional)</h2>
+        <p class="muted">This comment will be added to each selected lead. A blank comment is fine.</p>
+        <label for="batch-trash-comment">Comment</label>
+        <textarea id="batch-trash-comment" name="comment" rows="5" maxlength="10000"></textarea>
+        <div class="form-actions"><button class="button button-primary" value="delete">Delete</button><button class="button" value="cancel">Cancel</button></div>
+      </form>
+    </dialog>
+  {% endif %}
+
+  {% if leads %}
+    <div id="lead-results" class="{% if view_mode == 'list' %}lead-list-rows{% else %}lead-list{% endif %}">
+      {% for lead in leads %}
+        {% if view_mode == 'list' %}{% include 'tracker/_lead_row.html' with lead=lead %}{% else %}{% include 'tracker/_lead_card.html' with lead=lead %}{% endif %}
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty-state"><h2>{% if is_trash %}Trash is empty{% else %}No leads match these filters{% endif %}</h2><p>{% if is_trash %}Deleted leads will appear here with their comments and history.{% else %}Try clearing a filter or add the first lead to this project.{% endif %}</p></div>
+  {% endif %}
+{% endblock %}

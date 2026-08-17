@@ -6,15 +6,15 @@ The original September 2026 sublet search is included as an idempotent 25-lead b
 
 ## What is implemented
 
-- Email/password registration and browser sessions.
+- Email/password registration, invite-only signup, browser sessions, and 15-minute password resets.
 - Expiring, revocable bearer tokens for agents. **Equip an agent** creates a user-wide token that discovers the user's current and future project portfolio, so long-running agents never need to store the user's password.
 - Database-backed login throttling without storing raw attempted emails or IP addresses.
-- Owner/editor/viewer project roles and acceptance-based invitation links.
+- Equal collaborator content/invitation access with an owner safeguard for role administration.
 - Private profiles and personal saved prompts.
 - Multiple projects per user and multiple users per project.
 - Versioned project prompts and criteria with stale-edit protection.
 - Agent search runs with prompt snapshots, atomic leases, continuation state, retries, and durable idempotency.
-- Lead creation/upsert, source identity, filtering, reversible shared trash, reasons, comments, and ETags.
+- Lead creation/upsert, source identity, card/list views, batch actions, reversible shared trash, chronological comments, and ETags.
 - Per-user interest with group-visible attribution.
 - A monotonic project change feed so cron agents can discover every relevant update without timestamp races.
 - Versioned REST API and OpenAPI contract.
@@ -33,6 +33,22 @@ python3 -m venv .venv
 ```
 
 Open `http://127.0.0.1:8000/`. Local development uses SQLite by default. PostgreSQL is required in production.
+
+### Local review data
+
+Before reviewing a change, create or refresh the deterministic local demo project:
+
+```sh
+.venv/bin/python manage.py migrate
+.venv/bin/python manage.py seed_demo_data
+.venv/bin/python manage.py runserver
+```
+
+Sign in as `alex@demo.example.test`, `blair@demo.example.test`, or
+`casey@demo.example.test` with password `homing-demo-password`. The command is
+idempotent, uses non-deliverable addresses, and refuses to run unless Django is
+in debug mode. Local email is captured by the development email backend rather
+than delivered to real recipients.
 
 ## Import the September project
 

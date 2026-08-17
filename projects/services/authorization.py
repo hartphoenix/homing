@@ -4,7 +4,10 @@ from django.core.exceptions import PermissionDenied
 from django.http import Http404
 from projects.models import ProjectMembership
 
-SCOPES = frozenset({"profile:read", "projects:read", "prompts:read", "leads:read", "leads:write", "comments:read", "comments:write", "interest:read", "interest:write", "runs:write"})
+# "leads:destroy" covers trashing and restoring.  It is deliberately separate
+# from "leads:write" so a paired agent token cannot hold it: additive writes are
+# reversible, trash/restore are the two verbs that undo a human's decision.
+SCOPES = frozenset({"profile:read", "projects:read", "prompts:read", "leads:read", "leads:write", "leads:destroy", "comments:read", "comments:write", "interest:read", "interest:write", "runs:write"})
 ROLE_RANK = {ProjectMembership.Role.VIEWER: 10, ProjectMembership.Role.EDITOR: 20, ProjectMembership.Role.OWNER: 30}
 
 @dataclass(frozen=True)
@@ -65,7 +68,19 @@ def assert_owner(project, principal):
     return authorize_project(project, principal, minimum_role=ProjectMembership.Role.OWNER)
 
 def assert_editor(project, principal, *, scope=None):
-    return authorize_project(project, principal, minimum_role=ProjectMembership.Role.EDITOR, scope=scope)
+    """Authorize a project content mutation.
+
+    Historical callers use the ``assert_editor`` name, but Homing's current
+    collaboration policy gives every project member equal content authority.
+    The owner/editor/viewer role values remain for administrative compatibility
+    (and for the owner safeguard), while content writes require membership only.
+    """
+    return authorize_project(project, principal, minimum_role=ProjectMembership.Role.VIEWER, scope=scope)
+
+
+def assert_collaborator(project, principal, *, scope=None):
+    """Authorize any active project collaborator for shared content."""
+    return authorize_project(project, principal, minimum_role=ProjectMembership.Role.VIEWER, scope=scope)
 
 def assert_viewer(project, principal, *, scope=None):
     return authorize_project(project, principal, minimum_role=ProjectMembership.Role.VIEWER, scope=scope)

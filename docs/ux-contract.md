@@ -4,7 +4,7 @@ The templates in `templates/tracker/` are intentionally thin Django templates. T
 
 ## URL names
 
-Required names are `login`, `logout`, and the `tracker:` names: `project-list`, `project-create`, `project-detail`, `project-edit`, `project-settings`, `lead-list`, `lead-create`, `lead-detail`, `lead-edit`, `lead-trash`, `lead-interest`, `comment-create`, `comment-edit`, `prompt-edit`, `member-invite`, `profile`, `token-create`, `saved-prompts`, `saved-prompt-create`, `saved-prompt-edit`, and `register`. Positional args are project `slug`, then lead/comment IDs where shown in templates.
+Required names are `login`, `logout`, and the `tracker:` names: `project-list`, `project-create`, `project-detail`, `project-edit`, `project-settings`, `lead-list`, `lead-batch`, `lead-create`, `lead-detail`, `lead-edit`, `lead-trash`, `lead-interest`, `comment-create`, `comment-edit`, `prompt-edit`, `member-invite`, `profile`, `token-create`, `saved-prompts`, `saved-prompt-create`, `saved-prompt-edit`, `register`, and the password-reset routes. Positional args are project `slug`, then lead/comment IDs where shown in templates.
 
 ## Context contract
 
@@ -14,4 +14,4 @@ Forms must include CSRF tokens and preserve invalid submissions. Prompt updates 
 
 ## Accessibility and content rules
 
-Use semantic headings, labels, landmarks, keyboard-visible focus, and autoescaped untrusted lead/comment/prompt content. Interest is per-user but member display names may be shown on shared projects. Trash is reversible and should always expose the reason. Unknown values render explicitly as `Unknown` rather than being inferred.
+Use semantic headings, labels, landmarks, keyboard-visible focus, and autoescaped untrusted lead/comment/prompt content. Interest is per-user while aggregate counts and member nicknames are shared. Trash is reversible, records actor/time, and may append an optional chronological comment. Unknown values render explicitly as `Unknown` rather than being inferred.

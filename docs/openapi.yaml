@@ -103,15 +103,21 @@ paths:
       responses: {'200': {description: Member display identities, content: {application/json: {schema: {$ref: '#/components/schemas/MemberList'}}}}}
     patch:
       tags: [projects]
-      description: Owner-only role changes/removals; final owner removal is rejected.
+      description: Owner-only role changes; demoting the final owner is rejected.
       security: [{bearerAuth: ['projects:read']}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MemberPatch'}}}}
       responses: {'200': {description: Updated membership}, '403': {$ref: '#/components/responses/Forbidden'}, '409': {$ref: '#/components/responses/Conflict'}}
+    delete:
+      tags: [projects]
+      description: Owner-only member removal; removing the final owner is rejected.
+      security: [{bearerAuth: ['projects:read']}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MemberRemove'}}}}
+      responses: {'204': {description: Membership removed}, '403': {$ref: '#/components/responses/Forbidden'}, '404': {$ref: '#/components/responses/NotFound'}, '409': {$ref: '#/components/responses/Conflict'}}
   /projects/{project_id}/invitations:
     parameters: [{$ref: '#/components/parameters/ProjectId'}]
     post:
       tags: [projects]
-      description: Owner creates a single-use seven-day invite; account existence is not disclosed.
+      description: Any project collaborator creates a single-use seven-day invite; account existence is not disclosed.
       security: [{bearerAuth: ['projects:read']}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/InvitationCreate'}}}}
       responses: {'201': {description: Invitation link shown once, content: {application/json: {schema: {$ref: '#/components/schemas/Invitation'}}}}, '403': {$ref: '#/components/responses/Forbidden'}}
@@ -129,7 +135,7 @@ paths:
       responses: {'200': {description: Current prompt, content: {application/json: {schema: {$ref: '#/components/schemas/Prompt'}}}}}
     put:
       tags: [prompts]
-      description: Owner/editor write under row lock; expected_revision prevents stale overwrites.
+      description: Any project collaborator writes under row lock; expected_revision prevents stale overwrites.
       security: [{bearerAuth: ['prompts:read']}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PromptUpdate'}}}}
       responses: {'200': {description: New revision, content: {application/json: {schema: {$ref: '#/components/schemas/Prompt'}}}}, '403': {$ref: '#/components/responses/Forbidden'}, '409': {$ref: '#/components/responses/Conflict'}}
@@ -216,6 +222,14 @@ paths:
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/BulkUpsertRequest'}}}}
       responses: {'200': {description: Per-item created/updated/unchanged/conflict/error results, content: {application/json: {schema: {$ref: '#/components/schemas/BulkUpsertResponse'}}}}, '409': {$ref: '#/components/responses/Conflict'}, '422': {$ref: '#/components/responses/Validation'}}
+  /projects/{project_id}/leads/batch:
+    parameters: [{$ref: '#/components/parameters/ProjectId'}]
+    post:
+      tags: [leads]
+      security: [{bearerAuth: ['leads:write']}]
+      description: Atomically apply one action to 1–100 leads in this project. Every collaborator may use it.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/LeadBatchRequest'}}}}
+      responses: {'200': {description: Updated leads, content: {application/json: {schema: {$ref: '#/components/schemas/LeadPage'}}}}, '403': {$ref: '#/components/responses/Forbidden'}, '422': {$ref: '#/components/responses/Validation'}}
   /projects/{project_id}/leads/{lead_id}:
     parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/LeadId'}]
     get:
@@ -329,7 +343,7 @@ components:
       properties: {error: {$ref: '#/components/schemas/Error'}}
     RegisterRequest:
       type: object
-      required: [email, password]
+      required: [email, password, display_name]
       properties:
         email: {type: string, format: email}
         password: {type: string, format: password, minLength: 12}
@@ -430,6 +444,7 @@ components:
       properties:
         user_id: {type: string, format: uuid}
         display_name: {type: string}
+        email: {type: string, format: email, description: Visible to project collaborators for disambiguation and invitations.}
         role: {type: string, enum: [owner, editor, viewer]}
     MemberList:
       type: object
@@ -438,9 +453,13 @@ components:
       type: object
       required: [user_id, role]
       properties: {user_id: {type: string, format: uuid}, role: {type: string, enum: [owner, editor, viewer]}}
+    MemberRemove:
+      type: object
+      required: [user_id]
+      properties: {user_id: {type: string, format: uuid}}
     InvitationCreate:
       type: object
-      required: [email, role]
+      required: [email]
       properties: {email: {type: string, format: email}, role: {type: string, enum: [editor, viewer]}}
     Invitation:
       type: object
@@ -559,8 +578,10 @@ components:
             id: {type: string, format: uuid}
             project_id: {type: string, format: uuid}
             status: {type: string, enum: [active, trashed]}
-            trash_reason: {type: string, nullable: true}
             interested_users: {type: array, items: {type: string}}
+            interest_count: {type: integer}
+            is_interested: {type: boolean}
+            trashed_at: {type: string, format: date-time, nullable: true}
             comment_count: {type: integer}
             revision: {type: integer}
             updated_at: {type: string, format: date-time}
@@ -593,8 +614,14 @@ components:
         error: {$ref: '#/components/schemas/Error'}
     TrashRequest:
       type: object
-      required: [reason]
-      properties: {reason: {type: string, minLength: 1, maxLength: 500}}
+      properties: {comment: {type: string, maxLength: 10000, description: Optional chronological comment appended while trashing.}}
+    LeadBatchRequest:
+      type: object
+      required: [lead_ids, action]
+      properties:
+        lead_ids: {type: array, minItems: 1, maxItems: 100, items: {type: string, format: uuid}}
+        action: {type: string, enum: [trash, restore, interested, uninterested]}
+        comment: {type: string, maxLength: 10000}
     CommentInput:
       type: object
       required: [body]

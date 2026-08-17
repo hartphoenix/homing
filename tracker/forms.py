@@ -45,6 +45,11 @@ class JSONTextareaMixin:
 
 
 class RegisterForm(forms.ModelForm):
+    display_name = forms.CharField(
+        label="Nickname",
+        max_length=120,
+        help_text="This is the name other project members will see.",
+    )
     password1 = forms.CharField(
         label="Password",
         widget=forms.PasswordInput,
@@ -60,8 +65,14 @@ class RegisterForm(forms.ModelForm):
     def clean_email(self):
         email = normalize_email(self.cleaned_data["email"])
         if User.objects.filter(email=email).exists():
-            raise ValidationError("An account with this email already exists.")
+            raise ValidationError("Unable to register with these details.")
         return email
+
+    def clean_display_name(self):
+        display_name = self.cleaned_data["display_name"].strip()
+        if not display_name:
+            raise ValidationError("Enter a nickname.")
+        return display_name
 
     def clean(self):
         cleaned = super().clean()
@@ -87,7 +98,10 @@ class RegisterForm(forms.ModelForm):
         user.set_password(self.cleaned_data["password1"])
         if commit:
             user.save()
-            Profile.objects.get_or_create(user=user)
+            Profile.objects.update_or_create(
+                user=user,
+                defaults={"display_name": self.cleaned_data["display_name"].strip()},
+            )
         return user
 
 
@@ -209,11 +223,31 @@ class LeadForm(JSONTextareaMixin, forms.ModelForm):
 
 
 class TrashLeadForm(forms.Form):
-    reason = forms.CharField(
-        max_length=1000,
-        widget=forms.Textarea(attrs={"rows": 4}),
-        help_text="Required so your group knows why this lead was set aside.",
+    comment = forms.CharField(
+        max_length=10000,
+        required=False,
+        label="Comment (optional)",
+        widget=forms.Textarea(attrs={"rows": 4, "maxlength": 10000}),
+        help_text="Optionally add context. A blank comment is fine.",
     )
+
+    def __init__(self, *args, **kwargs):
+        # Keep old callers that supplied the former ``reason`` initial value
+        # working while the web UI moves to normal chronological comments.
+        initial = kwargs.get("initial") or {}
+        if "comment" not in initial and "reason" in initial:
+            initial = dict(initial)
+            initial["comment"] = initial["reason"]
+            kwargs["initial"] = initial
+        super().__init__(*args, **kwargs)
+
+    def clean(self):
+        cleaned = super().clean()
+        # Older clients may still submit ``reason``. Treat it as a comment so
+        # the transition does not silently discard an existing note.
+        if not cleaned.get("comment") and self.data.get("reason"):
+            cleaned["comment"] = self.data.get("reason", "").strip()
+        return cleaned
 
 
 class CommentForm(forms.ModelForm):
@@ -225,7 +259,6 @@ class CommentForm(forms.ModelForm):
 
 class InvitationForm(forms.Form):
     email = forms.EmailField(label="Member email")
-    role = forms.ChoiceField(choices=(("editor", "Editor"), ("viewer", "Viewer")))
 
     def clean_email(self):
         return normalize_email(self.cleaned_data["email"])

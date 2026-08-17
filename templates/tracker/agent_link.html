@@ -1,0 +1,67 @@
+{% extends 'tracker/base.html' %}
+{% block title %}Approve an assistant · Homing{% endblock %}
+{% block content %}
+
+{% if outcome == 'approved' %}
+<section class="auth-card link-card" aria-labelledby="link-heading">
+  <p class="eyebrow">Connected</p>
+  <h1 id="link-heading">Approved</h1>
+  <p role="status"><strong class="link-agent">{{ link.agent_label|truncatechars:80 }}</strong> can now add places to your searches.</p>
+  <p>You can close this page. Your assistant picks this up on its own within a few seconds — you don't have to tell it anything.</p>
+  <p class="muted">Changed your mind? <a href="{% url 'tracker:agent-setup' %}">Disconnect it here</a> at any time. Everything it has already found stays.</p>
+</section>
+
+{% elif outcome == 'denied' %}
+<section class="auth-card link-card" aria-labelledby="link-heading">
+  <p class="eyebrow">Not connected</p>
+  <h1 id="link-heading">Denied</h1>
+  <p role="status">Nothing was shared. That assistant cannot see your searches, and this code will not work again.</p>
+  <p class="muted">If you didn't start this, there is nothing else you need to do. <a href="{% url 'tracker:agent-setup' %}">Set up your own assistant</a>.</p>
+</section>
+
+{% elif link %}
+<section class="auth-card link-card" aria-labelledby="link-heading">
+  <p class="eyebrow">Connection request</p>
+  <h1 id="link-heading">Approve this assistant?</h1>
+  <p>An assistant calling itself <strong class="link-agent">{{ link.agent_label|truncatechars:80 }}</strong> is asking to connect to your Homing account.</p>
+  {% if link.environment_note %}<p class="muted link-agent">It says it is running: {{ link.environment_note|truncatechars:140 }}</p>{% endif %}
+  <p class="link-ask">Your assistant should be showing the code <strong class="link-code">{{ link.user_code }}</strong>. If it isn't, or you didn't start this, press Deny.</p>
+
+  <h2>What it will be able to do</h2>
+  <ul class="link-scope">
+    <li>Add places it finds, and update the ones it added</li>
+    <li>Read your searches and the comments on them</li>
+    <li>Leave comments, and mark a place as one to look at</li>
+  </ul>
+  <h2>What it will not be able to do</h2>
+  <ul class="link-scope">
+    <li>Delete anything, or bring anything back out of the trash</li>
+    <li>Change your account, your password, or how you sign in</li>
+    <li>Add or remove people, or send invitations</li>
+  </ul>
+
+  <div class="agent-actions">
+    <form method="post" class="inline-form">{% csrf_token %}<input type="hidden" name="code" value="{{ link.user_code }}"><button class="button button-primary" name="action" value="approve">Approve</button></form>
+    <form method="post" class="inline-form">{% csrf_token %}<input type="hidden" name="code" value="{{ link.user_code }}"><button class="button danger-button" name="action" value="deny">Deny</button></form>
+  </div>
+  <p class="muted">This request runs out in {{ link.expires_at|timeuntil }}. After that your assistant has to ask again.</p>
+</section>
+
+{% else %}
+<section class="auth-card link-card" aria-labelledby="link-heading">
+  <p class="eyebrow">Connection request</p>
+  <h1 id="link-heading">Enter the code</h1>
+  {% if error %}<div class="message message-error" role="alert">{{ error }}</div>{% endif %}
+  <p>Your assistant should be showing you a six-character code. Type it in and we'll show you what it is asking for. Nothing is shared until you approve it.</p>
+  <form method="get">
+    <div class="field">
+      <label for="code">Code from your assistant</label>
+      <input id="code" class="link-code-input" name="code" value="{{ code }}" maxlength="7" autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false" required autofocus>
+    </div>
+    <button class="button button-primary">Continue</button>
+  </form>
+  <p class="muted">No code? <a href="{% url 'tracker:agent-setup' %}">Set up an assistant first</a>.</p>
+</section>
+{% endif %}
+
+{% endblock %}

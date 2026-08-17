@@ -187,7 +187,6 @@ class Lead(models.Model):
     attributes = models.JSONField(default=dict, blank=True)
     verification_notes = models.TextField(blank=True, validators=[MaxLengthValidator(10000)])
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
-    trash_reason = models.CharField(max_length=1000, blank=True)
     trashed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="trashed_leads")
     trashed_at = models.DateTimeField(null=True, blank=True)
     creator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="created_leads")

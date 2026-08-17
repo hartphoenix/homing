@@ -11,6 +11,8 @@ urlpatterns = [
     path("health/ready", health_ready, name="health-ready"),
     path("admin/", admin.site.urls),
     path("api/v1/", include("api.urls")),
+    # Public agent kit. Above the tracker include so nothing login-walled can shadow it.
+    path("agent/", include("agentkit.urls")),
     path("login/", TrackerLoginView.as_view(), name="login"),
     path("logout/", TrackerLogoutView.as_view(), name="logout"),
     path("", RedirectView.as_view(pattern_name="tracker:project-list", permanent=False)),

@@ -177,9 +177,10 @@ Updates are partial: omitted fields are unchanged. A stale ETag returns
 edits cannot be silently overwritten by an agent.
 
 `DELETE /leads/{id}` means shared reversible trash, not permanent deletion. It
-requires a short reason and `leads:write`. Re-upserting a trashed lead returns
-`409 lead_trashed`; it never restores silently. Restore is an explicit
-`POST /projects/{id}/trash/{lead_id}/restore` and requires editor/owner role.
+accepts an optional comment and requires `leads:write`. Re-upserting a trashed
+lead returns `409 lead_trashed`; it never restores silently. Restore is an
+explicit `POST /projects/{id}/trash/{lead_id}/restore` available to any
+collaborator with the required token scope.
 
 ### Bulk upsert
 
@@ -222,13 +223,16 @@ the group's display names. Interest survives trash and membership removal, but
 trashed leads are excluded from the default interested view.
 
 Comments are shared plain text, bounded at 10,000 characters, autoescaped, and
-soft-deleted. Authors edit/delete only their own comments; owners can moderate.
+soft-deleted. Every project collaborator may append comments; authors edit or
+delete their own comments and owners may moderate. Trash accepts an optional
+comment; an empty comment is valid.
 Comments do not execute markup and may be read by project agents with
 `comments:read`. An agent can append a criterion warning such as “exclude
 listings with a three-month minimum” as a comment, and the next run will see it
 through the change feed/current project state.
 
-`GET /trash` is shared project trash and includes actor, reason, and timestamps.
+`GET /trash` is shared project trash and includes actor and timestamps. Legacy
+trash reasons are migrated into attributed chronological comments.
 Trash/restore and comments/interest all produce change-feed and audit events in
 the same transaction as the mutation.
 

@@ -20,23 +20,24 @@ This is a self-hosted collaborative research tracker. Humans use a low-noise web
 - Agent tokens have explicit scopes and optional project restrictions. Scopes are `profile:read`, `projects:read`, `prompts:read`, `leads:read`, `leads:write`, `comments:read`, `comments:write`, `interest:read`, `interest:write`, and `runs:write`. Tokens can never manage users, membership, invitations, or tokens.
 - Password-exchange tokens require an allowed-project list, default to read plus lead/run write scopes, expire after 90 days, and show a blast-radius warning. Creation, rotation, revocation, expiry, and use are audited by non-secret token ID.
 - Auth responses are generic and throttled by IP plus normalized email using a shared database/cache backend. Secrets and Authorization headers never enter URLs or logs.
-- Public registration follows `ALLOW_PUBLIC_SIGNUP` and is disabled by default. In the closed-signup release, an administrator creates collaborator accounts before they accept invitations. A bootstrap management command is the self-hosted recovery path.
+- Public registration follows `ALLOW_PUBLIC_SIGNUP` and is disabled by default. A valid pending invitation permits only its recipient to register, choose a required nickname, and continue to acceptance. A bootstrap management command is the self-hosted recovery path.
+- Existing active accounts can request a generic, throttled password-reset email. Reset tokens expire after 15 minutes and become invalid when the password changes.
 - Password changes rotate the browser session and revoke agent tokens unless explicitly retained. Deactivation invalidates sessions and tokens immediately.
 
 ## Authorization and sharing
 
 - Central policy/service functions enforce every project read and mutation. Object IDs never authorize access. Inaccessible objects uniformly return 404; an authenticated principal with insufficient role/scope on a known project receives 403.
-- Roles are `owner`, `editor`, and `viewer`. A token's effective authority is the intersection of its user's role, token scopes, and optional project restrictions.
-- Owners invite by normalized email. Every share creates a pending invitation—even for existing users—so a mistyped email cannot disclose a project without consent.
+- Legacy role labels are `owner`, `editor`, and `viewer`, but every collaborator has equal project-content and invitation authority. A token's effective authority is the intersection of membership, token scopes, and optional project restrictions.
+- Any collaborator invites by normalized email. Every share creates a pending invitation—even for existing users—so a mistyped email cannot disclose a project without consent.
 - Invitations are random, digest-stored, single-use, seven-day, revocable/reissuable tokens. Acceptance requires an authenticated account with exactly the normalized invited email. Recipients can register first when necessary.
-- Invite responses do not reveal whether an email has an account. Acceptance transactionally rechecks that the inviter remains an active owner. Invite, accept, reject, revoke, expiry, and role changes are audited.
+- Invite responses do not reveal whether an email has an account. Acceptance transactionally rechecks that the inviter remains an active project collaborator. Any collaborator may invite; invite, accept, reject, revoke, expiry, and role changes are audited.
 - A project always retains at least one owner; final-owner removal is transactionally rejected.
 
 ### Role matrix
 
-- Owner: settings, prompt/criteria, leads, comments, trash/restore, membership/invitations, audit view.
-- Editor: prompt/criteria, leads, comments, trash/restore; no membership/invitation administration.
-- Viewer: read project/leads/trash/member display identity, manage own interest, create/edit/delete own comments.
+- Owner: membership role administration, final-owner safeguards, and the same project-content authority as every collaborator.
+- Editor/viewer: equal project-content authority, including metadata, prompt/criteria, leads, interest, trash/restore, and invitations. Role labels remain for compatibility and owner safeguards.
+- Comment authors edit/delete their own comments; owners retain moderation authority.
 - Agent: the user's role intersected with token scopes and project restrictions; never membership/invitation administration.
 
 ## Data model
@@ -55,9 +56,9 @@ This is a self-hosted collaborative research tracker. Humans use a low-noise web
 - `ProjectInvitation`: project, normalized email, role, inviter, token digest, expiry, accepted/revoked timestamps.
 - `PromptRevision`: immutable revision number, prompt, criteria, editor, timestamp. Current prompt update and revision append share one locked transaction.
 - `SearchRun`: project, user, authenticated token identity, descriptive agent label, exact prompt/criteria snapshot, status, lease owner/expiry, attempt count, input/output cursors, continuation JSON, result counts, summary, timestamps, idempotency key. Statuses: `queued`, `claimed`, `running`, `completed`, `failed`, `cancelled`.
-- `Lead`: UUID, project, source identity, canonical/source URLs, title, summary, location, price display and optional amount/currency, availability, housing type, date confidence, park notes, attributes, verification notes, status, trash reason/actor/time, creator, timestamps, revision.
+- `Lead`: UUID, project, source identity, canonical/source URLs, title, summary, location, price display and optional amount/currency, availability, housing type, date confidence, park notes, attributes, verification notes, status, trash actor/time, creator, timestamps, revision. Legacy trash reasons are migrated to `LeadComment`.
 - `LeadInterest`: lead, user, timestamp; unique pair. Unsetting deletes the row.
-- `LeadComment`: lead, author, plain-text body, created/edited/deleted timestamps. Authors edit their own; owners moderate. Agents write only with `comments:write`.
+- `LeadComment`: lead, author, plain-text body, created/edited/deleted timestamps. Authors edit their own and owners may moderate. Agents write only with `comments:write`.
 - `ProjectChange`: monotonic per-project sequence, event/object type and ID, compact payload or tombstone, actor, timestamp. This is the durable agent sync feed.
 - `AuditEvent`: append-only project event with actor kind, user, token ID if any, request ID, and redacted bounded mutation summary.
 
@@ -69,7 +70,7 @@ JSON fields have versioned schemas, enum/depth/byte limits, and migration rules.
 - Suspected identity collisions return 409 instead of merging. Fields retain compact provenance: human/token ID, search run, and observed timestamp.
 - Bulk upsert updates only supplied fields, never clears omitted fields, and cannot overwrite newer human edits without the current ETag.
 - Bulk requests allow 100 items, process each item transactionally, and return created/updated/unchanged/conflict/error results. Idempotency keys are scoped to token+endpoint for seven days; payload mismatch returns 409.
-- Trash is project-shared, visible to members/scoped agents, reversible by editors/owners, and requires a short reason. `DELETE` means trash; permanent deletion is absent from v1. Re-upserting a trashed lead conflicts and never restores silently.
+- Trash is project-shared, visible to members/scoped agents, reversible by collaborators, and accepts an optional comment. `DELETE` means trash; permanent deletion is absent from v1. Re-upserting a trashed lead conflicts and never restores silently. Batch trash/restore/interest actions validate every lead against the current project and commit atomically.
 - Interest is per-user, survives trash and membership removal, and becomes visible again if membership returns. Trashed leads are excluded from interested views unless explicitly included.
 - Comments, interest, and audit records remain when a lead is trashed.
 
@@ -107,8 +108,8 @@ The checked-in API contract defines schemas and a method-by-method role/scope ma
 
 ## Privacy, audit, and untrusted content
 
-- Profiles and saved prompts are private. Project serializers expose member UUID, display name, role, and interest attribution; only owners see member email for administration. Structured personal details never appear in project output.
-- Comments are plain text, max 10,000 characters, autoescaped, soft-deleted, and included in the change feed. Original moderated content is audit-restricted.
+- Profiles and saved prompts are private. Project serializers expose member UUID, nickname, email, role, and interest attribution; structured personal details never appear in project output.
+- Comments are plain text, max 10,000 characters, autoescaped, soft-deleted, and included in the change feed. Authors edit/delete their own comments and owners may moderate; original moderated content is audit-restricted.
 - Audit events are owner-visible, redacted/size-bounded, retained one year by default, and never contain passwords, token/invitation secrets, Authorization headers, or full profile JSON.
 - Listing text, comments, prompts, and source pages are untrusted data. Agent documentation explicitly warns against treating embedded listing/comment content as instructions.
 
@@ -116,7 +117,7 @@ The checked-in API contract defines schemas and a method-by-method role/scope ma
 
 - Project switcher, overview, current prompt with history, lead board, trash, members/invitations, profile, and saved prompts.
 - Active leads default to high-signal facts, interested-member names, comment count, and explicit unknowns. Filters persist in shareable URLs.
-- Edits use focused dialogs/pages. Destructive actions are reversible and include visible reasons.
+- Edits use focused dialogs/pages. Destructive actions are reversible, show actor/time, and may append an optional comment.
 - Stale edit conflicts show the server version; failed saves retain input; partial imports are explicit; expired sessions redirect safely. Empty project/trash and pending-invite states explain the next action.
 - Semantic accessible HTML, keyboard operation, visible focus, reduced motion, and responsive single-column cards.
 - Existing data imports as one ongoing September 2026 project. A one-time legacy-state importer accepts old `localStorage` JSON and reports unknown IDs while mapping interest and shared trash.
@@ -135,7 +136,7 @@ The checked-in API contract defines schemas and a method-by-method role/scope ma
 
 - Built-in scraping/browser automation or scheduler.
 - Email delivery; invitation links are copied and delivered out of band.
-- Social login, email password reset, uploads, external full-text search, websockets, mobile apps, or routine hard deletion.
+- Social login, uploads, external full-text search, websockets, mobile apps, or routine hard deletion.
 
 ## Deployment inputs still needed
 

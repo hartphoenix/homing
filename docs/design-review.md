@@ -19,7 +19,7 @@ The initial architecture was challenged by a separate adversarial design agent b
 - Threaded plain-text comments have author edits, owner moderation, soft deletion, limits, and change events.
 - `/interested` defaults to the current user; group interest is explicit.
 - Agent-token identity appears in audits and search runs.
-- Signup, password change/token invalidation, deactivation, privacy projections, shared-trash reasons, restore behavior, JSON limits, URL validation, and prompt-injection guidance are defined.
+- Invite-only signup, password reset/change and token invalidation, deactivation, privacy projections, optional trash comments, restore behavior, JSON limits, URL validation, and prompt-injection guidance are defined.
 - Deployment adds migration locking, network isolation, host hardening, encrypted off-host backups, restore drills, and alert hooks.
 - Legacy browser state has an explicit import path.
 
@@ -27,7 +27,7 @@ The initial architecture was challenged by a separate adversarial design agent b
 
 - Invitations always require acceptance.
 - Agents may exchange email/password for a token; long-running agents should use a revocable user-wide token from **Equip an agent** instead of storing a password.
-- Owners/editors edit criteria. Viewers read, express interest, and comment.
+- All project collaborators edit project content and send invitations; owner remains only as a role-administration safeguard.
 - Agents write comments only with `comments:write`.
 - September 2026 is imported project data, not application behavior.
 

@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     "projects",
     "api",
     "tracker",
+    "agentkit",
 ]
 
 MIDDLEWARE = [
@@ -136,3 +137,25 @@ AGENT_TOKEN_DEFAULT_DAYS = int(os.environ.get("AGENT_TOKEN_DEFAULT_DAYS", "90"))
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 if not PUBLIC_BASE_URL and os.environ.get("APP_DOMAIN"):
     PUBLIC_BASE_URL = f"https://{os.environ['APP_DOMAIN']}"
+
+# Keep local previews from ever sending real mail.  Production can use any
+# ordinary SMTP provider (including Resend) without an application-specific
+# integration.  Setting EMAIL_FILE_PATH selects Django's file backend, which
+# is useful for a persistent local/staging mailbox.
+EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND") or (
+    "django.core.mail.backends.smtp.EmailBackend"
+    if os.environ.get("EMAIL_HOST")
+    else "django.core.mail.backends.console.EmailBackend"
+)
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
+EMAIL_USE_SSL = env_bool("EMAIL_USE_SSL", False)
+EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "10"))
+if os.environ.get("EMAIL_FILE_PATH"):
+    EMAIL_BACKEND = "django.core.mail.backends.filebased.EmailBackend"
+    EMAIL_FILE_PATH = os.environ["EMAIL_FILE_PATH"]
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "Homing <notifications@localhost>")
+PASSWORD_RESET_TIMEOUT = int(os.environ.get("PASSWORD_RESET_TIMEOUT", "900"))

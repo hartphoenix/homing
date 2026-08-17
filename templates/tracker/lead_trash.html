@@ -1,0 +1,24 @@
+{% extends 'tracker/base.html' %}
+{% block title %}Move lead to trash · {{ project.name }}{% endblock %}
+{% block content %}
+  {% include 'tracker/_project_nav.html' %}
+  <div class="form-panel">
+    <p class="eyebrow">Move lead to trash</p>
+    <h1>{{ lead.title|default:'Untitled lead' }}</h1>
+    <p class="muted">Add an optional comment for the project timeline. Leaving it blank is okay.</p>
+    <form method="post">
+      {% csrf_token %}
+      {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+      <div class="field">
+        {{ form.comment.label_tag }}
+        {{ form.comment }}
+        {% if form.comment.help_text %}<small class="form-help">{{ form.comment.help_text }}</small>{% endif %}
+        {% for error in form.comment.errors %}<span class="field-error">{{ error }}</span>{% endfor %}
+      </div>
+      <div class="form-actions">
+        <button class="button button-primary" type="submit">Delete</button>
+        <a class="button" href="{% if next %}{{ next }}{% else %}{% url 'tracker:lead-detail' project.slug lead.id %}{% endif %}">Cancel</a>
+      </div>
+    </form>
+  </div>
+{% endblock %}
