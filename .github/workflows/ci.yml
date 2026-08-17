@@ -37,7 +37,6 @@ jobs:
       # Django's test client uses HTTP unless a test explicitly requests HTTPS.
       # Exercise redirects in the deploy check without redirecting the suite.
       SECURE_SSL_REDIRECT: "0"
-      ALLOW_PUBLIC_SIGNUP: "true"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -52,6 +51,8 @@ jobs:
         run: |
           SECURE_SSL_REDIRECT=1 python manage.py check --deploy
           python manage.py makemigrations --check --dry-run
+      - name: Build production static assets
+        run: python manage.py collectstatic --noinput
       - name: Tests
         run: python -m pytest -q
       - name: Dependency audit
