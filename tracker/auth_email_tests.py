@@ -1,4 +1,5 @@
 import re
+from urllib.parse import urlencode
 
 from django.conf import settings
 from django.core import mail
@@ -37,8 +38,29 @@ class BrowserAuthEmailTests(TestCase):
         token = re.search(r"/invite/([^/]+)/", mail.outbox[0].body).group(1)
 
         self.client.logout()
-        register = self.client.get(reverse("tracker:register") + f"?invite={token}")
+        invite_link = reverse("tracker:invitation-accept", args=[token])
+        landing = self.client.get(invite_link)
+        self.assertRedirects(
+            landing,
+            reverse("tracker:register") + f"?invite={token}",
+            fetch_redirect_response=False,
+        )
+        register = self.client.get(landing["Location"])
         self.assertEqual(register.status_code, 200)
+        self.assertContains(register, 'value="new@example.com"')
+        self.assertContains(register, "readonly")
+        tampered = self.client.post(
+            reverse("tracker:register"),
+            {
+                "invite": token,
+                "email": "someone-else@example.com",
+                "display_name": "Wrong recipient",
+                "password1": "a sufficiently long password",
+                "password2": "a sufficiently long password",
+            },
+        )
+        self.assertContains(tampered, "Use the invited email address")
+        self.assertFalse(User.objects.filter(email="someone-else@example.com").exists())
         created = self.client.post(
             reverse("tracker:register"),
             {
@@ -64,6 +86,31 @@ class BrowserAuthEmailTests(TestCase):
         self.assertEqual(Profile.objects.get(user__email="new@example.com").display_name, "New teammate")
         invitation.refresh_from_db()
         self.assertIsNotNone(invitation.accepted_at)
+
+    def test_existing_account_invitation_uses_same_landing_with_returning_sign_in(self):
+        recipient = User.objects.create_user("recipient@example.com", "recipient-password")
+        Profile.objects.create(user=recipient, display_name="Recipient")
+        self.client.force_login(self.owner)
+        self.client.post(
+            reverse("tracker:member-invite", args=[self.project.slug]),
+            {"email": recipient.email},
+        )
+        token = re.search(r"/invite/([^/]+)/", mail.outbox[-1].body).group(1)
+        invite_link = reverse("tracker:invitation-accept", args=[token])
+
+        self.client.logout()
+        landing = self.client.get(invite_link)
+        self.assertRedirects(
+            landing,
+            reverse("tracker:register") + f"?invite={token}",
+            fetch_redirect_response=False,
+        )
+        registration = self.client.get(landing["Location"])
+        expected_query = urlencode({"next": invite_link})
+        self.assertContains(
+            registration,
+            f'{reverse("login")}?{expected_query}',
+        )
 
     def test_registration_requires_a_nonempty_nickname(self):
         response = self.client.post(

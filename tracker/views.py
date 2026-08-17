@@ -10,6 +10,7 @@ import hashlib
 import secrets
 import uuid
 from datetime import timedelta
+from urllib.parse import urlencode
 
 from django.conf import settings
 from django.contrib import messages
@@ -169,6 +170,10 @@ def register(request):
     if request.user.is_authenticated:
         return redirect("tracker:project-list")
     invite_token = request.POST.get("invite") or request.GET.get("invite", "")
+    login_url = reverse("login")
+    if invite_token:
+        invitation_path = reverse("tracker:invitation-accept", args=[invite_token])
+        login_url = f"{login_url}?{urlencode({'next': invitation_path})}"
     invitation = None
     invitation_error = None
     if invite_token:
@@ -190,11 +195,16 @@ def register(request):
                 "disabled": True,
                 "invite_token": invite_token,
                 "invitation_error": invitation_error,
+                "login_url": login_url,
             },
             status=403,
         )
     initial = {"email": invitation.invited_email} if invitation else None
-    form = RegisterForm(request.POST or None, initial=initial)
+    form = RegisterForm(
+        request.POST or None,
+        initial=initial,
+        locked_email=invitation.invited_email if invitation else None,
+    )
     if request.method == "POST" and form.is_valid():
         if invitation and normalize_email(form.cleaned_data["email"]) != invitation.invited_email:
             form.add_error("email", "Use the invited email address to create this account.")
@@ -215,6 +225,7 @@ def register(request):
             "invite_token": invite_token,
             "invitation": invitation,
             "invitation_error": invitation_error,
+            "login_url": login_url,
         },
     )
 
@@ -841,11 +852,8 @@ def invitation_accept(request, token):
             request, "tracker/invitation_accept.html", {"invitation": display}, status=410
         )
     if not request.user.is_authenticated:
-        display["requires_login"] = True
-        display["register_url"] = (
-            f"{reverse('tracker:register')}?invite={token}"
-        )
-        return render(request, "tracker/invitation_accept.html", {"invitation": display})
+        query = urlencode({"invite": token})
+        return redirect(f"{reverse('tracker:register')}?{query}")
     if request.user.email != invitation.invited_email:
         display["error"] = f"Sign in as {invitation.invited_email} to accept this invitation."
         return render(

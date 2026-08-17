@@ -62,8 +62,17 @@ class RegisterForm(forms.ModelForm):
         model = User
         fields = ("email",)
 
+    def __init__(self, *args, locked_email=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.locked_email = normalize_email(locked_email) if locked_email else ""
+        if self.locked_email:
+            self.initial["email"] = self.locked_email
+            self.fields["email"].widget.attrs["readonly"] = True
+
     def clean_email(self):
         email = normalize_email(self.cleaned_data["email"])
+        if self.locked_email and email != self.locked_email:
+            raise ValidationError("Use the invited email address to create this account.")
         if User.objects.filter(email=email).exists():
             raise ValidationError("Unable to register with these details.")
         return email
