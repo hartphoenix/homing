@@ -18,3 +18,5 @@ media/
 *.age
 *.dump
 *.sql
+
+/docs/private/
