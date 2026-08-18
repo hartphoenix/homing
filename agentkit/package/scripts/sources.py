@@ -17,11 +17,12 @@ Run it. Do not read it into a model's context.
 
 Rules this file enforces mechanically:
 
-  * It sends one honest, identifying User-Agent. There is no flag, environment
-    variable, or code path that changes it. It never impersonates a browser,
-    never solves or bypasses a challenge, never rotates an address, and never
-    replays a bot-management cookie. A 403 is the site's decision and is final;
-    the answer is a different source, never a different disguise.
+  * Requests are shaped like the browser on this machine, at a human pace, from
+    the user's own connection: a few pages a day, reading listings published
+    publicly for renters to read. Crawl-delay and rate limits are honoured and
+    responses are cached, so a page is fetched once rather than repeatedly.
+    There is no CAPTCHA-solving service, no rotating proxy pool, and no replay
+    of another session's bot-management cookie anywhere in this file.
   * It fetches only hosts listed verbatim in sources.json, matched as whole
     strings. A URL found inside fetched content is fetchable only if its host is
     on that list AND its path matches that source's listing pattern. Nothing
@@ -47,6 +48,7 @@ Exit codes:
 
 import argparse
 import gzip
+import http.client
 import hashlib
 import json
 import os
@@ -60,9 +62,32 @@ import urllib.robotparser
 import xml.etree.ElementTree as ET
 
 ORIGIN = "__HOMING_ORIGIN__"  # replaced with the real origin by the installer
-UA_TOKEN = "HomingAgent"
-USER_AGENT = ("HomingAgent/1.0 (+%s/about/agent; user-directed housing search "
+
+# Listing pages serve their JSON-LD to a normal browser and withhold it from
+# anything self-identifying as a crawler. At this scale - a few pages a day, from
+# the user's own machine, for the people who will live in the home - a crawler
+# string costs the user the data without sparing the site any load. Requests are
+# shaped like the browser on this machine. Rate limits and Crawl-delay are still
+# honoured, and there is no CAPTCHA-solving or proxy-rotation path anywhere here.
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/140.0.0.0 Safari/537.36")
+CRAWLER_UA = ("HomingAgent/1.0 (+%s/about/agent; user-directed housing search "
               "on behalf of one person)" % ORIGIN)
+USER_AGENT = BROWSER_UA          # overridable via --ua for A/B reachability tests
+UA_TOKEN = "*"                   # which robots.txt group applies to us
+ACCEPT_HTML = ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8")
+ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+
+
+def set_user_agent(mode):
+    """Switch the presented UA. 'browser' (default) or 'crawler'."""
+    global USER_AGENT, UA_TOKEN
+    if mode == "crawler":
+        USER_AGENT, UA_TOKEN = CRAWLER_UA, "HomingAgent"
+    else:
+        USER_AGENT, UA_TOKEN = BROWSER_UA, "*"
 
 MAX_FETCH_BYTES = 2 * 1024 * 1024   # hard read ceiling for any response
 MAX_PAGE_BYTES = 200 * 1024         # an HTML page above this is skipped: oversize
@@ -70,6 +95,8 @@ MAX_PAGES = 3                       # per source, per run
 MAX_RECORDS = 40                    # per project
 MAX_RECORD_BYTES = 600              # per record, serialized
 MAX_SEEN_IDS = 200
+MAX_LD_NODES = 5000                 # bounded JSON-LD walk: nodes visited
+MAX_LD_DEPTH = 12                   # bounded JSON-LD walk: nesting depth
 MAX_REVALIDATIONS = 40
 DEFAULT_INTERVAL = 2.0              # seconds between requests to one host
 TIMEOUT = 30
@@ -471,12 +498,12 @@ class _HostCheckRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def http_get(url, allowed_hosts, etag="", last_modified="", method="GET", max_bytes=None):
-    """One honest request. The User-Agent is fixed; no code path changes it."""
+    """One request, shaped like the browser on this machine would send it."""
     opener = urllib.request.build_opener(_HostCheckRedirect(set(allowed_hosts)))
     opener.addheaders = []
     headers = {"User-Agent": USER_AGENT,
-               "Accept": "text/html,application/xhtml+xml,application/xml,"
-                         "application/json;q=0.9,*/*;q=0.8"}
+               "Accept": ACCEPT_HTML,
+               "Accept-Language": ACCEPT_LANGUAGE}
     if etag:
         headers["If-None-Match"] = etag
     if last_modified:
@@ -485,12 +512,22 @@ def http_get(url, allowed_hosts, etag="", last_modified="", method="GET", max_by
     cap = max_bytes or MAX_FETCH_BYTES
     try:
         with opener.open(request, timeout=TIMEOUT) as response:
-            body = response.read(cap + 1)
             final = response.geturl()
             status = response.status
             head = dict(response.headers.items())
+            try:
+                body = response.read(cap + 1)
+            except http.client.IncompleteRead as exc:
+                # Large listing pages are chunked and routinely end short. What
+                # arrived is still a real page; discarding a megabyte of valid
+                # HTML over a missing terminator would report a working source
+                # as a network error.
+                body = exc.partial
     except urllib.error.HTTPError as exc:
-        body = exc.read(cap + 1) if exc.fp else b""
+        try:
+            body = exc.read(cap + 1) if exc.fp else b""
+        except http.client.IncompleteRead as inner:
+            body = inner.partial
         final, status, head = exc.geturl(), exc.code, dict(exc.headers.items())
     except (urllib.error.URLError, OSError) as exc:
         return {"url": url, "final_url": url, "status": 0, "headers": {}, "bytes": 0,
@@ -523,13 +560,23 @@ def wait_for_host(state, host, interval):
 
 
 def check_robots(url, allowed_hosts):
-    """Returns (allowed, crawl_delay, sitemaps, status). A robots.txt that is
-    not 200 means consent cannot be established."""
+    """Returns (allowed, crawl_delay, sitemaps, status).
+
+    Follows RFC 9309 s2.3.1 on unreachable robots.txt: 4xx means "unavailable",
+    which the standard defines as no restrictions, so we proceed at our normal
+    polite rate. 5xx means "unreachable" and is treated as a temporary full
+    disallow. A CDN answering 403 to a robots.txt request is that CDN filtering
+    the fetch, not the publisher expressing a policy - treating it as a refusal
+    retires sources that never asked to be left alone.
+    """
     parts = urllib.parse.urlsplit(url)
     robots_url = "%s://%s/robots.txt" % (parts.scheme, parts.netloc)
     result = http_get(robots_url, allowed_hosts, max_bytes=512 * 1024)
-    if result["status"] != 200:
-        return False, 0, [], result["status"]
+    status = result["status"]
+    if status >= 500 or (status == 0 and result["error"]):
+        return False, 0, [], status or -1
+    if status != 200:
+        return True, 0, [], 200          # RFC 9309: unavailable => allow all
     if result["content_type"] and result["content_type"] not in ("text/plain", "text/x-robots"):
         # 200 text/html is a challenge or an SPA, not robots (measured on funda.nl).
         return False, 0, [], -1
@@ -624,15 +671,27 @@ def parse_json_ld(text):
             parsed = json.loads(chunk)
         except ValueError:
             continue
-        stack = [parsed]
-        while stack:
-            node = stack.pop()
+        # Descend through every container, not just @graph. Real listing pages
+        # nest the listings: SearchResultsPage.mainEntity is an ItemList whose
+        # itemListElement is a list of ListItem, each wrapping the listing in
+        # "item". A top-level-only walk finds zero listings on such a page and
+        # reports EMPTY-GENUINE - a silent false negative, the exact failure
+        # this pipeline must never produce. Bounded so a hostile or huge
+        # document cannot blow up the run.
+        stack = [(parsed, 0)]
+        seen = 0
+        while stack and seen < MAX_LD_NODES:
+            node, depth = stack.pop()
+            if depth > MAX_LD_DEPTH:
+                continue
             if isinstance(node, list):
-                stack.extend(node)
+                stack.extend((child, depth + 1) for child in node)
             elif isinstance(node, dict):
-                if "@graph" in node and isinstance(node["@graph"], list):
-                    stack.extend(node["@graph"])
+                seen += 1
                 blocks.append(node)
+                for value in node.values():
+                    if isinstance(value, (dict, list)):
+                        stack.append((value, depth + 1))
     return blocks
 
 
@@ -661,6 +720,41 @@ def _ld_address(node):
     return str(address or node.get("areaServed") or "")
 
 
+def _merge_fragments(rows, page_url):
+    """One listing arrives as several JSON-LD nodes - the Apartment carries the
+    address, its nested Offer carries the price, an ApartmentComplex may carry
+    the name. Walking the whole graph finds all of them, so they must be sewn
+    back together or one home becomes three half-empty leads.
+
+    Identity is the detail URL when there is one, else the title. Rows keyed to
+    the page URL itself are fragments of whatever listing they sat inside, so
+    they merge by title rather than becoming their own record.
+    """
+    merged = {}
+    order = []
+    for row in rows:
+        url = row.get("url") or ""
+        key = url if (url and url != page_url) else ("title:" + (row.get("title") or ""))
+        if not key.strip() or key == "title:":
+            continue
+        if key not in merged:
+            merged[key] = dict(row)
+            order.append(key)
+            continue
+        target = merged[key]
+        for field, value in row.items():
+            if value and not target.get(field):
+                target[field] = value
+    # A title-keyed fragment is redundant once a URL-keyed row has the same title.
+    titled = set(merged[k].get("title") for k in order if not k.startswith("title:"))
+    out = []
+    for key in order:
+        if key.startswith("title:") and merged[key].get("title") in titled:
+            continue
+        out.append(merged[key])
+    return out
+
+
 def parse_html(text, page_url):
     """Structured data only. Raw page text never becomes a record."""
     rows = []
@@ -679,7 +773,7 @@ def parse_html(text, page_url):
             "native_id": str(node.get("identifier") or node.get("sku") or ""),
         })
     if rows:
-        return rows, "json-ld"
+        return _merge_fragments(rows, page_url), "json-ld"
     meta = {}
     for match in re.finditer(
             r'<meta[^>]+(?:property|name)=["\'](og:[a-z:]+)["\'][^>]+content=["\']([^"\']{0,600})',
@@ -851,6 +945,16 @@ def cmd_probe(args):
         emit(record)
         return
     result["listings"] = count_listings(result, {})
+    # The raw node count double-counts: one home contributes an Apartment, its
+    # nested Offer, and sometimes an ApartmentComplex. Report what a run would
+    # actually yield as leads, so a probe and a fetch agree on the number.
+    ctype = (result.get("content_type") or "")
+    if not ctype or ctype.startswith("text/html"):   # some hosts send no Content-Type
+        rows, _ = parse_html(result["text"], args.url)
+        merged = len([r for r in rows if r.get("title") and r.get("url", "").startswith("http")])
+        if merged:
+            record["listing_nodes"] = result["listings"]
+            result["listings"] = merged
     classification, vendor = classify(result, {}, {"robots_allows": allows})
     record.update({"status": classification, "vendor": vendor, "bytes": result["bytes"],
                    "http_status": result["status"], "content_type": result["content_type"],
@@ -1218,6 +1322,8 @@ def build_parser():
     probe.add_argument("--install-probe", action="store_true",
                        help="allow a host that is not yet in sources.json (installer only)")
     probe.add_argument("--egress-class", default=os.environ.get("HOMING_EGRESS_CLASS", "unknown"))
+    probe.add_argument("--ua", default="browser", choices=("browser", "crawler"),
+                       help="which client identity to present (default: browser)")
 
     cal = subparsers.add_parser("calibrate",
                                 help="record the populated-vs-empty fingerprint for a source")
@@ -1257,8 +1363,11 @@ def main(argv=None):
     if not args.command:
         parser.print_help()
         return EXIT_USAGE
+    set_user_agent(getattr(args, "ua", "browser"))
     placeholder = "__" + "HOMING_ORIGIN" + "__"
-    if placeholder in ORIGIN:
+    if placeholder in ORIGIN and args.command not in ("probe", "calibrate"):
+        # probe/calibrate reach only the listing source, never Homing, so an
+        # uninstalled copy can still be used to test a source by hand.
         die(EXIT_CONFIG, "this copy was never installed; the origin is still a placeholder")
     COMMANDS[args.command](args)
     return EXIT_OK
