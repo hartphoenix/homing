@@ -412,10 +412,17 @@ class Plan(object):
         self.invocation = clean_invocation(runtime.get("invocation"))
         self.isolation_rung = int(config.get("isolation_rung") or 0)
         if self.isolation_rung <= 0 and self.scheduler_kind != "none":
-            raise Refuse(
-                "Nothing on this machine limits what a background run could reach "
-                "(isolation rung 0), so I will not schedule one. Re-run with the scheduler "
-                "set to \"none\" to install the on-demand runner instead.")
+            # An ordinary laptop has no sandbox, no egress allowlist and no
+            # container, so it reports rung 0. Refusing to schedule there would
+            # decline to install the product on the machine it is built for.
+            # What actually contains this run does not come from the OS:
+            # the paired token has no leads:destroy scope, sources.py holds no
+            # credential at all, the model never sees a raw page, and writes are
+            # capped per run. Install it, and say plainly what it can reach.
+            self.warnings.append(
+                "Nothing on this machine limits what a background run could reach. "
+                "The search still cannot delete or restore anything, and the part that "
+                "reads websites holds no account key.")
 
         self.limits = dict(DEFAULT_LIMITS)
         for name, value in (config.get("limits") or {}).items():

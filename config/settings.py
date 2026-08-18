@@ -139,6 +139,10 @@ SECURE_HSTS_INCLUDE_SUBDOMAINS = SECURE_HSTS_SECONDS > 0
 SECURE_HSTS_PRELOAD = SECURE_HSTS_SECONDS > 0
 
 ALLOW_PUBLIC_SIGNUP = env_bool("ALLOW_PUBLIC_SIGNUP", False)
+# Exchanging an email/password for a bearer token. Off by default: the agent
+# kit pairs through an approval code instead, so nothing needs to ask a person
+# for their password. Set to 1 only to support a client predating the kit.
+ALLOW_PASSWORD_TOKEN_EXCHANGE = env_bool("ALLOW_PASSWORD_TOKEN_EXCHANGE", False)
 AGENT_TOKEN_DEFAULT_DAYS = int(os.environ.get("AGENT_TOKEN_DEFAULT_DAYS", "90"))
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 if not PUBLIC_BASE_URL and os.environ.get("APP_DOMAIN"):
