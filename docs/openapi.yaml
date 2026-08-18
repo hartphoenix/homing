@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: September Sublet Tracker API
   version: 1.0.0
-  description: Scoped collaborative project API. See agent-api.md for sync, leases, bulk semantics, and Hermes examples.
+  description: Scoped collaborative project API. See agent-api.md for sync, leases, bulk semantics, device-code pairing, and the agent kit served at /agent/.
 servers:
   - url: https://{host}/api/v1
     variables:
@@ -23,11 +23,40 @@ paths:
     post:
       security: []
       tags: [auth]
+      description: >-
+        Password exchange. Gated behind a server-side flag that defaults to
+        off; when off this route does not exist (404), not 401/403. Agents
+        should use /agent-link + /agent-link/token instead of this endpoint.
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TokenExchange'}}}}
       responses:
         '200': {description: Opaque token shown once, content: {application/json: {schema: {$ref: '#/components/schemas/TokenResponse'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {description: Password exchange is disabled on this deployment, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
         '429': {$ref: '#/components/responses/RateLimited'}
+  /agent-link:
+    post:
+      security: []
+      tags: [auth]
+      description: >-
+        Start device-code pairing (RFC 8628-shaped). Unauthenticated: the
+        agent has no credential yet. Rate-limited per client IP.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AgentLinkStart'}}}}
+      responses:
+        '201': {description: Device code, user code, and verification URIs, content: {application/json: {schema: {$ref: '#/components/schemas/AgentLinkStartResponse'}}}}
+        '422': {$ref: '#/components/responses/Validation'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /agent-link/token:
+    post:
+      security: []
+      tags: [auth]
+      description: >-
+        Poll for the token after the person approves at /link/. Returns the
+        bearer token exactly once; the link is then consumed. Poll no faster
+        than the interval returned by /agent-link.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AgentLinkPoll'}}}}
+      responses:
+        '200': {description: Bearer token, shown once, content: {application/json: {schema: {$ref: '#/components/schemas/AgentLinkTokenResponse'}}}}
+        '400': {description: 'authorization_pending, slow_down, access_denied, or expired_token', content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
   /auth/tokens:
     get:
       tags: [auth]
@@ -49,6 +78,12 @@ paths:
       tags: [me]
       security: [{bearerAuth: ['profile:read']}]
       responses: {'200': {description: Current user, content: {application/json: {schema: {$ref: '#/components/schemas/User'}}}}}
+  /me/token:
+    get:
+      tags: [me]
+      description: Introspect the calling credential (or session) itself, including agent_paused_until.
+      security: [{bearerAuth: []}]
+      responses: {'200': {description: Credential metadata, content: {application/json: {schema: {$ref: '#/components/schemas/TokenIntrospection'}}}}}
   /me/profile:
     get:
       tags: [me]
@@ -157,7 +192,12 @@ paths:
     parameters: [{$ref: '#/components/parameters/ProjectId'}]
     get:
       tags: [search-runs]
+      description: Cursor-paginated, always newest-first. agent_label_prefix finds the latest run for one worker family.
       security: [{bearerAuth: ['projects:read']}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: agent_label_prefix, in: query, schema: {type: string, maxLength: 160}}
       responses: {'200': {description: Search runs, content: {application/json: {schema: {$ref: '#/components/schemas/SearchRunList'}}}}}
     post:
       tags: [search-runs]
@@ -227,7 +267,11 @@ paths:
     post:
       tags: [leads]
       security: [{bearerAuth: ['leads:write']}]
-      description: Atomically apply one action to 1–100 leads in this project. Every collaborator may use it.
+      description: >-
+        Atomically apply one action to 1-100 leads in this project.
+        `interested`/`uninterested` need only leads:write; `trash`/`restore`
+        additionally require leads:destroy, which a device-code-paired token
+        never holds.
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/LeadBatchRequest'}}}}
       responses: {'200': {description: Updated leads, content: {application/json: {schema: {$ref: '#/components/schemas/LeadPage'}}}}, '403': {$ref: '#/components/responses/Forbidden'}, '422': {$ref: '#/components/responses/Validation'}}
   /projects/{project_id}/leads/{lead_id}:
@@ -244,11 +288,11 @@ paths:
       responses: {'200': {description: Updated lead, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Lead'}}}}, '404': {$ref: '#/components/responses/NotFound'}, '409': {$ref: '#/components/responses/Conflict'}}
     delete:
       tags: [leads]
-      description: DELETE means reversible shared trash; permanent delete is absent in v1.
-      security: [{bearerAuth: ['leads:write']}]
+      description: DELETE means reversible shared trash; permanent delete is absent in v1. Requires leads:destroy.
+      security: [{bearerAuth: ['leads:destroy']}]
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TrashRequest'}}}}
-      responses: {'204': {description: Trashed}, '409': {$ref: '#/components/responses/Conflict'}}
+      responses: {'204': {description: Trashed}, '403': {$ref: '#/components/responses/Forbidden'}, '409': {$ref: '#/components/responses/Conflict'}}
   /projects/{project_id}/leads/{lead_id}/interest:
     parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/LeadId'}]
     put:
@@ -293,13 +337,17 @@ paths:
     parameters: [{$ref: '#/components/parameters/ProjectId'}]
     get:
       tags: [leads]
+      description: Cursor-paginated, newest-updated first.
       security: [{bearerAuth: ['leads:read']}]
+      parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}]
       responses: {'200': {description: Shared trash, content: {application/json: {schema: {$ref: '#/components/schemas/LeadPage'}}}}}
   /projects/{project_id}/trash/{lead_id}/restore:
     parameters: [{$ref: '#/components/parameters/ProjectId'}, {$ref: '#/components/parameters/LeadId'}]
     post:
       tags: [leads]
-      security: [{bearerAuth: ['leads:write']}]
+      description: Requires leads:destroy and If-Match — reversing a human's decision needs the current row read first.
+      security: [{bearerAuth: ['leads:destroy']}]
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
       responses: {'200': {description: Restored lead, content: {application/json: {schema: {$ref: '#/components/schemas/Lead'}}}}, '403': {$ref: '#/components/responses/Forbidden'}, '409': {$ref: '#/components/responses/Conflict'}}
 components:
   securitySchemes:
@@ -320,8 +368,9 @@ components:
     IfMatch: {name: If-Match, in: header, required: true, schema: {type: string}}
   headers:
     ETag: {description: Opaque lead revision; send as If-Match, schema: {type: string}}
+    WWWAuthenticate: {description: 'Bearer realm="homing", error="invalid_token", resource_metadata="<origin>/agent/"', schema: {type: string}}
   responses:
-    Unauthorized: {description: 401 invalid/expired/revoked credentials, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    Unauthorized: {description: 401 invalid/expired/revoked credentials, headers: {WWW-Authenticate: {$ref: '#/components/headers/WWWAuthenticate'}}, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
     Forbidden: {description: 403 insufficient role or scope, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
     NotFound: {description: 404 inaccessible object or absent object, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
     Conflict: {description: 409 stale ETag, lease, idempotency mismatch, identity collision, or lifecycle conflict, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
@@ -386,6 +435,45 @@ components:
         project_ids: {type: array, items: {type: string, format: uuid}}
         expires_at: {type: string, format: date-time}
         revoked_at: {type: string, format: date-time, nullable: true}
+    TokenIntrospection:
+      type: object
+      description: Metadata about the calling credential; a session principal (no token) gets scopes = every scope and null id/name/expires_at/last_used_at.
+      properties:
+        id: {type: string, format: uuid, nullable: true}
+        name: {type: string}
+        scopes: {type: array, items: {type: string}}
+        expires_at: {type: string, format: date-time, nullable: true}
+        last_used_at: {type: string, format: date-time, nullable: true}
+        agent_paused_until: {type: string, format: date-time, nullable: true}
+    AgentLinkStart:
+      type: object
+      required: [agent_label]
+      properties:
+        agent_label: {type: string, maxLength: 120}
+        environment_note: {type: string, maxLength: 200}
+        requested_cadence_minutes: {type: integer, minimum: 1, maximum: 10080}
+    AgentLinkStartResponse:
+      type: object
+      required: [device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval]
+      properties:
+        device_code: {type: string, writeOnly: true, description: Agent-side secret; never shown to the person.}
+        user_code: {type: string, minLength: 6, maxLength: 6, description: Six-character Crockford base32 (no I, L, O, U), shown to the person for approval.}
+        verification_uri: {type: string, format: uri}
+        verification_uri_complete: {type: string, format: uri}
+        expires_in: {type: integer, description: Seconds until the link expires (600).}
+        interval: {type: integer, description: Minimum seconds between polls (5).}
+    AgentLinkPoll:
+      type: object
+      required: [device_code]
+      properties: {device_code: {type: string, writeOnly: true}}
+    AgentLinkTokenResponse:
+      type: object
+      required: [token, expires_at, scopes]
+      description: Returned exactly once; a second poll of the same device_code gets access_denied.
+      properties:
+        token: {type: string, writeOnly: true}
+        expires_at: {type: string, format: date-time}
+        scopes: {type: array, items: {type: string}, description: Every scope except leads:destroy.}
     User:
       type: object
       required: [id, email]
@@ -438,7 +526,9 @@ components:
             created_at: {type: string, format: date-time}
     ProjectList:
       type: object
-      properties: {items: {type: array, items: {$ref: '#/components/schemas/Project'}}}
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Project'}}
+        agent_paused_until: {type: string, format: date-time, nullable: true, description: Set when the person paused the search from Homing's UI; a scheduled run must exit without acting while this is in the future.}
     Member:
       type: object
       properties:
@@ -524,7 +614,10 @@ components:
         created_at: {type: string, format: date-time}
     SearchRunList:
       type: object
-      properties: {items: {type: array, items: {$ref: '#/components/schemas/SearchRun'}}}
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/SearchRun'}}
+        next_cursor: {type: string}
+        ordering: {type: string, example: '-created_at'}
     ClaimRequest:
       type: object
       required: [claim_token]
@@ -543,9 +636,32 @@ components:
           properties:
             status: {type: string, enum: [completed, failed]}
             output_cursor: {type: string, maxLength: 2000}
-            continuation: {type: object, additionalProperties: true}
+            continuation: {$ref: '#/components/schemas/Continuation'}
             result_counts: {type: object, additionalProperties: {type: integer}}
             summary: {type: string, maxLength: 5000}
+    Continuation:
+      type: object
+      description: >-
+        Closed schema: an unknown top-level field is rejected (422), except
+        next_query, which is accepted-but-ignored for one release with an
+        X-Homing-Deprecation response header before it too becomes a 422.
+      properties:
+        worker: {type: string, maxLength: 120, description: No whitespace.}
+        protocol: {type: integer, minimum: 0, maximum: 16}
+        deferred_batches: {type: integer, minimum: 0, maximum: 10000}
+        lanes: {type: array, maxItems: 64, items: {$ref: '#/components/schemas/ContinuationLane'}}
+        lanes_owned: {type: array, maxItems: 64, items: {type: string}}
+        needs_local: {type: array, maxItems: 64, items: {type: string}}
+        needs_human: {type: array, maxItems: 64, items: {type: string}}
+    ContinuationLane:
+      type: object
+      required: [lane, status]
+      properties:
+        lane: {type: string, maxLength: 80}
+        status: {type: string, enum: [ok, empty, blocked, error, deferred, skipped, skipped_needs_local, skipped_needs_human]}
+        covered_through: {type: string, maxLength: 64}
+        items_seen: {type: integer, minimum: 0, maximum: 1000000}
+        items_new: {type: integer, minimum: 0, maximum: 1000000}
     LeadInput:
       type: object
       required: [source, url, title]
@@ -620,7 +736,7 @@ components:
       required: [lead_ids, action]
       properties:
         lead_ids: {type: array, minItems: 1, maxItems: 100, items: {type: string, format: uuid}}
-        action: {type: string, enum: [trash, restore, interested, uninterested]}
+        action: {type: string, enum: [trash, restore, interested, uninterested], description: 'trash/restore require leads:destroy; interested/uninterested require only leads:write.'}
         comment: {type: string, maxLength: 10000}
     CommentInput:
       type: object

@@ -35,7 +35,10 @@ Three things it deliberately does not do, and neither do you:
 | `homing` | `{origin, http, reachable}` for `__HOMING_ORIGIN__` | Non-2xx/3xx here → stop; nothing else works. |
 | `prior_install` | `{found, scheduler_records[], state_dirs[], secret_item, last_run_at, lock}` | See below. |
 | `isolation` | `{rung, evidence[]}` | Feeds D5 in `security.md`. |
+| `browser` | `{state, kind, path}` for a browser found on this machine | Presence only. Nothing in the scheduled path drives a browser: it is the most token-expensive and least reliable way to read a page, and the fetch/extract scripts do not need one. |
 | `errors` | array of `{step, signature, detail}` | Every entry carries a signature. Read it before concluding anything. |
+| `generated_at` | ISO-8601 UTC of the probe run | Stale probe (older than this install session) → re-run rather than trust it. |
+| `duration_seconds` | how long the probe took | Over ~30 s means something timed out; check `errors` before treating any `absent` as real. |
 
 ## Capability tri-state
 

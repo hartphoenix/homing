@@ -252,13 +252,21 @@ Redact before `Tee-Object` with the same three patterns as `redact()` above.
 
 ## 7. `sources.json` (mode 0400) — also the fetch host allowlist
 
+`slug` is derived from the host, never hand-picked: lowercase, drop a leading
+`www.`, replace dots with hyphens (`www.daft.ie` → `daft-ie`). Homing's lead
+identity is `(project_id, source, source_listing_id)`, so two workers that name
+the same site differently will file the same home twice. `tier` is a string
+slug from `sources.md` (`sanctioned`/`inbox`/`community`/`residential`/`human`),
+never an integer.
+
 ```json
 {
   "schema": 1,
   "allowed_hosts": ["www.daft.ie", "www.listingsproject.com"],
   "sources": [
     {
-      "slug": "daft", "lane": "daft:sitemap", "channel": "sitemap", "tier": 1,
+      "slug": "daft-ie", "lane": "daft-ie:sitemap", "channel": "sitemap",
+      "tier": "sanctioned",
       "owner_worker": "homing/cloud-a",
       "url_template": "https://www.daft.ie/sitemap-property-{page}.xml",
       "permitted_by": "robots.txt allow, checked 2026-08-17",

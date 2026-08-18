@@ -53,6 +53,11 @@ jobs:
           python manage.py makemigrations --check --dry-run
       - name: Build production static assets
         run: python manage.py collectstatic --noinput
+      - name: Validate the public agent kit
+        # The kit is served to strangers' agents from /agent/. This catches a
+        # file that grew past the archive cap, a hardcoded origin, or anything
+        # token-shaped before it ships.
+        run: python manage.py build_agentkit --quiet
       - name: Tests
         run: python -m pytest -q
       - name: Dependency audit

@@ -1,11 +1,17 @@
 # Reachability
 
-Answering, refusing, or genuinely empty. Read alongside `sources.md` in Phase 4; the classifier
-also runs on every scheduled fetch — **in code, never in the model**.
+Answering, refusing, or genuinely empty. The classifier also runs on every scheduled fetch —
+**in code, never in the model**.
 
 All measurements dated **2026-08-17**, from **datacenter egress, US Northeast**, honest
 User-Agent. Every block below was a real HTTP response from the site's edge carrying that
 vendor's own headers.
+
+**Tooling.** `scripts/verify_sources.py --help` first, then run it against candidate listing
+URLs (`--url`, repeatable, or `--urls file.txt`). It reports REACHED / PARSED / USEFUL per
+source, optionally A/B-tests the browser and crawler identities with `--both`, writes nothing to
+Homing, needs no account key, and invokes no model — the tool for deciding whether a source is
+worth integrating before it goes into `sources.json`.
 
 ---
 
@@ -131,8 +137,13 @@ payload carries per-source `ok | empty | blocked | skipped`, and the UI says "3 
 
 ## 4. Legitimate fallback ladder
 
-Rung 0, every class: read `robots.txt` and `/llms.txt` and obey them. If robots.txt itself is
-blocked (apartments.com), consent cannot be established — stop permanently.
+Rung 0, every class: read `robots.txt` and `/llms.txt` and obey them, per RFC 9309 §2.3.1. A 4xx
+on the robots.txt request itself — including a CDN's own 403, e.g. apartments.com — means
+**unavailable**: no restrictions apply, proceed at the normal polite rate. A 5xx, a network
+failure, or a 200 whose body isn't `text/plain`/`text/x-robots` (a challenge page standing in for
+robots.txt, e.g. hotpads.com) means **unreachable**: treat it as a temporary full disallow and
+skip the source until it is re-probed. Neither shape is the publisher expressing a policy — both
+are the edge filtering the fetch before it ever reaches the publisher's own rules.
 
 | Class | In preference order |
 |---|---|

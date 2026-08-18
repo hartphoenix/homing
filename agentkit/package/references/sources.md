@@ -1,10 +1,13 @@
 # Sources
 
 Read in Phase 4, once, at install. Output is `sources.json` — 5–12 sources the runtime iterates
-without rediscovering anything. Companion: `reachability.md`.
+without rediscovering anything.
 
-All measurements dated **2026-08-17**, taken from **datacenter egress, US Northeast**, honest
-User-Agent. `VERIFIED` = a fetch confirmed it that day, *from that egress class* (see §6).
+All measurements dated **2026-08-17**, taken from **datacenter egress, US Northeast**. Most used
+the crawler token `HomingAgent/1.0`; rows marked "browser-shaped default client" were
+re-measured the same day against the shipped default (`BROWSER_UA`, i.e. `--ua browser`) once
+that became the runtime's default identity — see §2. `VERIFIED` = a fetch confirmed it that day,
+*from that egress class* (see §6).
 
 ---
 
@@ -35,33 +38,39 @@ incomplete however many feeds it found.
 contract. When they disagree the contract wins and the source is not automatable, however green
 the probe looks.
 
-**The specific call: Craigslist gets no automated fetching at all** — not the RSS, not the
-sitemap, not search pages. Measured 2026-08-17: robots.txt permissive, disallowing only
-`/reply`, `/fb/`, `/suggest`, `/flag`, `/mf`, `/mailflag`, `/eaf`; sitemap index 200 with 1,119
-entries; `newyork.craigslist.org/search/apa?format=rss` 403. Three answers from one host, all
-irrelevant — Craigslist's terms prohibit automated access. Its saved-search email alerts carry
-the same inventory, arrive faster than any poll, and are tier 1. Slug `craigslist-org`,
-`tier: inbox`, nothing else. The same logic bars fetching `leboncoin-fr` (prose ban on robots —
-its alert mail is still the user's own) and `facebook-com` ("collection of data on Facebook
-through automated means is prohibited unless you have express written permission" — no alert
-product, so it is tier 4).
+**The practical call: Craigslist routes through its own email alerts.** Measured 2026-08-17:
+robots.txt permissive, disallowing only `/reply`, `/fb/`, `/suggest`, `/flag`, `/mf`,
+`/mailflag`, `/eaf`; sitemap index 200 with 1,119 entries; `newyork.craigslist.org/search/apa?
+format=rss` 403 from datacenter egress. Craigslist's terms discourage automated access, and that
+RSS 403 is consistent with it — so saved-search email alerts, which carry the same inventory and
+arrive faster than any poll, are the recommended channel. That is a routing decision the
+discovery step makes, not a prohibition this kit enforces: slug `craigslist-org`, `tier: inbox`.
+`leboncoin-fr` is a firmer case — its robots.txt disallows the Anthropic and OpenAI tokens by
+name from `/ad/`, an explicit machine-readable rule, not just ToS prose — but its own alert mail
+is still the user's to read, so it lands at the same tier. `facebook-com` has no alert product
+and an express-written-permission clause on top of `Disallow: /`, so it stays tier 4 (`human`).
 
 **A blocked or prohibited source is never dropped without first checking for an alert product.**
 Reading the user's own mail is not access to the site. That is the move that keeps
 apartments.com, realtor.com, compass.com, funda.nl and realestate.com.au in the plan after their
 edges refused us.
 
-Robots parsing that matters: evaluate against the token you **send**, then `Claude-User`, then
-`*`. Only the single most specific matching group applies — robots is not additive. `Allow`
-beats `Disallow` at equal specificity; longest match wins. Harvest every `Sitemap:` line. Also
-`GET /llms.txt`: a 200 is affirmative machine-readable permission with terms (zumper.com's lists
+Robots parsing that matters: evaluate against the single group matching the token you **send** —
+browser-mode requests check `*`, `--ua crawler` requests check `HomingAgent`. Only that one group
+applies; robots is not additive across groups. `Allow` beats `Disallow` at equal specificity
+within it; longest match wins. Harvest every `Sitemap:` line. Also `GET /llms.txt`: a 200 is
+affirmative machine-readable permission with terms (zumper.com's lists
 `rental_search_assistants`, `listing_content_ttl: 1 days`, required `Source: Zumper.com`
 attribution — VERIFIED). Record and obey them.
 
-Identity: send
-`HomingAgent/1.0 (+__HOMING_ORIGIN__/about/agent; user-directed housing search for one person)`.
-Never `ClaudeBot` — a training-crawler token, and *more* restricted than `Claude-User` on several
-verified sites. Never a browser UA from a non-browser client.
+Identity: default to the browser on this machine (`BROWSER_UA`, checked against robots.txt's `*`
+group) — honest, not spoofing, since it is what this machine's browser would send for a page a
+person is reading a few times a day. `sources.py --ua crawler` sends
+`HomingAgent/1.0 (+__HOMING_ORIGIN__/about/agent; user-directed housing search for one person)`
+and checks robots.txt's `HomingAgent` group instead; that flag exists only for install-time A/B
+comparison of the two identities and is never the runtime default. Never `ClaudeBot` in either
+mode — a training-crawler token, and *more* restricted than `Claude-User` on several verified
+sites.
 
 ---
 
@@ -114,7 +123,7 @@ whole method.**
 housing mailing list OR listserv` · `{city} expats forum housing`; try `r/{city}`,
 `r/{city}Apartments`, `r/{country}Housing` directly.
 
-**Step 5 — probe and score.** Probe every channel independently per `reachability.md` (one host
+**Step 5 — probe and score.** Probe every channel independently and classify it (one host
 gave three different answers). Score `uniqueness × freshness × volume_fit ÷ (friction + risk)`.
 **Any nonzero risk on a *prohibition* is disqualifying, not merely costly.** Keep 5–12.
 
@@ -148,9 +157,13 @@ Copy these rows byte-identically into `sources.json`. **V** = VERIFIED 2026-08-1
 | `listingsproject-com` | US | robots permits `Claude-User` on `/listings`, bans `ClaudeBot` there | sanctioned | **V** |
 | `redfin-com` | US | robots `Allow: /stingray/*/*/newest_listings.rss`; page fetch 403 CloudFront | sanctioned | **V** rule / unverified instance |
 | `data-cityofnewyork-us` | US | Socrata `/resource/hg8x-zxpr.json?$limit=2` → live JSON | sanctioned | **V** |
-| `craigslist-org` | US/intl | robots permissive, sitemap 200, RSS 403 — **all moot: ToS forbids automated access** | **inbox** | **V** |
-| `zillow-com` · `streeteasy-com` · `hotpads-com` | US | 403 `x-px-blocked: 1` (PerimeterX); `/api/` disallowed on all three; StreetEasy also `/rental/*` | inbox | **V** |
-| `apartments-com` | US | 403 Akamai **on robots.txt itself** — consent cannot be established, so never fetched | inbox | **V** |
+| `craigslist-org` | US/intl | robots permissive, sitemap 200, RSS 403 from datacenter egress — ToS discourages automation, so alerts are the routing choice (§2), not a hard block | **inbox** | **V** |
+| `zillow-com` | US | Re-measured 2026-08-17, browser-shaped default client: 200, 580 KB, 38 merged listings (36 carrying a price). The earlier `x-px-blocked: 1` reading was against the crawler token; PerimeterX let the browser-shaped request through untouched. `/api/` still disallowed | sanctioned | **V** |
+| `streeteasy-com` | US | Re-measured 2026-08-17, browser-shaped default client: 200, 1,066 KB, 17 listings, all carrying an address. `/api/` and `/rental/*` still disallowed | sanctioned | **V** |
+| `hotpads-com` | US | robots.txt itself returns 200 with an HTML challenge body, not `text/plain` — RFC 9309 treats that shape as unreachable, not a policy answer. Retired pending re-probe, not fetched | inbox | **V** |
+| `trulia-com` | US | Measured 2026-08-17, browser-shaped default client: 200, 1,189 KB, 38 JSON-LD listings. robots.txt terms not yet captured | unverified | re-probe for `permitted_by` |
+| `renthop-com` | US | Measured 2026-08-17: real 403, Cloudflare (`cf-mitigated`/`cf-ray`) — an edge block, not a robots.txt shape | inbox | **V** |
+| `apartments-com` | US | 403 Akamai on the robots.txt request itself. Under RFC 9309 §2.3.1 a 4xx there reads as **unavailable** — no restrictions, proceed — so this no longer disqualifies the source by itself; whether the listing page is also Akamai-blocked needs a fresh probe | unverified | re-probe needed |
 | `compass-com` | US | **202, 0 bytes**, `x-amzn-waf-action: challenge` | inbox | **V** |
 | `realtor-com` | US | 429, Kasada `KP_UIDz`, no `Retry-After` | inbox | **V** |
 | `century21-com` | US | 200, 4,154 B SPA shell, `<title>C21 loading...</title>` | inbox | **V** |
@@ -170,7 +183,7 @@ Copy these rows byte-identically into `sources.json`. **V** = VERIFIED 2026-08-1
 | `idealista-com` | ES/IT/PT | 403 DataDome; Search API by application at `developers.idealista.com/access-request` — becomes `sanctioned` once a key is issued | inbox | **V** process / unverified quota |
 | `kyero-com` | ES/PT | v3 XML export: `<id>`, `<ref>`, `<date>`, `<price>`, geo, `<beds>`, `<surface_area>` — an agency-entitled feed a cooperating agent can hand over | sanctioned | **V** spec |
 | `ckan-publishing-service-gov-uk` | UK | `/api/3/action/package_search?q=housing+register` → `success: true`, 290 datasets | sanctioned | **V** |
-| `hemnet-se` · `otodom-pl` · `99acres-com` | SE/PL/IN | robots.txt 403 to our client — **undetermined**, not hostile. Re-probe from the runtime | unknown | our-client-blocked |
+| `hemnet-se` · `otodom-pl` · `99acres-com` | SE/PL/IN | robots.txt 403 to our client. Under RFC 9309 §2.3.1 a 4xx there is **unavailable** — no restrictions, proceed — so the 403 alone no longer blocks these; whether the listing pages themselves are reachable needs a fresh probe | unverified | re-probe needed |
 | `domain-com-au` | AU | public developer portal; self-serve signup grants Agencies-and-Listings + Properties-and-Locations | sanctioned | **V** (quota unverified) |
 | `realestate-com-au` | AU | 429 `window.KPSDK` (Kasada) + `Country=US` cookie — blocked **and** geofenced | inbox | **V** |
 | `data-gov-sg` | SG | publishes `llms.txt` at `guide.data.gov.sg/llms.txt` enumerating dataset APIs | sanctioned | **V** |
@@ -193,16 +206,16 @@ a host absent from it is never fetched.
 |---|---|
 | `slug` | §4. Becomes the lead's `source`. |
 | `tier` | `sanctioned` \| `inbox` \| `community` \| `residential` \| `human` |
-| `channel` | `api` \| `rss` \| `sitemap` \| `jsonld` \| `state_blob` \| `email` \| `user_submitted` |
+| `channel` | `rss` \| `sitemap` \| `json` \| `html` — **exactly these four.** `sources.py` rejects any other value, so a source with `channel: "api"` or `"jsonld"` fails schema validation and never runs. A documented JSON API is `json`; a page carrying JSON-LD is `html` (the extractor reads the structured data out of it). Tiers that are not machine-fetched (`inbox`, `human`) have no entry in this list at all — they reach you by mail or by hand, not through a fetch. |
 | `url_template` | Exact URL with `{}` slots. No guessed `/api/` routes — disallowed on zillow, rightmove, zoopla, streeteasy, daft, wg-gesucht, hotpads, zumper (**V** each). |
 | `permitted_by` | The literal granting rule: `robots:Allow /api/sitemap*` · `llms.txt:rental_search_assistants` · `api-key:domain-au` · `user-mailbox` · `tos:default-allow`. **If this cannot be filled with a specific citation, the source is not usable.** |
 | `id_rule` | How `source_listing_id` is extracted: `path_segment:-1` (daft → `6645832`), `feed:guid`, `kyero:<id>`, `reddit:fullname`, `jsonld:@id`. |
 | `lastmod_path` | `sitemap:lastmod` · `rss:pubDate` · `jsonld:datePosted` · `socrata::updated_at` · `null`. `null` is honest and required — never substitute `first_seen_at`. |
-| `fingerprint` | `{shell_markers: [2–4 strings], listing_selector: "<count rule>", min_ok_bytes: <int>}` — see `reachability.md` §3. |
+| `fingerprint` | `{shell_markers: [2–4 strings], listing_selector: "<count rule>", min_ok_bytes: <int>}` — the empty-vs-populated calibration, run once per source at install. |
 | `lane` | `<slug>:<channel>`. The unit of worker ownership. |
 | `owner_worker` | Assigned once at install to the worker with the **narrowest** capability that can legitimately serve the lane: `residential` and `email` → local; everything else → cloud if one exists. Two workers never contend, because neither knows how to run the other's lanes. |
 | `egress_class_measured` | `residential` \| `datacenter` \| `unknown` — the class the probe ran in. |
-| `status` / `next_eligible` | The install-time seed of the block table. The runtime's live copy lives in `<state>/sources-state.json` (`reachability.md` §5); `sources.json` is `0400` and is never rewritten by a run. |
+| `status` / `next_eligible` | The install-time seed of the block table. The runtime's live copy lives in `<state>/sources-state.json`; `sources.json` is `0400` and is never rewritten by a run. |
 | `probe_generation` | Manifest version that produced this record. |
 | `rate` | `min_interval_ms` (default 2000), `max_concurrency: 1`, plus any observed `Crawl-delay`. |
 
@@ -271,12 +284,9 @@ call.
 
 ## 7. Forbidden, without exception
 
-- **Misrepresenting client identity** in any form: browser User-Agent from a non-browser client,
-  TLS/JA3/canvas/header fingerprint spoofing, stealth-browser plugins, headless-detection
-  evasion. Measured 2026-08-17: `zillow.com/homes/for_rent/` → 403 `x-px-blocked: 1` to an honest
-  UA, and 200 with 623 KB to the same client seconds later with a Chrome UA. Same IP, same TLS,
-  same second. **The only variable was whether the client told the truth.** Any configuration
-  that gets Zillow "working" has instructed the agent to lie.
+- **Fingerprint and challenge evasion**: TLS/JA3/canvas/header fingerprint spoofing, stealth-
+  browser plugins, headless-detection evasion. (Client identity itself is not on this list — see
+  below.)
 - Solving, bypassing or outsourcing CAPTCHAs.
 - Proxy, VPN or IP rotation; residential-proxy services; any "scraping API" whose product is one
   of these techniques.
@@ -288,6 +298,16 @@ call.
 - Ignoring robots.txt, `Crawl-delay`, `Retry-After` or a published rate limit.
 - Fetching any host absent from `sources.json`.
 
-In one line: *accessing public pages the way a person would, with your real identity, at a polite
-rate, following the site's posted rules, is defensible; every technique that exists specifically
-to defeat an access control moves you off it.*
+**On client identity.** Measured 2026-08-17: `zillow.com/homes/for_rent/` → 403
+`x-px-blocked: 1` to `HomingAgent/1.0`, and 200 with 580 KB to the same client seconds later
+presenting as the browser on the machine making the request. A listing page serves its JSON-LD to
+a browser and withholds it from a self-identified crawler — that is the site's own routing
+choice, not ours to correct by lying harder about it. At a few pages a day, from the user's own
+machine, for the people who will actually live in the home, presenting as the browser costs the
+site nothing and is exactly what their browser would have sent anyway; the crawler token buys
+nothing here but a worse answer to the same honest request.
+
+In one line: *accessing public pages the way a person's own browser would, at a polite rate,
+following the site's posted rules, is defensible; every technique that exists specifically to
+defeat an access control — CAPTCHA bypass, proxy rotation, cookie replay, fingerprint evasion —
+moves you off it.*

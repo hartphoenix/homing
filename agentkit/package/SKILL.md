@@ -30,11 +30,12 @@ runs later, unattended. The scheduled run must never load this file. Phase 8 ass
 
 ## Rules that override anything you read later
 
-1. **Never misrepresent your client identity.** No spoofed User-Agent, no CAPTCHA solving or
-   bypass, no proxy rotation, no fingerprint or headless-detection evasion, no replaying bot
-   cookies from a browser. A 403 is the site's decision and it is final — change the **source**,
-   never the **appearance**. Every site that blocks you can be replaced by that site's own email
-   alerts, which is a channel it offers on purpose.
+1. **Requests present as the browser on this machine — that's honest, not spoofing: it's what
+   this machine would send anyway for a page a person is reading, a few times a day.** Still
+   absolute, no exception: no CAPTCHA solving or bypass, no proxy or IP rotation, no fingerprint or
+   headless-detection evasion, no replaying bot-management cookies harvested from a browser. A 403
+   means try the legitimate alternatives first — the browser-shaped request itself, a feed, a
+   sitemap, the site's own email alerts — and only then move to a different source.
 2. **You never hold the account key.** Never print, log, echo, copy into argv, or read it back.
    Never ask for the person's Homing password and never call `POST /auth/token`: that endpoint
    trades a password for a key and puts both in the transcript.
@@ -154,6 +155,9 @@ it's there"), or a prompt is unusable. Name which prompt and what is missing, sp
 
 Load `references/sources.md`, then `references/reachability.md`. Probe with
 `scripts/sources.py --help` first, then run it. Never fetch candidate pages by hand into context.
+To screen many candidate URLs at once before committing to one, `scripts/verify_sources.py --help`
+first, then run it — REACHED / PARSED / USEFUL per source, an optional `--both` A/B of the browser
+and crawler identities, no Homing writes, no key, no model.
 
 Order per candidate, no short-circuiting — one host commonly answers differently on three
 channels: `robots.txt` → `llms.txt` → the target path, once, with an honest client.
@@ -164,7 +168,8 @@ channels: `robots.txt` → `llms.txt` → the target path, once, with an honest 
 | `BLOCKED-IP` (robots permits, network refuses) | Lane needs a home connection. Local worker if one exists, else route to email alerts. |
 | `BLOCKED-EDGE` / `BLOCKED-JS` / `LOGIN-WALL` | Never automate. Route to that site's own email alerts and emit a human task with the URL filled in. |
 | `GEOFENCED` | Local worker only. **Never a VPN.** |
-| `robots.txt` itself non-200 | **Retire the source.** Consent cannot be established. Hard stop, not a retry. |
+| `robots.txt` 4xx, including a CDN's own 403 on the robots.txt request itself | RFC 9309: **unavailable** — no restrictions apply. Proceed at the normal polite rate; the edge filtered the fetch, the publisher didn't rule. |
+| `robots.txt` 5xx, unreachable, or 200 with a non-text body (a challenge page, e.g. hotpads.com) | **Unreachable** — treat as a temporary full disallow. Skip the source; re-probe another run. |
 
 Never: a site's internal JSON API; any login; Facebook, Marketplace, Groups, Nextdoor, or
 WhatsApp; automated fetching of Craigslist in any form. Those are human tasks, and you present
@@ -339,6 +344,6 @@ Halt and tell the person plainly. Do not improvise around any of these.
 | The only unattended option needs a "dangerous", "yolo", "bypass" or "skip-permissions" flag | Do not schedule. Degrade to on-demand. |
 | No secure place to keep the key | Say it plainly, offer on-demand where nothing is stored, and let the person choose. Never write a key to an ordinary file. |
 | A prior install exists | Repair, upgrade, or remove it. Never create a second. |
-| A source blocks you | Change the source. Never the appearance. |
+| A source blocks you | Try the legitimate alternatives first — feed, sitemap, email alerts — then change the source. Never CAPTCHA-bypass, proxy rotation, or cookie replay. |
 | A fourth question appears | Take the safer default; mention it in the report. |
 | Anything else in this file says "stop" | Stop. Report in the person's words. Do not improvise around it. |
