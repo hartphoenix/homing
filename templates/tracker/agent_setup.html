@@ -8,8 +8,8 @@
 <section class="panel agent-primary" aria-labelledby="instruction-heading">
   <h2 id="instruction-heading">Copy this to your assistant</h2>
   <p>Paste it into ChatGPT, Claude, or whichever AI assistant you use, and send it. It will come back and ask you to approve the connection here.</p>
-  <p class="agent-actions"><button type="button" class="button button-primary" data-copy data-copy-source="agent-prompt" aria-live="polite">Copy the instruction</button></p>
-  <details class="prompt-preview"><summary>See what it says</summary><label class="sr-only" for="agent-prompt">The instruction for your assistant</label><textarea id="agent-prompt" readonly rows="14">{{ agent_prompt }}</textarea></details>
+  <p class="agent-actions"><button type="button" class="button button-primary" data-copy data-copy-source="agent-prompt" aria-live="polite">Copy the prompt</button></p>
+  <details class="prompt-preview"><summary>See what it says</summary><label class="sr-only" for="agent-prompt">The prompt for your assistant</label><textarea id="agent-prompt" readonly rows="14">{{ agent_prompt }}</textarea></details>
   {% if approved_link %}<p class="agent-note" role="status">You approved <strong>{{ approved_link.agent_label }}</strong>. It will finish connecting the next time it checks in.</p>{% endif %}
   <p class="muted">Your assistant showing you a six-character code? <a href="{% url 'tracker:agent-link' %}">Enter it here</a>.</p>
 </section>
@@ -35,11 +35,11 @@
   <h2 id="status-heading">{{ agent.name }}{% if state == 'silent' %} last checked {% if last_check %}{{ last_check.happened_at|timesince }} ago{% else %}never{% endif %}{% else %} is connected{% endif %}</h2>
   {% if paused_until %}<p class="agent-note" role="status"><strong>Paused.</strong> Nothing new will be added until you resume. It starts again on its own {{ paused_until|date:"j M Y" }}.</p>{% endif %}
   <dl class="status-facts">
-    <div><dt>Searching</dt><dd>{% for name in searching %}{{ name }}{% if not forloop.last %} · {% endif %}{% empty %}Nothing yet — make a search first{% endfor %}</dd></div>
-    <div><dt>How often</dt><dd>{{ cadence_text }}</dd></div>
-    <div><dt>Where it runs</dt><dd>{{ agent.environment_note|default:"It didn't say" }}</dd></div>
-    <div><dt>Last check</dt><dd>{% if last_check %}{{ last_check.happened_at|timesince }} ago — {{ last_check.outcome }}{% else %}Not yet{% endif %}</dd></div>
-    <div><dt>Next check</dt><dd>{% if paused_until %}Paused{% elif next_check %}{{ next_check|date:"D j M, H:i" }}{% else %}When you ask{% endif %}</dd></div>
+    <div><dt>Searching:</dt><dd>{% for name in searching %}{{ name }}{% if not forloop.last %} · {% endif %}{% empty %}Nothing yet — make a search first{% endfor %}</dd></div>
+    <div><dt>How often:</dt><dd>{{ cadence_text }}</dd></div>
+    <div><dt>Where it runs:</dt><dd>{{ agent.environment_note|default:"It didn't say" }}</dd></div>
+    <div><dt>Last check:</dt><dd>{% if last_check %}{{ last_check.happened_at|timesince }} ago — {{ last_check.outcome }}{% else %}Not yet{% endif %}</dd></div>
+    <div><dt>Next check:</dt><dd>{% if paused_until %}Paused{% elif next_check %}{{ next_check|date:"D j M, H:i" }}{% else %}When you ask{% endif %}</dd></div>
   </dl>
   <div class="agent-actions">
     <form method="post" class="inline-form">{% csrf_token %}
@@ -53,26 +53,26 @@
 {% if state == 'silent' %}
 <section class="panel agent-primary" aria-labelledby="repair-heading">
   <h2 id="repair-heading">Ask it to fix itself</h2>
-  <p>Copy the instruction again and paste it to your assistant. It will check its own setup and start again.</p>
-  <p class="agent-actions"><button type="button" class="button button-primary" data-copy data-copy-source="agent-prompt" aria-live="polite">Copy the instruction again</button></p>
-  <details class="prompt-preview"><summary>See what it says</summary><label class="sr-only" for="agent-prompt">The instruction for your assistant</label><textarea id="agent-prompt" readonly rows="14">{{ agent_prompt }}</textarea></details>
+  <p>Copy the prompt again and paste it to your assistant. It will check its own setup and start again.</p>
+  <p class="agent-actions"><button type="button" class="button button-primary" data-copy data-copy-source="agent-prompt" aria-live="polite">Copy the prompt again</button></p>
+  <details class="prompt-preview"><summary>See what it says</summary><label class="sr-only" for="agent-prompt">The prompt for your assistant</label><textarea id="agent-prompt" readonly rows="14">{{ agent_prompt }}</textarea></details>
 </section>
 {% else %}
 <details class="panel agent-more"><summary>Set up another assistant</summary>
   <p>Paste this to any other AI assistant you use. Each one connects separately, and you can disconnect them one at a time.</p>
-  <p class="agent-actions"><button type="button" class="button" data-copy data-copy-source="agent-prompt" aria-live="polite">Copy the instruction</button></p>
-  <label class="sr-only" for="agent-prompt">The instruction for your assistant</label><textarea id="agent-prompt" class="prompt-text-area" readonly rows="10">{{ agent_prompt }}</textarea>
+  <p class="agent-actions"><button type="button" class="button" data-copy data-copy-source="agent-prompt" aria-live="polite">Copy the prompt</button></p>
+  <label class="sr-only" for="agent-prompt">The prompt for your assistant</label><textarea id="agent-prompt" class="prompt-text-area" readonly rows="10">{{ agent_prompt }}</textarea>
 </details>
 {% endif %}
 
 <section class="panel agent-checks" aria-labelledby="checks-heading">
   <div class="section-heading"><div><p class="eyebrow">History</p><h2 id="checks-heading">Recent checks</h2></div></div>
-  <ul class="check-list">{% for check in checks %}<li><span><strong>{{ check.happened_at|date:"j M, H:i" }}</strong><small>{{ check.project.name }}</small></span><span>{{ check.outcome }}</span></li>{% empty %}<li class="muted">No checks yet. The first one happens after your assistant finishes setting itself up.</li>{% endfor %}</ul>
+  <ul class="check-list">{% for check in checks %}<li><span class="check-metadata"><time datetime="{{ check.happened_at|date:'c' }}">{{ check.happened_at|date:"j M, H:i" }}</time><span aria-hidden="true">·</span><span>{{ check.project.name }}</span><span aria-hidden="true">·</span><span>{{ check.outcome }}</span></span></li>{% empty %}<li class="muted">No checks yet. The first one happens after your assistant finishes setting itself up.</li>{% endfor %}</ul>
 </section>
 {% endif %}
 
 <details class="panel agent-more" {% if new_key %}open{% endif %}><summary>Other ways to connect</summary>
-  <p>Most people never need this. If your assistant cannot reach Homing on its own, make an access key and hand it over yourself. Anything you paste into a chat window can be read by anyone who can see that chat, so use the instruction above when you can.</p>
+  <p>Most people never need this. If your assistant cannot reach Homing on its own, make an access key. Run the setup command your assistant provides on the computer that will run your searches. When that command asks for the access key in your terminal, paste it there; it will store the key securely on that computer. Do not paste it into a chat window: anyone who can see that chat could read it. Use the prompt above when you can.</p>
   <form method="post">{% csrf_token %}
     <input type="hidden" name="action" value="create-key">
     <div class="field"><label for="key-name">Name this connection</label><span class="form-help">A private label so you can recognise it later.</span><input id="key-name" name="name" maxlength="120" value="My search assistant" autocomplete="off"></div>
@@ -87,10 +87,6 @@
     <input id="new-key" type="text" readonly value="{{ new_key }}" spellcheck="false" autocomplete="off">
     <p class="muted">A key made this way can add and update places and leave comments. It cannot delete or restore anything, and it cannot change your account.</p>
   </div>
-  {% endif %}
-  {% if tokens %}
-  <h3>Connections</h3>
-  <ul class="token-list">{% for token in tokens %}<li><span><strong>{{ token.name }}</strong><small>{% if token.revoked_at %}Disconnected {{ token.revoked_at|date:"j M Y" }}{% else %}All your searches · stops working {{ token.expires_at|date:"j M Y" }}{% if token.exposed_to_chat %} · you carried this key by hand{% endif %}{% endif %}</small></span>{% if token.revoked_at %}<span class="badge badge-trash">Disconnected</span>{% else %}<form method="post" class="inline-form">{% csrf_token %}<input type="hidden" name="token_id" value="{{ token.id }}"><button class="link-button danger-link" name="action" value="disconnect">Disconnect</button></form>{% endif %}</li>{% endfor %}</ul>
   {% endif %}
 </details>
 {% endblock %}

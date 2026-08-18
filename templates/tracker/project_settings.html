@@ -15,6 +15,13 @@
       <div><dt>Description</dt><dd>{{ project.description|default:'None' }}</dd></div>
       <div><dt>Status</dt><dd>{{ project.status|default:'Active' }}</dd></div>
     </dl>
+    {% if can_manage_project %}
+    <div class="section-heading">
+      <h2>Delete project</h2>
+    </div>
+    <p class="muted">Move this project and its leads to trash. Nothing is permanently deleted.</p>
+    <button class="button danger-button" type="button" data-project-delete>Move project to trash</button>
+    {% endif %}
   </section>
   <section class="panel">
     <div class="section-heading">
@@ -27,7 +34,7 @@
         <span><strong>{{ member.display_name }}</strong><small>{{ member.email|default:member.role }}</small></span>
         <span class="member-actions">
           <span class="badge">{{ member.role }}</span>
-          {% if can_manage_project %}
+          {% if can_manage_project and not member.is_current_user %}
             {% if member.can_remove %}
             <button
               class="link-button danger-link"
@@ -57,6 +64,17 @@
   </section>
 </div>
 {% if can_manage_project %}
+<dialog class="trash-dialog" data-project-delete-dialog aria-labelledby="project-delete-title">
+  <form method="post" action="{% url 'tracker:project-delete' project.slug %}">
+    {% csrf_token %}
+    <h2 id="project-delete-title">Move project to trash?</h2>
+    <p><strong>{{ project.name }}</strong> and its leads will be hidden from your active projects. Nothing is permanently deleted.</p>
+    <div class="form-actions">
+      <button class="button danger-button" type="submit">Move to trash</button>
+      <button class="button button-quiet" type="button" data-project-delete-cancel>Cancel</button>
+    </div>
+  </form>
+</dialog>
 <dialog class="trash-dialog" data-member-remove-dialog aria-labelledby="member-remove-title">
   <form method="post" data-member-remove-form>
     {% csrf_token %}

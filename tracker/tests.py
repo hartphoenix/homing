@@ -1,9 +1,18 @@
+from django.core import mail
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from accounts.models import AgentToken, Profile, User
 from accounts.services.tokens import digest_token
-from projects.models import AuditEvent, Lead, LeadComment, LeadInterest, Project, ProjectMembership
+from projects.models import (
+    AuditEvent,
+    Lead,
+    LeadComment,
+    LeadInterest,
+    Project,
+    ProjectMembership,
+    PromptRevision,
+)
 from projects.services.authorization import SCOPES
 from tracker.forms import LeadForm, RegisterForm
 
@@ -119,6 +128,102 @@ class TrackerWebFlowTests(TestCase):
         )
         self.assertContains(response, "A project must retain at least one owner.")
 
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+    def test_project_creation_generates_slug_prompt_and_deduplicated_invitations(self):
+        self.login_as(self.owner)
+        response = self.client.post(
+            reverse("tracker:project-create"),
+            {
+                "name": "September search",
+                "description": "A second search",
+                "initial_prompt": "Find a sunny room near a park.",
+                "invite_emails": "New@Example.com, new@example.com\nsecond@example.com",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        created = Project.objects.get(name="September search", description="A second search")
+        self.assertEqual(created.slug, "september-search-2")
+        self.assertEqual(created.prompt, "Find a sunny room near a park.")
+        self.assertEqual(created.prompt_revision, 1)
+        self.assertTrue(
+            ProjectMembership.objects.filter(
+                project=created, user=self.owner, role=ProjectMembership.Role.OWNER
+            ).exists()
+        )
+        self.assertTrue(PromptRevision.objects.filter(project=created, revision=1).exists())
+        self.assertEqual(
+            set(created.invitations.values_list("invited_email", flat=True)),
+            {"new@example.com", "second@example.com"},
+        )
+        self.assertEqual(len(mail.outbox), 2)
+
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+    def test_project_creation_omits_creator_email_and_does_not_expose_slug(self):
+        self.login_as(self.owner)
+        page = self.client.get(reverse("tracker:project-create"))
+        self.assertNotContains(page, 'name="slug"')
+        response = self.client.post(
+            reverse("tracker:project-create"),
+            {
+                "name": "No self invite",
+                "description": "",
+                "initial_prompt": "",
+                "invite_emails": "owner@example.com, teammate@example.com",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        created = Project.objects.get(name="No self invite")
+        self.assertEqual(
+            list(created.invitations.values_list("invited_email", flat=True)),
+            ["teammate@example.com"],
+        )
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_legacy_project_detail_redirects_to_leads(self):
+        self.login_as(self.owner)
+        response = self.client.get(reverse("tracker:project-detail", args=[self.project.slug]))
+        self.assertRedirects(response, reverse("tracker:lead-list", args=[self.project.slug]))
+
+    def test_current_user_cannot_remove_themselves_when_another_owner_exists(self):
+        second_owner = User.objects.create_user("second-owner@example.com", "password")
+        ProjectMembership.objects.create(
+            project=self.project, user=second_owner, role=ProjectMembership.Role.OWNER
+        )
+        self.login_as(self.owner)
+        page = self.client.get(reverse("tracker:project-settings", args=[self.project.slug]))
+        self.assertNotContains(
+            page,
+            reverse("tracker:member-remove", args=[self.project.slug, self.owner.pk]),
+        )
+        response = self.client.post(
+            reverse("tracker:member-remove", args=[self.project.slug, self.owner.pk]),
+            follow=True,
+        )
+        self.assertContains(response, "You cannot remove yourself")
+        self.assertTrue(
+            ProjectMembership.objects.filter(project=self.project, user=self.owner).exists()
+        )
+
+    def test_owner_can_move_project_to_recoverable_trash(self):
+        self.login_as(self.owner)
+        page = self.client.get(reverse("tracker:project-settings", args=[self.project.slug]))
+        self.assertContains(page, "Move project to trash")
+        response = self.client.post(
+            reverse("tracker:project-delete", args=[self.project.slug]), follow=True
+        )
+        self.assertRedirects(response, reverse("tracker:project-list"))
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.TRASHED)
+        self.assertContains(response, "moved to trash")
+        self.assertNotContains(response, 'class="project-card"')
+        self.assertEqual(
+            self.client.get(reverse("tracker:lead-list", args=[self.project.slug])).status_code,
+            404,
+        )
+        self.assertTrue(
+            AuditEvent.objects.filter(project=self.project, action="project.trashed").exists()
+        )
+
     def test_outsider_cannot_discover_project(self):
         self.login_as(self.outsider)
         response = self.client.get(reverse("tracker:lead-list", args=[self.project.slug]))
@@ -206,6 +311,58 @@ class TrackerWebFlowTests(TestCase):
         page = self.client.get(reverse("tracker:lead-list", args=[self.project.slug]))
         self.assertContains(page, "Viewer")
         self.assertContains(page, 'aria-pressed="false"')
+
+    def test_lead_list_defaults_to_list_and_universal_filters_are_shareable(self):
+        second = Lead.objects.create(
+            project=self.project,
+            creator=self.owner,
+            source="example",
+            canonical_url="https://example.test/listing/2",
+            title="Second lead",
+        )
+        LeadInterest.objects.create(lead=second, user=self.viewer)
+        self.login_as(self.viewer)
+
+        default_page = self.client.get(reverse("tracker:lead-list", args=[self.project.slug]))
+        self.assertContains(default_page, 'data-view-mode="list"')
+        self.assertEqual(default_page.context["filters"]["sort"], "updated")
+        self.assertEqual(default_page.context["filters"]["interest_scope"], "all")
+
+        filtered = self.client.get(
+            reverse("tracker:lead-list", args=[self.project.slug]),
+            {"interest_scope": "anyone", "sort": "interest"},
+        )
+        self.assertContains(filtered, "Second lead")
+        self.assertNotContains(filtered, "Sunny room")
+        self.assertEqual([lead.pk for lead in filtered.context["leads"]], [second.pk])
+        self.assertContains(filtered, 'name="interest_scope"')
+        self.assertContains(filtered, 'name="sort"')
+
+        self.lead.status = Lead.Status.TRASHED
+        self.lead.save(update_fields=["status"])
+        trash_page = self.client.get(
+            reverse("tracker:lead-list", args=[self.project.slug]), {"status": "trash"}
+        )
+        self.assertContains(trash_page, "Sunny room")
+        self.assertNotContains(trash_page, "Second lead")
+
+    def test_interest_json_update_returns_state_for_progressive_enhancement(self):
+        self.login_as(self.viewer)
+        response = self.client.post(
+            reverse("tracker:lead-interest", args=[self.project.slug, self.lead.pk]),
+            {"interested": "true"},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            HTTP_ACCEPT="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "is_interested": True,
+                "interest_count": 1,
+                "interested_members": ["Viewer"],
+            },
+        )
 
     def test_owner_can_delete_comment_and_editor_can_restore_trash(self):
         comment = LeadComment.objects.create(lead=self.lead, author=self.editor, body="Check guests")

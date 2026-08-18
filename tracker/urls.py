@@ -32,6 +32,7 @@ urlpatterns = [
     path("projects/<slug:slug>/", views.project_detail, name="project-detail"),
     path("projects/<slug:slug>/edit/", views.project_edit, name="project-edit"),
     path("projects/<slug:slug>/settings/", views.project_settings, name="project-settings"),
+    path("projects/<slug:slug>/delete/", views.project_delete, name="project-delete"),
     path("projects/<slug:slug>/prompt/", views.prompt_edit, name="prompt-edit"),
     path("projects/<slug:slug>/leads/", views.lead_list, name="lead-list"),
     path("projects/<slug:slug>/leads/batch/", views.lead_batch, name="lead-batch"),

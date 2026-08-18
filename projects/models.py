@@ -7,6 +7,7 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MaxLengthValidator, MinValueValidator
 from django.db import models
 from django.utils import timezone
+from django.utils.text import slugify
 
 from accounts.managers import normalize_email
 
@@ -48,6 +49,26 @@ class Project(models.Model):
 
     def __str__(self):
         return self.name
+
+
+def unique_project_slug(name, *, exclude_pk=None):
+    """Return a readable, available slug for a project name.
+
+    Slugs are generated server-side so creating a project never requires a
+    user to understand URL identifiers.  Numeric suffixes keep collisions
+    readable (and the loop also handles names that slugify to an empty value).
+    """
+    base = slugify(str(name or ""))[:220] or "project"
+    candidate = base
+    suffix = 2
+    queryset = Project.objects.all()
+    if exclude_pk is not None:
+        queryset = queryset.exclude(pk=exclude_pk)
+    while queryset.filter(slug=candidate).exists():
+        suffix_text = f"-{suffix}"
+        candidate = f"{base[:220 - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+    return candidate
 
 
 class ProjectMembership(models.Model):

@@ -24,6 +24,10 @@ class FinalOwnerError(Exception):
     """Raised when a membership change would leave a project ownerless."""
 
 
+class SelfRemovalError(Exception):
+    """Raised when a member tries to remove their own project access."""
+
+
 def _actor_user(actor):
     return actor.user if hasattr(actor, "user") else actor
 
@@ -49,6 +53,8 @@ def remove_project_member(project, *, member_user_id, actor):
         and locked.memberships.filter(role=ProjectMembership.Role.OWNER).count() == 1
     ):
         raise FinalOwnerError("A project must retain an owner.")
+    if _actor_user(actor).pk == membership.user_id:
+        raise SelfRemovalError("You cannot remove yourself from a project.")
 
     payload = {"user_id": str(membership.user_id), "role": membership.role}
     append_change(
@@ -69,6 +75,29 @@ def remove_project_member(project, *, member_user_id, actor):
         actor,
     )
     membership.delete()
+
+
+@transaction.atomic
+def trash_project(project, *, actor):
+    """Soft-delete a project while retaining its data for recovery."""
+    assert_owner(project, actor)
+    locked = Project.objects.select_for_update().get(pk=project.pk)
+    if locked.status == Project.Status.TRASHED:
+        return locked
+    locked.status = Project.Status.TRASHED
+    locked.save(update_fields=["status", "updated_at"])
+    payload = {"status": Project.Status.TRASHED}
+    append_change(
+        locked,
+        "project.trashed",
+        "project",
+        str(locked.pk),
+        payload,
+        actor,
+        tombstone=True,
+    )
+    append_audit(locked, "project.trashed", "project", str(locked.pk), payload, actor)
+    return locked
 
 @transaction.atomic
 def update_project_prompt(project, *, editor, prompt, criteria, expected_revision=None):

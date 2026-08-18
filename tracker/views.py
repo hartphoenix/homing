@@ -17,9 +17,9 @@ from django.contrib import messages
 from django.contrib.auth import login
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.views import LoginView, LogoutView
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Count, Q
-from django.http import HttpResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
@@ -34,23 +34,25 @@ from accounts.services.tokens import create_agent_token, default_agent_scopes, r
 from projects.models import (
     Lead,
     LeadComment,
-    LeadInterest,
     AuditEvent,
     Project,
     ProjectInvitation,
     ProjectMembership,
     SearchRun,
+    unique_project_slug,
 )
 from projects.services.authorization import authorize_project
 from projects.services.mutations import (
     FinalOwnerError,
     PromptRevisionConflict,
+    SelfRemovalError,
     append_change,
     batch_lead_mutation,
     remove_project_member,
     restore_lead,
     set_interest,
     trash_lead,
+    trash_project,
     update_project_prompt,
 )
 
@@ -158,6 +160,14 @@ class TrackerLoginView(LoginView):
         context["public_signup_enabled"] = settings.ALLOW_PUBLIC_SIGNUP
         return context
 
+    def dispatch(self, request, *args, **kwargs):
+        # Do not let a login form (and its CSRF token) be restored from a
+        # shared/browser cache after the session or token has changed.
+        response = super().dispatch(request, *args, **kwargs)
+        response["Cache-Control"] = "no-store"
+        response["Pragma"] = "no-cache"
+        return response
+
     def get_success_url(self):
         return _safe_next(self.request, self.get_redirect_url(), reverse("tracker:project-list"))
 
@@ -233,7 +243,9 @@ def register(request):
 @login_required
 def project_list(request):
     projects = list(
-        Project.objects.filter(memberships__user=request.user)
+        Project.objects.filter(
+            memberships__user=request.user, status=Project.Status.ACTIVE
+        )
         .annotate(
             active_count=Count("leads", filter=Q(leads__status=Lead.Status.ACTIVE), distinct=True),
             member_count=Count("memberships", distinct=True),
@@ -255,42 +267,46 @@ def project_list(request):
 
 @login_required
 def project_create(request):
-    form = ProjectForm(request.POST or None)
+    form = ProjectForm(request.POST or None, creator_email=request.user.email)
     if request.method == "POST" and form.is_valid():
-        with transaction.atomic():
-            project = form.save(commit=False)
-            project.creator = request.user
-            project.save()
-            ProjectMembership.objects.create(
-                project=project, user=request.user, role=ProjectMembership.Role.OWNER
-            )
+        # The availability check in unique_project_slug is intentionally
+        # human-readable. A short retry closes the check-then-insert race when
+        # two people create the same project name concurrently.
+        for attempt in range(3):
+            try:
+                with transaction.atomic():
+                    project = form.save(commit=False)
+                    project.pk = uuid.uuid4()
+                    project.creator = request.user
+                    project.slug = unique_project_slug(project.name)
+                    project.save()
+                    ProjectMembership.objects.create(
+                        project=project, user=request.user, role=ProjectMembership.Role.OWNER
+                    )
+                    append_change(project, "project.created", "project", str(project.pk), {}, request.user)
+                    if form.cleaned_data["prompt"]:
+                        update_project_prompt(
+                            project,
+                            editor=request.user,
+                            prompt=form.cleaned_data["prompt"],
+                            criteria={},
+                            expected_revision=0,
+                        )
+                    for email in form.cleaned_data["invite_emails"]:
+                        _send_project_invitation(project, request.user, email, request=request)
+                break
+            except IntegrityError:
+                if attempt == 2:
+                    raise
         messages.success(request, "Project created.")
-        return redirect("tracker:project-detail", project.slug)
+        return redirect("tracker:lead-list", project.slug)
     return render(request, "tracker/project_form.html", {"form": form, "title": "Create project"})
 
 
 @login_required
 def project_detail(request, slug):
     project = _project(slug, request.user)
-    flags = _project_flags(project, request.user)
-    project.active_count = project.leads.filter(status=Lead.Status.ACTIVE).count()
-    project.trash_count = project.leads.filter(status=Lead.Status.TRASHED).count()
-    project.interested_count = LeadInterest.objects.filter(
-        lead__project=project, user=request.user
-    ).count()
-    project.member_count = project.memberships.count()
-    latest = project.prompt_revisions.select_related("editor__profile").first()
-    project.prompt_updated_at = latest.created_at if latest else None
-    project.prompt_editor = (
-        (
-            getattr(latest.editor, "profile", None).display_name
-            if latest and hasattr(latest.editor, "profile")
-            else None
-        )
-        if latest
-        else None
-    )
-    return render(request, "tracker/project_detail.html", {"project": project, **flags})
+    return redirect("tracker:lead-list", project.slug)
 
 
 @login_required
@@ -321,12 +337,14 @@ def project_settings(request, slug):
                 "display_name": (profile.display_name if profile else "") or membership.user.email,
                 "email": membership.user.email,
                 "user_id": membership.user_id,
+                "is_current_user": membership.user_id == request.user.pk,
                 "role": (
                     "owner"
                     if membership.role == ProjectMembership.Role.OWNER
                     else "collaborator"
                 ),
                 "can_remove": flags["can_manage_project"]
+                and membership.user_id != request.user.pk
                 and not (
                     membership.role == ProjectMembership.Role.OWNER and owner_count == 1
                 ),
@@ -362,9 +380,21 @@ def member_remove(request, slug, user_id):
         remove_project_member(project, member_user_id=user_id, actor=request.user)
     except FinalOwnerError:
         messages.error(request, "A project must retain at least one owner.")
+    except SelfRemovalError:
+        messages.error(request, "You cannot remove yourself from a project.")
     else:
         messages.success(request, f"{display_name} was removed from the project.")
     return redirect("tracker:project-settings", project.slug)
+
+
+@login_required
+@require_POST
+def project_delete(request, slug):
+    """Move a project to the recoverable trash state."""
+    project = _project(slug, request.user, ProjectMembership.Role.OWNER)
+    trash_project(project, actor=request.user)
+    messages.success(request, f"{project.name} was moved to trash.")
+    return redirect("tracker:project-list")
 
 
 @login_required
@@ -412,13 +442,23 @@ def prompt_edit(request, slug):
 
 def _filtered_leads(project, request):
     params = request.GET
-    is_trash = params.get("status") == "trash"
+    status = params.get("status", "active")
+    if status not in {"active", "trash"}:
+        status = "active"
+    is_trash = status == "trash"
     qs = project.leads.select_related("creator", "trashed_by__profile").prefetch_related("interests__user__profile")
     qs = qs.filter(status=Lead.Status.TRASHED if is_trash else Lead.Status.ACTIVE)
     q = params.get("q", "").strip()
-    date_confidence = params.get("date_confidence", "")
-    housing_type = params.get("housing_type", "")
-    interested_by = params.get("interested_by", "")
+    interest_scope = params.get("interest_scope", "").strip().lower()
+    # Older links used interested_by=me.  Continue accepting them while the
+    # broader scope control uses an explicit, self-describing parameter.
+    if not interest_scope and params.get("interested_by") == "me":
+        interest_scope = "me"
+    if interest_scope not in {"all", "me", "anyone"}:
+        interest_scope = "all"
+    sort = params.get("sort", "updated").strip().lower()
+    if sort not in {"updated", "newest", "oldest", "interest"}:
+        sort = "updated"
     if q:
         qs = qs.filter(
             Q(title__icontains=q)
@@ -426,20 +466,35 @@ def _filtered_leads(project, request):
             | Q(location__icontains=q)
             | Q(source__icontains=q)
         )
-    if date_confidence:
-        qs = qs.filter(date_confidence=date_confidence)
-    if housing_type:
-        qs = qs.filter(housing_type=housing_type)
-    if interested_by == "me":
+    if interest_scope == "me":
         qs = qs.filter(interests__user=request.user)
+    elif interest_scope == "anyone":
+        qs = qs.filter(interests__isnull=False)
+    if sort == "newest":
+        qs = qs.order_by("-created_at", "-pk")
+    elif sort == "oldest":
+        qs = qs.order_by("created_at", "pk")
+    elif sort == "interest":
+        qs = qs.annotate(interest_total=Count("interests", distinct=True)).order_by(
+            "-interest_total", "-updated_at", "-pk"
+        )
+    else:
+        # The model's existing default is recently updated, so retain that
+        # behavior as the new universal sort default.
+        qs = qs.order_by("-updated_at", "-pk")
     return (
         qs.distinct(),
         {
             "q": q,
-            "date_confidence": date_confidence,
-            "housing_type": housing_type,
-            "interested_by": interested_by,
-            "view": params.get("view", "cards") if params.get("view") in {"cards", "list"} else "cards",
+            "interest_scope": interest_scope,
+            # Keep this projection for callers that still inspect the legacy
+            # checkbox state while links migrate to interest_scope.
+            "interested_by": "me" if interest_scope == "me" else "",
+            "status": status,
+            "sort": sort,
+            # List is the compact, scan-friendly default.  An explicit view
+            # query parameter remains authoritative so links stay shareable.
+            "view": params.get("view", "list") if params.get("view") in {"cards", "list"} else "list",
         },
         is_trash,
     )
@@ -467,7 +522,16 @@ def lead_list(request, slug):
     cards_params = request.GET.copy()
     cards_params["view"] = "cards"
     clear_params = request.GET.copy()
-    for key in ("q", "date_confidence", "housing_type", "interested_by", "view"):
+    for key in (
+        "q",
+        "interest_scope",
+        "interested_by",
+        "date_confidence",
+        "housing_type",
+        "status",
+        "sort",
+        "view",
+    ):
         clear_params.pop(key, None)
     base_url = reverse("tracker:lead-list", args=[project.slug])
     return render(
@@ -478,8 +542,6 @@ def lead_list(request, slug):
             "leads": leads,
             "filters": filters,
             "is_trash": is_trash,
-            "date_confidence_choices": Lead.DateConfidence.choices,
-            "housing_choices": Lead.HousingType.choices,
             "view_mode": filters["view"],
             "cards_url": f"{base_url}?{cards_params.urlencode()}",
             "list_url": f"{base_url}?{list_params.urlencode()}",
@@ -723,6 +785,19 @@ def lead_interest(request, slug, lead_id):
     lead = get_object_or_404(Lead, pk=lead_id, project=project)
     interested = request.POST.get("interested", "true").lower() not in {"0", "false", "no", "off"}
     set_interest(lead, user=request.user, interested=interested)
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest" or "application/json" in request.headers.get("Accept", ""):
+        interests = list(lead.interests.select_related("user__profile"))
+        members = []
+        for interest in interests:
+            profile = getattr(interest.user, "profile", None)
+            members.append((profile.display_name if profile else "") or interest.user.email)
+        return JsonResponse(
+            {
+                "is_interested": any(interest.user_id == request.user.pk for interest in interests),
+                "interest_count": len(interests),
+                "interested_members": members,
+            }
+        )
     return redirect(
         _safe_next(
             request, request.POST.get("next"), reverse("tracker:lead-list", args=[project.slug])
@@ -793,23 +868,30 @@ def comment_delete(request, slug, lead_id, comment_id):
     return redirect("tracker:lead-detail", project.slug, lead.pk)
 
 
+def _send_project_invitation(project, inviter, email, *, request=None):
+    """Create and deliver one invitation using the normal invitation flow."""
+    raw_token = secrets.token_urlsafe(32)
+    invitation = ProjectInvitation.objects.create(
+        project=project,
+        invited_email=email,
+        role=ProjectMembership.Role.VIEWER,
+        inviter=inviter,
+        token_digest=hashlib.sha256(raw_token.encode()).hexdigest(),
+        expires_at=timezone.now() + timedelta(days=7),
+    )
+    return invitation, send_invitation_email(
+        invitation=invitation, raw_token=raw_token, request=request
+    )
+
+
 @login_required
 def member_invite(request, slug):
     project = _project(slug, request.user, ProjectMembership.Role.VIEWER)
     form = InvitationForm(request.POST or None)
     invitation_url = None
     if request.method == "POST" and form.is_valid():
-        raw_token = secrets.token_urlsafe(32)
-        invitation = ProjectInvitation.objects.create(
-            project=project,
-            invited_email=form.cleaned_data["email"],
-            role=ProjectMembership.Role.VIEWER,
-            inviter=request.user,
-            token_digest=hashlib.sha256(raw_token.encode()).hexdigest(),
-            expires_at=timezone.now() + timedelta(days=7),
-        )
-        invitation_url = send_invitation_email(
-            invitation=invitation, raw_token=raw_token, request=request
+        _, invitation_url = _send_project_invitation(
+            project, request.user, form.cleaned_data["email"], request=request
         )
         messages.success(request, "Invitation created and sent to the member.")
     return render(
@@ -846,7 +928,11 @@ def invitation_accept(request, token):
         "role": "collaborator",
         "email": invitation.invited_email if invitation else "",
     }
-    if not invitation or not invitation.is_pending:
+    if (
+        not invitation
+        or not invitation.is_pending
+        or invitation.project.status == Project.Status.TRASHED
+    ):
         display["error"] = "This invitation is expired, revoked, or already used."
         return render(
             request, "tracker/invitation_accept.html", {"invitation": display}, status=410
@@ -873,6 +959,8 @@ def invitation_accept(request, token):
             )
             if not locked.is_pending:
                 display["error"] = "This invitation is no longer available."
+            elif locked.project.status == Project.Status.TRASHED:
+                display["error"] = "This project is no longer available."
             elif not locked.inviter.is_active or not ProjectMembership.objects.filter(
                 project=locked.project, user=locked.inviter
             ).exists():
@@ -1136,7 +1224,9 @@ def agent_setup(request):
             "last_check": last_check,
             "next_check": next_check,
             "searching": list(
-                Project.objects.filter(memberships__user=request.user)
+                Project.objects.filter(
+                    memberships__user=request.user, status=Project.Status.ACTIVE
+                )
                 .order_by("name")
                 .values_list("name", flat=True)[:6]
             ),

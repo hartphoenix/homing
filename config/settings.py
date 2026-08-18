@@ -122,9 +122,15 @@ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
 
+# Keep this explicit: adding a host to ALLOWED_HOSTS does not make it a
+# trusted form origin. Strip harmless whitespace in host-managed env files,
+# but never infer or wildcard additional origins.
 CSRF_TRUSTED_ORIGINS = [
-    origin for origin in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if origin
+    origin.strip()
+    for origin in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",")
+    if origin.strip()
 ]
+CSRF_FAILURE_VIEW = "tracker.csrf.failure"
 SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT")
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG

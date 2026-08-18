@@ -47,7 +47,11 @@ def authorize_project(project, principal, *, minimum_role=ProjectMembership.Role
     """Return membership; inaccessible projects are 404 and policy failures 403."""
     context = as_principal(principal)
     membership = get_membership(project, context)
-    if membership is None or project_is_restricted(project, context.token):
+    if (
+        membership is None
+        or project.status == "trashed"
+        or project_is_restricted(project, context.token)
+    ):
         raise Http404("Project not found")
     if context.token and not token_is_valid(context.token):
         raise PermissionDenied("Token is expired or revoked")

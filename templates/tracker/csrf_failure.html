@@ -1,0 +1,10 @@
+{% extends 'tracker/base.html' %}
+{% block title %}Sign-in page expired · Homing{% endblock %}
+{% block content %}
+<section class="auth-card" aria-labelledby="csrf-heading">
+  <p class="eyebrow">Homing</p>
+  <h1 id="csrf-heading">Sign-in page expired</h1>
+  <p class="muted">For your security, this sign-in form was rejected because it is no longer current. Reload the sign-in page and try again.</p>
+  <a class="button button-primary" href="{% url 'login' %}">Reload sign in</a>
+</section>
+{% endblock %}

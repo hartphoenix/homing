@@ -11,6 +11,7 @@ from django import forms
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 from django.utils import timezone
 
 from accounts.managers import normalize_email
@@ -165,8 +166,75 @@ class ProfileForm(JSONTextareaMixin, forms.ModelForm):
 class ProjectForm(forms.ModelForm):
     class Meta:
         model = Project
-        fields = ("name", "slug", "description")
+        fields = ("name", "description")
         widgets = {"description": forms.Textarea(attrs={"rows": 4})}
+
+    def __init__(self, *args, creator_email=None, **kwargs):
+        editing = kwargs.get("instance") is not None
+        # Keep the voice-memo wording ("initial prompt") accepted by older
+        # callers while exposing the model's natural ``prompt`` field name.
+        if not editing and (args or kwargs.get("data") is not None):
+            data = args[0] if args else kwargs.get("data")
+            if (
+                hasattr(data, "copy")
+                and not data.get("prompt")
+                and data.get("initial_prompt")
+            ):
+                data = data.copy()
+                data["prompt"] = data.get("initial_prompt", "")
+                if args:
+                    args = (data, *args[1:])
+                else:
+                    kwargs["data"] = data
+        super().__init__(*args, **kwargs)
+        self.creator_email = normalize_email(creator_email)
+        # Initial prompt and invitations belong to creation, not metadata
+        # editing. They remain available as fields on the bound create form.
+        if not editing:
+            self.fields["prompt"] = forms.CharField(
+                required=False,
+                label="Initial search prompt (optional)",
+                widget=forms.Textarea(attrs={"rows": 8}),
+                help_text="Tell the agent what to search for. You can add or change this later.",
+            )
+            self.fields["invite_emails"] = forms.CharField(
+                required=False,
+                label="Invite collaborators (optional)",
+                widget=forms.Textarea(
+                    attrs={
+                        "rows": 4,
+                        "placeholder": "one@example.com, another@example.com",
+                    }
+                ),
+                help_text="Enter multiple email addresses separated by commas, spaces, or new lines.",
+            )
+
+    def clean_name(self):
+        name = self.cleaned_data["name"].strip()
+        if not name:
+            raise ValidationError("Enter a project name.")
+        return name
+
+    def clean_prompt(self):
+        return self.cleaned_data.get("prompt", "").strip()
+
+    def clean_invite_emails(self):
+        raw = self.cleaned_data.get("invite_emails", "")
+        emails = []
+        seen = set()
+        for token in raw.replace(",", " ").replace(";", " ").split():
+            try:
+                email = normalize_email(validate_email(token) or token)
+            except ValidationError:
+                raise ValidationError(f"Enter a valid email address: {token}")
+            # The creator already belongs to the project; quietly omit their
+            # address while retaining any other valid invitees.
+            if email == self.creator_email:
+                continue
+            if email not in seen:
+                seen.add(email)
+                emails.append(email)
+        return emails
 
 
 class PromptForm(JSONTextareaMixin, forms.Form):

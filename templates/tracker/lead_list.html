@@ -13,20 +13,19 @@
 
   <form class="filter-bar" method="get">
     <input type="hidden" name="view" value="{{ view_mode }}">
-    {% if is_trash %}<input type="hidden" name="status" value="trash">{% endif %}
     <label>Search<input type="search" name="q" value="{{ filters.q }}" placeholder="Title, location, source"></label>
-    <label>Date confidence<select name="date_confidence"><option value="">Any confidence</option>{% for value,label in date_confidence_choices %}<option value="{{ value }}"{% if filters.date_confidence == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
-    <label>Housing<select name="housing_type"><option value="">Any type</option>{% for value,label in housing_choices %}<option value="{{ value }}"{% if filters.housing_type == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
-    <label class="check-label"><input type="checkbox" name="interested_by" value="me"{% if filters.interested_by == 'me' %} checked{% endif %}> Interested by me</label>
+    <label>Interest<select name="interest_scope"><option value="all"{% if filters.interest_scope == 'all' %} selected{% endif %}>All leads</option><option value="me"{% if filters.interest_scope == 'me' %} selected{% endif %}>Interested by me</option><option value="anyone"{% if filters.interest_scope == 'anyone' %} selected{% endif %}>Interested by anyone</option></select></label>
+    <label>Status<select name="status"><option value="active"{% if filters.status == 'active' %} selected{% endif %}>Active</option><option value="trash"{% if filters.status == 'trash' %} selected{% endif %}>Trash</option></select></label>
+    <label>Sort<select name="sort"><option value="updated"{% if filters.sort == 'updated' %} selected{% endif %}>Recently updated</option><option value="newest"{% if filters.sort == 'newest' %} selected{% endif %}>Newest</option><option value="oldest"{% if filters.sort == 'oldest' %} selected{% endif %}>Oldest</option><option value="interest"{% if filters.sort == 'interest' %} selected{% endif %}>Most interest</option></select></label>
     <button class="button" type="submit">Filter</button>
-    {% if filters.q or filters.date_confidence or filters.housing_type or filters.interested_by %}<a class="button button-quiet" href="{{ clear_url }}">Clear</a>{% endif %}
+    {% if filters.q or filters.interest_scope != 'all' or filters.status != 'active' or filters.sort != 'updated' %}<a class="button button-quiet" href="{{ clear_url }}">Clear</a>{% endif %}
   </form>
 
-  <div class="list-controls">
+  <div class="list-controls" data-lead-page data-project-slug="{{ project.slug }}" data-user-id="{{ request.user.pk }}">
     <div class="view-switcher" aria-label="Lead view">
       <span class="muted">View</span>
-      <a class="button{% if view_mode == 'cards' %} is-selected{% endif %}" href="{{ cards_url }}" aria-current="{% if view_mode == 'cards' %}page{% endif %}">Cards</a>
-      <a class="button{% if view_mode == 'list' %} is-selected{% endif %}" href="{{ list_url }}" aria-current="{% if view_mode == 'list' %}page{% endif %}">List</a>
+      <a class="button{% if view_mode == 'cards' %} is-selected{% endif %}" href="{{ cards_url }}" data-view-link="cards" aria-current="{% if view_mode == 'cards' %}page{% endif %}">Cards</a>
+      <a class="button{% if view_mode == 'list' %} is-selected{% endif %}" href="{{ list_url }}" data-view-link="list" aria-current="{% if view_mode == 'list' %}page{% endif %}">List</a>
     </div>
     {% if leads %}<label class="check-label select-all-label"><input type="checkbox" data-select-all aria-controls="lead-results"> Select all</label>{% endif %}
   </div>
@@ -52,11 +51,18 @@
   {% endif %}
 
   {% if leads %}
-    <div id="lead-results" class="{% if view_mode == 'list' %}lead-list-rows{% else %}lead-list{% endif %}">
+    <div id="lead-results" data-view-mode="{{ view_mode }}" class="{% if view_mode == 'list' %}lead-list-rows{% else %}lead-list{% endif %}">
       {% for lead in leads %}
         {% if view_mode == 'list' %}{% include 'tracker/_lead_row.html' with lead=lead %}{% else %}{% include 'tracker/_lead_card.html' with lead=lead %}{% endif %}
       {% endfor %}
     </div>
+    {# Keep the alternate representation available for a no-navigation view switch. #}
+    <template data-lead-view-template="cards">
+      {% for lead in leads %}{% include 'tracker/_lead_card.html' with lead=lead %}{% endfor %}
+    </template>
+    <template data-lead-view-template="list">
+      {% for lead in leads %}{% include 'tracker/_lead_row.html' with lead=lead %}{% endfor %}
+    </template>
   {% else %}
     <div class="empty-state"><h2>{% if is_trash %}Trash is empty{% else %}No leads match these filters{% endif %}</h2><p>{% if is_trash %}Deleted leads will appear here with their comments and history.{% else %}Try clearing a filter or add the first lead to this project.{% endif %}</p></div>
   {% endif %}
