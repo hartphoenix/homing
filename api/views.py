@@ -15,6 +15,8 @@ from django.contrib.auth.password_validation import validate_password
 from django.http import JsonResponse, Http404
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+from django.middleware.csrf import CsrfViewMiddleware
 from django.utils.text import slugify
 from django.db import IntegrityError, transaction
 from django.db.models import Q
@@ -159,6 +161,33 @@ def _data(request):
         return None, _error(request, "invalid_json", str(exc), 422)
 
 
+class _SessionCsrf(CsrfViewMiddleware):
+    """Enforce CSRF for session-authenticated API calls only."""
+
+    def _reject(self, request, reason):
+        return reason
+
+
+def _session_csrf_failure(request):
+    """Return a rejection reason when a cookie-authenticated unsafe request
+    lacks a valid CSRF token, else None.
+
+    The whole /api/v1 surface is exempt from the blanket CSRF middleware
+    because a bearer credential is not ambient authority: it is never attached
+    by the browser, so it cannot be replayed cross-site and CSRF adds nothing.
+    A session cookie IS ambient, so a cookie-authenticated unsafe request is
+    still checked here, exactly as the middleware would have.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS", "TRACE"):
+        return None
+    if request.headers.get("Authorization", ""):
+        return None
+    user = getattr(request, "user", None)
+    if user is None or not user.is_authenticated:
+        return None
+    return _SessionCsrf(lambda req: None).process_view(request, None, (), {})
+
+
 def _principal(request):
     # A bearer credential is an explicit principal.  Never silently fall back
     # to a browser session when an Authorization header is present: otherwise
@@ -205,6 +234,9 @@ def _project_ids(value):
 def authenticated(view):
     @wraps(view)
     def wrapped(request, *args, **kwargs):
+        reason = _session_csrf_failure(request)
+        if reason is not None:
+            return _error(request, "csrf_failed", str(reason), 403)
         principal = _principal(request)
         if principal is None:
             return _unauthorized(request)
@@ -225,6 +257,7 @@ def authenticated(view):
 
 def endpoint(view):
     @wraps(view)
+    @csrf_exempt
     def wrapped(request, *args, **kwargs):
         try:
             return view(request, *args, **kwargs)
