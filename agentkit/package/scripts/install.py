@@ -15,7 +15,9 @@ What it creates, with the modes it creates them with:
 
     <config>/                 0700   config.json 0400, sources.json 0400
     <config>/bin/             0500   homing.py, sources.py, cycle.py, run.sh   0500
-    <config>/set-token.sh     0700   the one line a person runs; holds no key
+    <config>/connect.sh       0700   the one line a person runs; holds no key
+    <config>/set-token.sh     0700   the fallback if pairing cannot be used
+    <config>/private/         0700   the pairing helper's own scratch; never agent-readable
     <state>/                  0700   state.json, install-manifest.json, UNINSTALL.md  0600
     <logs>/                   0700   run-*.log 0600, pruned at 14 days
     <skill>/homing-check/     0755   SKILL.md, JUDGE.md 0644
@@ -24,7 +26,10 @@ Rules this file enforces mechanically:
 
   * It never writes, prints, echoes, or accepts a key. A config carrying
     something key-shaped is refused before anything is created. The person
-    stores their own key by running <config>/set-token.sh themselves.
+    pairs this computer by running <config>/connect.sh themselves.
+  * The model command is a list of arguments, never a command line. Every
+    argument, path, name and identifier is rendered through this platform's
+    quoting routine, so a value is data and can never become syntax.
   * The Homing origin is substituted into bin/homing.py and bin/sources.py as
     a compile-time literal, so the runtime can never take an origin from data.
   * Every directory is touch-probed before use, and a refusal names the path
@@ -33,7 +38,11 @@ Rules this file enforces mechanically:
     never created wide and narrowed afterwards.
   * No scheduled job ever carries a key, and no invocation containing
     "dangerous", "yolo", "bypass", "skip-permissions", "--force" or "-y" is
-    ever written into one.
+    ever written into one. That word check is a second line, not the defence:
+    the defence is that nothing is ever concatenated into a command line.
+  * A machine with no OS isolation (rung 0) may still be scheduled, but only
+    when the plan carries "unattended_rung0_opt_in": true, which is a person's
+    decision and not the installing agent's.
   * Every path, link and scheduler identifier lands in install-manifest.json,
     so --uninstall never has to guess.
   * Re-running it is safe: it converges on the same install.
@@ -52,6 +61,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -115,6 +125,101 @@ def say(message):
         pass   # someone piped us into `head`; that is not an install failure
 
 
+# --- quoting -----------------------------------------------------------------
+#
+# Everything this file writes into a shell or PowerShell script goes through one
+# of these two functions. There is no third path, and nothing is ever built by
+# concatenating a value into a command line: a value is data, and quoting is what
+# keeps it data. `MODEL_ARGV` is the only place a value becomes a program name,
+# and it is a list decided at plan time, never parsed at run time.
+
+# Anything a shell, a scheduler file or a log line cannot carry literally. Tab is
+# in here too: it survives quoting, but it makes a path unreadable in a message a
+# person has to act on, and a tab in a path is always a mistake, never an intent.
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+MAX_VALUE_CHARS = 4096
+
+
+def check_renderable(value, what):
+    """Refuse a value that cannot be written into a script safely or legibly."""
+    text = str(value)
+    if CONTROL_RE.search(text):
+        raise Refuse(
+            "The %s contains a control character (a newline, tab or similar). "
+            "I will not write that into a script. Nothing was created." % what)
+    if len(text) > MAX_VALUE_CHARS:
+        raise Refuse("The %s is %d characters long, which is past anything a real path or "
+                     "argument needs. Nothing was created." % (what, len(text)))
+    return text
+
+
+def posix_quote(value, what="value"):
+    """One shell argument, quoted so the shell can only ever see it as data."""
+    return shlex.quote(check_renderable(value, what))
+
+
+def ps_quote(value, what="value"):
+    """One PowerShell single-quoted literal. Inside '...' PowerShell expands
+    nothing at all - not $x, not $(...), not a backtick escape - so doubling the
+    single quote is the whole of the escaping, and expression syntax never runs."""
+    return "'" + check_renderable(value, what).replace("'", "''") + "'"
+
+
+def posix_argv(argv, what="model command"):
+    return " ".join(posix_quote(part, what) for part in argv)
+
+
+def ps_argv(argv, what="model command"):
+    return " ".join(ps_quote(part, what) for part in argv)
+
+
+# A parsed legacy string is only accepted when every word it produced is inert.
+# These are the characters that mean something to a shell; a word carrying one of
+# them was written to be interpreted, and reinterpreting it as a literal argument
+# would silently change what the person asked for.
+SHELL_META_RE = re.compile(r"[;&|<>`$(){}\[\]!*?~#\n\r\\\x00]")
+
+
+def parse_legacy_invocation(text):
+    """Split a legacy `runtime.invocation` string, or refuse it in plain words.
+
+    There is no repair path here on purpose. A string containing shell syntax was
+    written to be run by a shell; turning it into one quoted argument would run
+    something the person did not ask for, and dropping the syntax would run less
+    than they asked for. Both are wrong, so this stops instead.
+    """
+    if CONTROL_RE.search(text):
+        raise Refuse(
+            "The model command runs across more than one line, or carries a control "
+            "character. Write it as \"invocation_argv\": a list with one entry per "
+            "argument. Nothing was created.")
+    if "\\" in text:
+        # A POSIX split eats backslashes, so a Windows path would arrive here
+        # mangled and look fine. Refusing beats installing a command that cannot run.
+        raise Refuse(
+            "The model command contains a backslash. Read as a command line that means "
+            "an escape, and a Windows path would arrive with its separators gone. Write "
+            "it as \"invocation_argv\": a list with one entry per argument, and the path "
+            "exactly as it is on disk. Nothing was created.")
+    try:
+        argv = shlex.split(text, posix=True)
+    except ValueError as exc:
+        raise Refuse(
+            "The model command has quoting I cannot read (%s). Write it as "
+            "\"invocation_argv\": a list with one entry per argument, and no quoting "
+            "of your own. Nothing was created." % exc)
+    for word in argv:
+        found = SHELL_META_RE.search(word)
+        if found:
+            raise Refuse(
+                "The model command contains %r, which is shell syntax, not an argument. "
+                "A scheduled run has no shell to interpret it, and I will not guess what "
+                "was meant. Write it as \"invocation_argv\": a list with one entry per "
+                "argument - for example [\"claude\", \"-p\", \"--permission-mode\", "
+                "\"dontAsk\"]. Nothing was created." % found.group(0))
+    return argv
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -161,9 +266,15 @@ CONFIG_SCHEMA = {
                      "service": "homing-api-token",
                      "path": "(optional, file/container-secret only) absolute"},
     "runtime": {"kind": "claude-code | codex | gemini | none",
-                "invocation": "the non-interactive, least-privilege command, or \"\" for none",
+                "invocation_argv": ["the non-interactive, least-privilege judge command,",
+                                    "one entry per argument, or [] for none"],
+                "invocation": "(legacy, discouraged) the same command as one string; it is "
+                              "parsed, and refused if it carries shell syntax",
                 "skill_flavour": "(optional) portable | claude"},
     "isolation_rung": 3,
+    "unattended_rung0_opt_in": ("required only when isolation_rung is 0 and something is "
+                                "scheduled: true means a person was told what an unattended "
+                                "run can reach on this machine and said yes"),
     "lanes": ["daft:sitemap  (this worker's lanes; <source>:<channel>, hyphens only)"],
     "sources": {"schema": 1, "allowed_hosts": ["www.daft.ie"],
                 "sources": ["...see sources.md; every source needs slug, lane, https "
@@ -176,6 +287,11 @@ DEFAULT_LIMITS = {
     "leads_per_batch": 100, "pages_per_source": 3, "candidates_per_project": 40,
     "writes_per_run": 120, "destroys_per_run": 0, "max_page_bytes": 200000,
     "wall_clock_seconds": 720, "max_projects": 3,
+    # Bounds the generated runner enforces from outside the model: how long the
+    # judge may run, how much memory the whole run may map, how large a single
+    # file the run may write, and how many kit calls one cycle may make.
+    "model_seconds": 180, "memory_mb": 2048, "max_output_bytes": 4000000,
+    "requests_per_run": 200,
 }
 
 
@@ -229,18 +345,78 @@ def clean_origin(value):
                  "https://homing.example.com (got %r)." % origin)
 
 
-def clean_invocation(value):
-    text = " ".join(str(value or "").split())
-    lowered = text.lower()
+def clean_invocation_argv(runtime):
+    """The model command, as a list of arguments. Never a command line.
+
+    `invocation_argv` is the contract. `invocation` is still read, but only as a
+    string a safe parser can turn into the same list without changing its meaning;
+    anything else stops the install rather than being rewritten.
+    """
+    raw = runtime.get("invocation_argv")
+    legacy = str(runtime.get("invocation") or "")
+    if raw is None and legacy:
+        argv = parse_legacy_invocation(legacy)
+    elif raw is None or raw == []:
+        if legacy:
+            # Both forms, and they disagree: an empty list next to a real command
+            # line. Picking one silently would either run something nobody asked
+            # for or run nothing while the plan says otherwise.
+            raise Refuse(
+                "This plan has an empty \"invocation_argv\" and a non-empty "
+                "\"invocation\" (%r). I cannot tell which one is meant. Keep "
+                "\"invocation_argv\" as the one that counts, and delete the other. "
+                "Nothing was created." % legacy[:120])
+        return []
+    elif isinstance(raw, str):
+        raise Refuse(
+            "\"invocation_argv\" is a list of arguments, not a string. Write "
+            "[\"claude\", \"-p\", \"--permission-mode\", \"dontAsk\"], one entry per "
+            "argument. Nothing was created.")
+    elif not isinstance(raw, list):
+        raise Refuse("\"invocation_argv\" must be a list of strings.")
+    else:
+        argv = []
+        for index, part in enumerate(raw):
+            if not isinstance(part, str):
+                raise Refuse("Every entry of \"invocation_argv\" must be text; entry %d is %s."
+                             % (index, type(part).__name__))
+            argv.append(check_renderable(part, "model command argument %d" % index))
+    if not argv:
+        return []
+    if legacy and raw is not None:
+        # Both forms present and both non-empty: they have to say the same thing.
+        if parse_legacy_invocation(legacy) != argv:
+            raise Refuse(
+                "This plan's \"invocation\" and \"invocation_argv\" are two different "
+                "commands. \"invocation_argv\" is the one that counts; delete the "
+                "other, or make them match. Nothing was created.")
+    if not argv[0].strip():
+        raise Refuse("The model command's first entry is the program to run, and it is empty.")
+    # {{...}} is substituted only inside our own templates, never in a plan. A
+    # copied documentation example would otherwise install a judge pointed at a
+    # literal "{{SKILL_DIR}}/JUDGE.md", silently unpinning the model's only
+    # rule set while the install report still claims it is pinned.
+    for index, part in enumerate(argv):
+        if "{{" in part and "}}" in part:
+            raise Refuse(
+                "Model command argument %d still contains a %s placeholder. Those are "
+                "filled in only inside the kit's own templates, never in a plan, so this "
+                "would install a judge that reads a file named literally that. Replace it "
+                "with the real absolute path. Nothing was created."
+                % (index, part[part.index("{{"):part.index("}}") + 2]))
+    if len(argv) > 64:
+        raise Refuse("The model command has %d arguments. That is not a bounded judge "
+                     "invocation." % len(argv))
+    # Second line only. The first line is that none of this is ever concatenated
+    # into a command line, so none of it can become syntax whatever it says.
+    lowered = " ".join(argv).lower()
     for word in BANNED_FLAG_WORDS:
         if word in lowered:
             raise Refuse(
                 "The model command contains %r. A scheduled job never runs with approvals "
                 "turned off. Use the runtime's safe non-interactive form, or leave "
-                "\"invocation\" empty and install the on-demand runner." % word)
-    if "\n" in text or "\r" in text:
-        raise Refuse("The model command must be a single line.")
-    return text
+                "\"invocation_argv\" empty and install the on-demand runner." % word)
+    return argv
 
 
 def default_paths(os_id, home):
@@ -281,6 +457,30 @@ def safe_minute(minute):
     return minute
 
 
+WINDOWS_BAD_CHARS = '<>"|?*'
+
+
+def check_windows_path(path, what):
+    """Windows itself forbids these in a path. Saying so here is what lets the
+    Task Scheduler argument keep its one pair of double quotes: a path can never
+    contain the character that would close them."""
+    for char in WINDOWS_BAD_CHARS:
+        if char in str(path):
+            raise Refuse("The %s contains %r, which Windows does not allow in a path. "
+                         "Nothing was created." % (what, char))
+    tail = str(path)[2:] if re.match(r"^[A-Za-z]:", str(path)) else str(path)
+    if ":" in tail:
+        raise Refuse("The %s has a colon in it, which Windows only allows after a drive "
+                     "letter. Nothing was created." % what)
+    return path
+
+
+def systemd_quote(value):
+    """A unit-file value, double-quoted the way systemd's own parser unescapes it."""
+    text = check_renderable(value, "path in a systemd unit")
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def is_absolute(os_id, path):
     """Windows paths are absolute with a drive letter or a UNC prefix."""
     if os_id == "windows":
@@ -296,6 +496,18 @@ def is_synced(path):
 def in_user_folder(path):
     lowered = os.path.realpath(path).lower() + "/"
     return any(("/%s/" % name) in lowered for name in ("documents", "desktop", "downloads"))
+
+
+ORIGIN_LINE_RE = re.compile(r'^ORIGIN\s*=\s*["\']([^"\']*)["\']', re.M)
+
+
+def origin_baked_into(text):
+    """The origin already compiled into a served copy, or None."""
+    match = ORIGIN_LINE_RE.search(text)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return value or None
 
 
 class Plan(object):
@@ -351,6 +563,12 @@ class Plan(object):
         self.skill_root = str(paths.get("skill") or os.path.join(self.home, ".agents", "skills"))
         self.extra_skill_dirs = [str(item) for item in (paths.get("extra_skill_dirs") or [])]
         self.scheduler_dir = str(paths.get("scheduler") or defaults["scheduler"])
+        for label, path in (("config", self.config_dir), ("state", self.state_dir),
+                            ("logs", self.logs_dir), ("skill", self.skill_root),
+                            ("scheduler", self.scheduler_dir), ("python", self.python)):
+            check_renderable(path, "%s path" % label)
+            if self.windows:
+                check_windows_path(path, "%s path" % label)
         for label, path in (("config", self.config_dir), ("state", self.state_dir),
                             ("logs", self.logs_dir), ("skill", self.skill_root)):
             if not is_absolute(self.os, path):
@@ -409,20 +627,37 @@ class Plan(object):
 
         runtime = config.get("runtime") or {}
         self.runtime_kind = str(runtime.get("kind") or "none").lower()
-        self.invocation = clean_invocation(runtime.get("invocation"))
+        self.invocation_argv = clean_invocation_argv(runtime)
+        # For people to read - in the plan, the report and config.json. Nothing
+        # executes this string, and nothing ever parses it back into a command.
+        self.invocation_display = " ".join(shell_quote(part) for part in self.invocation_argv)
         self.isolation_rung = int(config.get("isolation_rung") or 0)
-        if self.isolation_rung <= 0 and self.scheduler_kind != "none":
+        self.rung0_opt_in = config.get("unattended_rung0_opt_in") is True
+        self.unattended = self.scheduler_kind != "none"
+        if self.isolation_rung <= 0 and self.unattended:
             # An ordinary laptop has no sandbox, no egress allowlist and no
             # container, so it reports rung 0. Refusing to schedule there would
             # decline to install the product on the machine it is built for.
             # What actually contains this run does not come from the OS:
             # the paired token has no leads:destroy scope, sources.py holds no
             # credential at all, the model never sees a raw page, and writes are
-            # capped per run. Install it, and say plainly what it can reach.
+            # capped per run. So it installs - but only once a person, not the
+            # agent doing the installing, has said yes to exactly that.
+            if not self.rung0_opt_in:
+                raise Refuse(
+                    "This machine has no isolation the operating system enforces (rung 0), "
+                    "and this plan schedules unattended runs. That is a person's decision, "
+                    "not mine. Ask them, in these words: a background search will run on "
+                    "this computer without anything on the computer limiting what it can "
+                    "reach; it cannot delete or restore anything, the part that reads "
+                    "websites holds no account key, and it can be stopped from Homing at "
+                    "any time. If they say yes, add \"unattended_rung0_opt_in\": true to "
+                    "the plan. If they say no, set scheduler.kind to \"none\" and install "
+                    "the on-demand runner instead. Nothing was created.")
             self.warnings.append(
-                "Nothing on this machine limits what a background run could reach. "
-                "The search still cannot delete or restore anything, and the part that "
-                "reads websites holds no account key.")
+                "rung 0, and the person opted in: nothing on this machine limits what a "
+                "background run could reach. The search still cannot delete or restore "
+                "anything, and the part that reads websites holds no account key.")
 
         self.limits = dict(DEFAULT_LIMITS)
         for name, value in (config.get("limits") or {}).items():
@@ -516,6 +751,11 @@ class Plan(object):
     def plan_skill_targets(self, runtime):
         """Canonical copy plus one entry per extra runtime dir, symlink or copy."""
         flavour = str(runtime.get("skill_flavour") or "").lower()
+        if not flavour and ".claude" in self.skill_dir.replace("\\", "/").split("/"):
+            # The canonical dir can itself be a Claude path. Detecting that only
+            # for the extras left the main copy model-invocable, so it could load
+            # itself mid-conversation.
+            flavour = "claude"
         targets = [(self.skill_dir, flavour or "portable", "write")]
         for extra in self.extra_skill_dirs:
             target = self.join(extra, "homing-check")
@@ -533,11 +773,19 @@ class Plan(object):
     def build(self):
         run_name = "run.ps1" if self.windows else "run.sh"
         self.run_path = self.join(self.bin_dir, run_name)
-        self.set_token_path = self.join(
-            self.config_dir, "set-token.ps1" if self.windows else "set-token.sh")
+        suffix = ".ps1" if self.windows else ".sh"
+        self.connect_path = self.join(self.config_dir, "connect" + suffix)
+        self.set_token_path = self.join(self.config_dir, "set-token" + suffix)
+        # The pairing helper's own directory. Nothing here is ever named in
+        # config.json, state.json or a skill file, so nothing points a model at it.
+        self.private_dir = self.join(self.config_dir, "private")
+        self.device_code_path = self.join(self.private_dir, "device-code.json")
+        self.pairing_meta_path = self.join(self.state_dir, "pairing.json")
+        self.pairing_result_path = self.join(self.state_dir, "pairing-result.json")
 
         self.dirs = [
             (self.config_dir, MODE_DIR_PRIVATE),
+            (self.private_dir, MODE_DIR_PRIVATE),
             (self.bin_dir, MODE_DIR_PRIVATE),      # narrowed to 0500 once written
             (self.state_dir, MODE_DIR_PRIVATE),
             (self.work_dir, MODE_DIR_PRIVATE),
@@ -563,6 +811,7 @@ class Plan(object):
              MODE_FILE_READONLY),
             (self.join(self.config_dir, "sources.json"),
              json.dumps(self.sources, indent=2, sort_keys=True) + "\n", MODE_FILE_READONLY),
+            (self.connect_path, self.render_connect(), 0o700),
             (self.set_token_path, self.render_set_token(), 0o700),
             (self.join(self.state_dir, "state.json"),
              json.dumps(self.initial_state(), indent=2, sort_keys=True) + "\n",
@@ -591,10 +840,21 @@ class Plan(object):
             raise Refuse("I could not read %s from the package (%s). The package is "
                          "incomplete; fetch it again before installing." % (path, exc),
                          EXIT_PATH)
-        if ORIGIN_PLACEHOLDER not in text:
-            raise Refuse("%s has no origin placeholder left in it. That copy was already "
-                         "installed somewhere else; fetch a clean package." % name)
-        return text.replace(ORIGIN_PLACEHOLDER, self.origin)
+        if ORIGIN_PLACEHOLDER in text:
+            return text.replace(ORIGIN_PLACEHOLDER, self.origin)
+        # A package served by Homing already carries its own origin baked in:
+        # the /agent/ routes substitute the placeholder at serve time. That copy
+        # is correct for THIS Homing and must install cleanly - refusing it made
+        # the documented install path impossible. Only a copy baked for some
+        # OTHER origin is genuinely wrong.
+        baked = origin_baked_into(text)
+        if baked is None:
+            raise Refuse("%s carries no origin at all. The package is incomplete; "
+                         "fetch it again before installing." % name)
+        if baked.rstrip("/") != self.origin.rstrip("/"):
+            raise Refuse("%s was built for %s, but this install targets %s. Fetch the "
+                         "package from %s." % (name, baked, self.origin, self.origin))
+        return text
 
     def config_document(self):
         return {
@@ -603,7 +863,10 @@ class Plan(object):
             "installed_version": self.package_version,
             "worker": {"label": self.worker_label, "role": self.role,
                        "slug": self.worker_slug, "machine_slug": self.machine_slug},
-            "runtime": {"kind": self.runtime_kind, "invocation": self.invocation},
+            # The list is the record. `invocation` is the same thing written out for
+            # a person to read, and nothing parses it back.
+            "runtime": {"kind": self.runtime_kind, "invocation_argv": self.invocation_argv,
+                        "invocation": self.invocation_display},
             "secret_store": {"kind": self.store_kind, "service": self.store_service},
             "scheduler": {"kind": self.scheduler_kind, "identifier": self.identifier,
                           "cadence_minutes": self.cadence_minutes,
@@ -611,6 +874,8 @@ class Plan(object):
             "paths": {"config": self.config_dir, "state": self.state_dir,
                       "logs": self.logs_dir, "skill": self.skill_dir, "bin": self.bin_dir},
             "isolation_rung": self.isolation_rung,
+            "unattended_rung0_opt_in": bool(self.rung0_opt_in and self.isolation_rung <= 0
+                                            and self.unattended),
             "limits": self.limits,
             "lanes_owned": self.lanes,
             "egress_class": self.egress_class,
@@ -640,21 +905,44 @@ class Plan(object):
         return JUDGE_TEMPLATE.replace("{{WORK}}", self.work_dir)
 
     def render_runner(self):
-        model_line, model_ps = "", ""
-        if self.invocation:
-            model_line = ('  run_bounded 180 %s || return $?   # JUDGE.md only, no key, no network\n'
-                          % self.invocation)
-            model_ps = ("  %s *>&1 | Redact | Tee-Object -Append $Log\n" % self.invocation)
-        template = RUN_PS1_TEMPLATE if self.windows else RUN_SH_TEMPLATE
-        return (template
-                .replace("{{MODEL_PHASE_PS}}", model_ps)
-                .replace("{{CONFIG}}", self.config_dir)
-                .replace("{{STATE}}", self.state_dir)
-                .replace("{{LOGS}}", self.logs_dir)
-                .replace("{{PYTHON}}", self.python)
+        """Every substituted value arrives already quoted for its platform.
+
+        The templates deliberately have no quotes of their own around a
+        placeholder: quoting is this function's job and only this function's, so
+        there is one place to be right rather than thirty.
+        """
+        if self.windows:
+            model_ps = ""
+            if self.invocation_argv:
+                model_ps = ("  Invoke-Bounded %d @(%s) | Redact | Tee-Object -Append $Log\n"
+                            % (self.limits["model_seconds"],
+                               ", ".join(ps_quote(part, "model command argument")
+                                         for part in self.invocation_argv)))
+            return (RUN_PS1_TEMPLATE
+                    .replace("{{MODEL_PHASE_PS}}", model_ps)
+                    .replace("{{CONFIG}}", ps_quote(self.config_dir, "config folder"))
+                    .replace("{{STATE}}", ps_quote(self.state_dir, "state folder"))
+                    .replace("{{LOGS}}", ps_quote(self.logs_dir, "logs folder"))
+                    .replace("{{PYTHON}}", ps_quote(self.python, "python program"))
+                    .replace("{{STORE_ENV}}", self.store_env())
+                    .replace("{{MEMORY_MB}}", str(self.limits["memory_mb"]))
+                    .replace("{{WALL_CLOCK}}", str(self.limits["wall_clock_seconds"])))
+        model_line = ""
+        if self.invocation_argv:
+            # JUDGE.md only: no key in argv or environment, no network of its own,
+            # and a wall clock outside the model's control.
+            model_line = ("  run_bounded %d %s || return $?\n"
+                          % (self.limits["model_seconds"],
+                             posix_argv(self.invocation_argv, "model command argument")))
+        return (RUN_SH_TEMPLATE
+                .replace("{{CONFIG}}", posix_quote(self.config_dir, "config folder"))
+                .replace("{{STATE}}", posix_quote(self.state_dir, "state folder"))
+                .replace("{{LOGS}}", posix_quote(self.logs_dir, "logs folder"))
+                .replace("{{PYTHON}}", posix_quote(self.python, "python program"))
                 .replace("{{STORE_ENV}}", self.store_env())
                 .replace("{{MODEL_PHASE}}", model_line)
-                .replace("{{MODEL_INVOCATION}}", self.invocation)
+                .replace("{{MEMORY_KB}}", str(self.limits["memory_mb"] * 1024))
+                .replace("{{OUTPUT_BLOCKS}}", str(max(1, self.limits["max_output_bytes"] // 512)))
                 .replace("{{WALL_CLOCK}}", str(self.limits["wall_clock_seconds"])))
 
     def store_env(self):
@@ -664,26 +952,74 @@ class Plan(object):
         # which its file reader looks in first, so that case is "file" with no path.
         reader = {"keychain": "keychain", "dpapi": "dpapi"}.get(self.store_kind, "file")
         if self.windows:
-            lines = ["$env:HOMING_TOKEN_STORE = '%s'" % reader]
+            lines = ["$env:HOMING_TOKEN_STORE = %s" % ps_quote(reader, "key store name")]
             if reader != "keychain":
-                lines.append("$env:HOMING_TOKEN_FILE = '%s'" % self.store_path)
+                lines.append("$env:HOMING_TOKEN_FILE = %s"
+                             % ps_quote(self.store_path, "key store path"))
             return "\n".join(lines)
-        lines = ['export HOMING_TOKEN_STORE="%s"' % reader]
+        lines = ["export HOMING_TOKEN_STORE=%s" % posix_quote(reader, "key store name")]
         if self.store_kind == "keychain":
-            lines.append('export HOMING_KEYCHAIN_SERVICE="%s"' % self.store_service)
+            lines.append("export HOMING_KEYCHAIN_SERVICE=%s"
+                         % posix_quote(self.store_service, "key store name"))
         elif self.store_kind != "systemd-creds":
-            lines.append('export HOMING_TOKEN_FILE="%s"' % self.store_path)
+            lines.append("export HOMING_TOKEN_FILE=%s"
+                         % posix_quote(self.store_path, "key store path"))
         return "\n".join(lines)
 
+    def render_connect(self):
+        """The pairing helper a person runs. It holds no key and prints none."""
+        if self.windows:
+            return (CONNECT_PS1
+                    .replace("{{STORE_ENV}}", self.store_env())
+                    .replace("{{CONFIG}}", ps_quote(self.config_dir, "config folder"))
+                    .replace("{{PRIVATE}}", ps_quote(self.private_dir, "private folder"))
+                    .replace("{{DEVICE_CODE}}", ps_quote(self.device_code_path, "pairing file"))
+                    .replace("{{META}}", ps_quote(self.pairing_meta_path, "pairing file"))
+                    .replace("{{RESULT}}", ps_quote(self.pairing_result_path, "pairing file"))
+                    .replace("{{HOMING_PY}}",
+                             ps_quote(self.join(self.bin_dir, "homing.py"), "homing.py path"))
+                    .replace("{{PYTHON}}", ps_quote(self.python, "python program"))
+                    .replace("{{LABEL}}", ps_quote(self.worker_label, "worker label"))
+                    .replace("{{NOTE}}", ps_quote(self.machine_slug, "machine name"))
+                    .replace("{{CADENCE}}", str(int(self.cadence_minutes)))
+                    .replace("{{ORIGIN}}", ps_quote(self.origin, "Homing address"))
+                    .replace("{{SET_TOKEN}}",
+                             ps_quote(self.set_token_path, "fallback helper path")))
+        return (CONNECT_SH
+                .replace("{{STORE_ENV}}", self.store_env())
+                .replace("{{CONFIG}}", posix_quote(self.config_dir, "config folder"))
+                .replace("{{PRIVATE}}", posix_quote(self.private_dir, "private folder"))
+                .replace("{{DEVICE_CODE}}", posix_quote(self.device_code_path, "pairing file"))
+                .replace("{{META}}", posix_quote(self.pairing_meta_path, "pairing file"))
+                .replace("{{RESULT}}", posix_quote(self.pairing_result_path, "pairing file"))
+                .replace("{{HOMING_PY}}",
+                         posix_quote(self.join(self.bin_dir, "homing.py"), "homing.py path"))
+                .replace("{{PYTHON}}", posix_quote(self.python, "python program"))
+                .replace("{{LABEL}}", posix_quote(self.worker_label, "worker label"))
+                .replace("{{NOTE}}", posix_quote(self.machine_slug, "machine name"))
+                .replace("{{CADENCE}}", str(int(self.cadence_minutes)))
+                .replace("{{ORIGIN}}", posix_quote(self.origin, "Homing address"))
+                .replace("{{SET_TOKEN}}",
+                         posix_quote(self.set_token_path, "fallback helper path")))
+
     def render_set_token(self):
-        template = SET_TOKEN_PS1 if self.windows else SET_TOKEN_SH
-        return (template
-                .replace("{{CONFIG}}", self.config_dir)
-                .replace("{{ORIGIN}}", self.origin)
-                .replace("{{PYTHON}}", self.python)
-                .replace("{{SERVICE}}", self.store_service)
-                .replace("{{STORE}}", self.store_kind)
-                .replace("{{TOKEN_PATH}}", self.store_path))
+        if self.windows:
+            return (SET_TOKEN_PS1
+                    .replace("{{CONFIG}}", ps_quote(self.config_dir, "config folder"))
+                    .replace("{{ORIGIN}}", ps_quote(self.origin, "Homing address"))
+                    .replace("{{PYTHON}}", ps_quote(self.python, "python program"))
+                    .replace("{{HOMING_PY}}",
+                             ps_quote(self.join(self.bin_dir, "homing.py"), "homing.py path"))
+                    .replace("{{TOKEN_PATH}}", ps_quote(self.store_path, "key store path")))
+        return (SET_TOKEN_SH
+                .replace("{{CONNECT}}", posix_quote(self.connect_path, "pairing helper path"))
+                .replace("{{ORIGIN}}", posix_quote(self.origin, "Homing address"))
+                .replace("{{PYTHON}}", posix_quote(self.python, "python program"))
+                .replace("{{HOMING_PY}}",
+                         posix_quote(self.join(self.bin_dir, "homing.py"), "homing.py path"))
+                .replace("{{SERVICE}}", posix_quote(self.store_service, "key store name"))
+                .replace("{{STORE}}", posix_quote(self.store_kind, "key store kind"))
+                .replace("{{TOKEN_PATH}}", posix_quote(self.store_path, "key store path")))
 
     # -- scheduler -----------------------------------------------------------
 
@@ -766,10 +1102,14 @@ class Plan(object):
         timer_path = os.path.join(self.scheduler_dir, self.identifier + ".timer")
         credential = ""
         if self.store_kind == "systemd-creds":
-            credential = "LoadCredentialEncrypted=%s:%s\n" % (self.store_service, self.store_path)
+            credential = ("LoadCredentialEncrypted=%s:%s\n"
+                          % (self.store_service, systemd_quote(self.store_path)))
+        # systemd splits ExecStart on whitespace unless the value is quoted, and
+        # unescapes \\ and \" inside the quotes. Every path here goes through that.
         service = SYSTEMD_SERVICE.format(
-            runner=self.run_path, workdir=self.config_dir, state=self.state_dir,
-            logs=self.logs_dir, identifier=self.identifier, credential=credential,
+            runner=systemd_quote(self.run_path), workdir=systemd_quote(self.config_dir),
+            state=systemd_quote(self.state_dir), logs=systemd_quote(self.logs_dir),
+            identifier=self.identifier, credential=credential,
             runtime_max=max(300, self.limits["wall_clock_seconds"] + 480))
         timer = SYSTEMD_TIMER.format(on_calendar=self.on_calendar(),
                                      identifier=self.identifier)
@@ -811,28 +1151,30 @@ class Plan(object):
                        "-RepetitionInterval (New-TimeSpan -Hours %d)"
                        % (self.hour, self.minute, hours))
         text = REGISTER_TASK_PS1.format(
-            root=self.config_dir, runner=self.run_path, task=self.identifier, trigger=trigger,
+            root=ps_quote(self.config_dir, "config folder"),
+            runner=ps_quote(self.run_path, "runner path"),
+            task=ps_quote(self.identifier, "task name"), trigger=trigger,
             minutes=max(5, (self.limits["wall_clock_seconds"] + 480) // 60))
         self.files.append((register_path, text, MODE_FILE_EXEC))
         self.scheduler_artifacts = [register_path]
         powershell = ["powershell", "-NoProfile", "-NonInteractive",
                       "-ExecutionPolicy", "Bypass", "-File", register_path]
         self.register_commands = [("register the task", powershell)]
+        name = ps_quote(self.identifier, "task name")
         self.pause_commands = [("pause", ["powershell", "-NoProfile", "-Command",
-                                          "Disable-ScheduledTask -TaskName '%s'"
-                                          % self.identifier])]
+                                          "Disable-ScheduledTask -TaskName %s" % name])]
         self.resume_commands = [("resume", ["powershell", "-NoProfile", "-Command",
-                                            "Enable-ScheduledTask -TaskName '%s'"
-                                            % self.identifier])]
+                                            "Enable-ScheduledTask -TaskName %s" % name])]
         self.unregister_commands = [
             ("remove the task", ["powershell", "-NoProfile", "-Command",
-                                 "Unregister-ScheduledTask -TaskName '%s' -Confirm:$false"
-                                 % self.identifier])]
+                                 "Unregister-ScheduledTask -TaskName %s -Confirm:$false"
+                                 % name])]
 
     def build_container_loop(self):
         loop_path = self.join(self.bin_dir, "loop.sh")
         self.files.append((loop_path, LOOP_SH.format(
-            runner=self.run_path, interval=self.cadence_minutes * 60,
+            runner=posix_quote(self.run_path, "runner path"),
+            interval=self.cadence_minutes * 60,
             bound=self.limits["wall_clock_seconds"] + 480), MODE_FILE_EXEC))
         self.scheduler_artifacts = [loop_path]
         self.warnings.append(
@@ -847,7 +1189,8 @@ class Plan(object):
                     os.environ.get("USER", ""), "-s", self.store_service]
         if self.windows:
             return ["powershell", "-NoProfile", "-Command",
-                    "Remove-Item -Force -ErrorAction SilentlyContinue '%s'" % self.store_path]
+                    "Remove-Item -Force -ErrorAction SilentlyContinue %s"
+                    % ps_quote(self.store_path, "key store path")]
         return ["rm", "-f", self.store_path]
 
 
@@ -1047,15 +1390,28 @@ def load_manifest(path):
 def render_uninstall(plan, manifest):
     if plan.windows:
         return render_uninstall_windows(plan, manifest)
-    lines = ["# Removing the Homing search from this computer", "",
-             "Run these in order. Each one is safe to run twice.", ""]
+    lines = ["# Stopping or removing the Homing search on this computer", "",
+             "Three different things, in the order most people want them.",
+             "Run these in order within a section. Each one is safe to run twice.", ""]
     if plan.pause_commands:
-        lines += ["## Pause it (keeps everything, stops it running)", "", "```sh"]
+        lines += ["## 1. Pause it (keeps everything, stops it running)", "", "```sh"]
         lines += [shell_join(argv) for _label, argv in plan.pause_commands]
         lines += ["```", "", "Resume with:", "", "```sh"]
         lines += [shell_join(argv) for _label, argv in plan.resume_commands]
-        lines += ["```", ""]
-    lines += ["## Remove it completely", "", "```sh"]
+        lines += ["```", "",
+                  "It can also be paused from %s/agent-setup/, which works even when this "
+                  "computer is off or someone else has it." % plan.origin, ""]
+    lines += ["## 2. Cut off its access (do this first if the computer is lost)", "",
+              "Open %s/agent-setup/ and disconnect this worker's key. Only you can do that; "
+              "this computer cannot cancel its own access, and removing the files below does "
+              "not cancel it either. After that, every request from here is refused, and the "
+              "next run stops with \"Homing needs you to reconnect\"." % plan.origin, "",
+              "To connect it again afterwards, run:", "",
+              "```sh", "sh %s" % shell_quote(plan.connect_path), "```", ""]
+    lines += ["## 3. Remove it completely", "",
+              "`install.py --manifest %s --uninstall` does all of this and closes any run "
+              "this computer still has open in Homing. By hand:"
+              % manifest_path_for(plan.state_dir), "", "```sh"]
     for _label, argv in plan.unregister_commands:
         lines.append(shell_join(argv))
     lines.append("rm -rf %s" % shell_quote(os.path.join(plan.state_dir, "run.lock")))
@@ -1070,8 +1426,8 @@ def render_uninstall(plan, manifest):
     lines.append("rm -rf %s" % shell_quote(plan.config_dir))
     lines.append("rm -rf %s" % shell_quote(plan.state_dir))
     lines += ["```", "", logs_note(plan), "",
-              "Last, open %s/agent-setup/ and disconnect the key. Only you can do that - "
-              "this computer cannot revoke its own access." % plan.origin, ""]
+              "Removing the files stops this computer from working. It does **not** cancel "
+              "the key - do section 2 as well.", ""]
     return "\n".join(lines)
 
 
@@ -1086,18 +1442,28 @@ def logs_note(plan):
 
 def render_uninstall_windows(plan, manifest):
     def gone(path):
-        return "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '%s'" % path
+        return ("Remove-Item -Recurse -Force -ErrorAction SilentlyContinue %s"
+                % ps_quote(path, "path"))
 
-    lines = ["# Removing the Homing search from this PC", "",
-             "Run these in PowerShell, in order. Each one is safe to run twice.", ""]
+    lines = ["# Stopping or removing the Homing search on this PC", "",
+             "Three different things, in the order most people want them. Run these in "
+             "PowerShell, in order within a section. Each one is safe to run twice.", "",
+             "## Cut off its access (do this first if the PC is lost)", "",
+             "Open %s/agent-setup/ and disconnect this worker's key. Only you can do that; "
+             "this PC cannot cancel its own access, and removing the files below does not "
+             "cancel it either. To connect it again afterwards, run "
+             "`powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\"`."
+             % (plan.origin, plan.connect_path), ""]
     if plan.pause_commands:
+        name = ps_quote(plan.identifier, "task name")
         lines += ["## Pause it (keeps everything, stops it running)", "", "```powershell",
-                  "Disable-ScheduledTask -TaskName '%s'" % plan.identifier, "```", "",
+                  "Disable-ScheduledTask -TaskName %s" % name, "```", "",
                   "Resume with:", "", "```powershell",
-                  "Enable-ScheduledTask -TaskName '%s'" % plan.identifier, "```", ""]
+                  "Enable-ScheduledTask -TaskName %s" % name, "```", ""]
     lines += ["## Remove it completely", "", "```powershell"]
     if plan.scheduler_kind == "schtasks":
-        lines.append("Unregister-ScheduledTask -TaskName '%s' -Confirm:$false" % plan.identifier)
+        lines.append("Unregister-ScheduledTask -TaskName %s -Confirm:$false"
+                     % ps_quote(plan.identifier, "task name"))
     lines.append(gone(plan.join(plan.state_dir, "run.lock")))
     for artifact in plan.scheduler_artifacts:
         lines.append(gone(artifact))
@@ -1112,9 +1478,9 @@ def render_uninstall_windows(plan, manifest):
 
 
 def shell_quote(value):
-    if re.match(r"^[A-Za-z0-9_@%+=:,./-]+$", value or ""):
-        return value
-    return "'" + str(value).replace("'", "'\\''") + "'"
+    """One name for the POSIX quoter, kept because the uninstall text reads better
+    with it. There is exactly one implementation, and it is `shlex.quote`."""
+    return posix_quote(value, "path")
 
 
 def shell_join(argv):
@@ -1132,8 +1498,15 @@ def show_plan(plan):
         % (plan.scheduler_kind, plan.identifier, plan.hour, plan.minute, plan.cadence_minutes))
     say("  key store     %s (%s) - written by the person, never by me"
         % (plan.store_kind, plan.store_service))
-    say("  model call    %s" % (plan.invocation or "(none: on-demand only)"))
-    say("  isolation     rung %d" % plan.isolation_rung)
+    say("  model call    %s" % (plan.invocation_display or "(none: on-demand only)"))
+    say("  isolation     rung %d%s"
+        % (plan.isolation_rung,
+           "  (unattended, opted in by the person)"
+           if plan.isolation_rung <= 0 and plan.unattended else ""))
+    say("  bounds        %ds wall clock, %ds for scoring, %d MB, %d API calls, %d writes"
+        % (plan.limits["wall_clock_seconds"], plan.limits["model_seconds"],
+           plan.limits["memory_mb"], plan.limits["requests_per_run"],
+           plan.limits["writes_per_run"]))
     say("")
     say("Folders:")
     for path, mode in plan.dirs:
@@ -1197,6 +1570,12 @@ def apply_plan(plan):
         if path == plan.bin_dir:
             continue        # recorded once below, at the mode it is locked down to
         existed = os.path.isdir(path)
+        if path == plan.work_dir:
+            # Scratch: run.sh recreates it each cycle and its EXIT trap removes
+            # it. Recording it as a required path made selftest fail on every
+            # install that had actually run once.
+            ensure_dir(path, mode, "Homing files")
+            continue
         actual = ensure_dir(path, mode, "Homing files", adopt_existing=path in plan.shared_dirs)
         manifest["dirs"].append({"path": path, "mode": oct(actual), "created": not existed})
     ensure_dir(plan.bin_dir, MODE_DIR_PRIVATE, "installed scripts")
@@ -1240,21 +1619,68 @@ def report_install(plan):
     say("Built. One thing is left, and only the person can do it:")
     say("")
     if plan.windows:
-        say("    powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\""
-            % plan.set_token_path)
+        say("    powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\"" % plan.connect_path)
     else:
-        say("    bash %s" % shell_quote(plan.set_token_path))
+        say("    sh %s" % shell_quote(plan.connect_path))
     say("")
-    say("That asks for the access key, keeps it in this computer's own safe place, and checks")
-    say("it works. The key is never shown, never written to a file I can read, and never")
-    say("passed to anything else.")
+    say("That shows a short code and a link. They approve it in their own browser, and the")
+    say("key travels from Homing straight into this computer's key store. Nobody types or")
+    say("pastes a key, and nothing here can read it back out.")
+    say("")
+    say("If pairing cannot be used at all on this machine - no browser, or a key minted")
+    say("somewhere else by an operator - the older paste-the-key path is still there, and it")
+    say("is the second choice, not the first:")
+    if plan.windows:
+        say("    powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\"" % plan.set_token_path)
+    else:
+        say("    sh %s" % shell_quote(plan.set_token_path))
+    say("")
+    say("What this install can reach:")
+    say("  * It runs as this account, in %s, and writes only there, in %s and in %s."
+        % (plan.config_dir, plan.state_dir, plan.logs_dir))
+    say("  * The installed scripts in %s are read-and-execute only, the plan and source list"
+        % plan.bin_dir)
+    say("    are read-only, and the pairing helper's own folder %s is owner-only and is"
+        % plan.private_dir)
+    say("    named in no config, state or skill file.")
+    say("  * The key is never in a command line, an environment value, a log or a prompt.")
+    say("    The runner is told the name of the key store, never the key.")
+    if plan.invocation_argv:
+        say("  * The only model command a run may start is: %s" % plan.invocation_display)
+        say("    It is a fixed list of arguments, not a command line, so nothing in a web")
+        say("    page or a prompt can add to it. It gets JUDGE.md and two files, and is")
+        say("    stopped at %d seconds." % plan.limits["model_seconds"])
+    else:
+        say("  * No model command runs unattended here at all.")
+    say("  * Bounds every run: %d seconds wall clock, %d MB, %d API calls, %d writes, and no"
+        % (plan.limits["wall_clock_seconds"], plan.limits["memory_mb"],
+           plan.limits["requests_per_run"], plan.limits["writes_per_run"]))
+    say("    deletes or restores, ever.")
+    if plan.isolation_rung <= 0 and plan.unattended:
+        say("")
+        say("This machine has nothing the operating system enforces to limit a background")
+        say("run (isolation rung 0), and the plan says a person was asked and agreed to that.")
+        say("Say it to them again in your own words before you finish, and tell them the two")
+        say("ways to stop it, below.")
     say("")
     if plan.scheduler_kind == "none":
         say("Nothing is scheduled here, so it runs when the person asks for it.")
     else:
         say("Scheduled for %02d:%02d." % (plan.hour, plan.minute))
+    say("")
+    say("Stopping it, in the order a person is most likely to want:")
+    say("  pause here      %s --manifest %s --pause"
+        % (os.path.basename(__file__), shell_quote(manifest_path_for(plan.state_dir))))
+    say("  pause in Homing %s/agent-setup/  - works even when this computer is off"
+        % plan.origin)
+    say("  remove it       %s --manifest %s --uninstall"
+        % (os.path.basename(__file__), shell_quote(manifest_path_for(plan.state_dir))))
+    say("  revoke the key  %s/agent-setup/  - only the person can do this, and it is the"
+        % plan.origin)
+    say("                  one that holds even if this computer is out of their hands")
+    say("")
     say("Record of everything created: %s" % manifest_path_for(plan.state_dir))
-    say("How to remove it: %s" % os.path.join(plan.state_dir, "UNINSTALL.md"))
+    say("Longer removal instructions: %s" % os.path.join(plan.state_dir, "UNINSTALL.md"))
     for warning in plan.warnings:
         say("Note: %s" % warning)
 
@@ -1335,10 +1761,26 @@ def worker_slug(manifest):
 
 
 def release_lease(manifest):
-    """Never strand a claimed run: a held lease locks the project for five minutes."""
+    """Never strand a claimed run: a held lease locks the project for five minutes.
+
+    Two places can be holding one - the run directory of a run that was killed
+    mid-flight, and `state/pending-complete/`, where a completion Homing never
+    acknowledged waits with the claim it belongs to. Both are closed here.
+    """
     state_dir = manifest_dir(manifest, "state")
-    claim_file = os.path.join(state_dir, "work", "claim.json")
     runner_bin = os.path.join(manifest_dir(manifest, "config"), "bin", "homing.py")
+    for name in sorted(os.listdir(os.path.join(state_dir, "pending-complete"))
+                       if os.path.isdir(os.path.join(state_dir, "pending-complete")) else []):
+        if not name.endswith(".claim.json"):
+            continue
+        close_claim(manifest, runner_bin, state_dir,
+                    os.path.join(state_dir, "pending-complete", name))
+    close_claim(manifest, runner_bin, state_dir,
+                os.path.join(state_dir, "work", "claim.json"))
+
+
+def close_claim(manifest, runner_bin, state_dir, claim_file):
+    """Tell Homing this worker is gone, using one claim it still holds."""
     if not (os.path.isfile(claim_file) and os.path.isfile(runner_bin)):
         return
     try:
@@ -1480,11 +1922,24 @@ Now score every record in `candidates.jsonl` and write `scored.jsonl`.
 
 RUN_SH_TEMPLATE = """#!/bin/sh
 # Homing runtime. Deterministic. Contains no key. Never add `set -x`.
+#
+# Every value below arrived already quoted from install.py. Do not add quotes
+# around one, and do not hand-edit a value in: the file is generated, and the
+# installer is the only thing that knows how to quote for this shell.
 set -eu
 umask 077
 ulimit -c 0 2>/dev/null || true
-CONFIG="{{CONFIG}}"; STATE="{{STATE}}"; LOGS="{{LOGS}}"; WORK="$STATE/work"
-BIN="$CONFIG/bin"; PY="{{PYTHON}}"
+# Bounds this run's own appetite, from outside whatever runs inside it: no core
+# dumps, an address-space ceiling, and a largest-single-file ceiling so a wedged
+# phase fills neither the disk nor the log.
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  Darwin) : ;;   # -v on macOS caps address space, not memory, and a modern
+                 # runtime reserves far more address space than it ever touches
+  *) ulimit -v {{MEMORY_KB}} 2>/dev/null || true ;;
+esac
+ulimit -f {{OUTPUT_BLOCKS}} 2>/dev/null || true
+CONFIG={{CONFIG}}; STATE={{STATE}}; LOGS={{LOGS}}; WORK="$STATE/work"
+BIN="$CONFIG/bin"; PY={{PYTHON}}
 NONCE=$(od -An -tx1 -N8 /dev/urandom 2>/dev/null | tr -d ' \\n')
 [ -n "$NONCE" ] || NONCE="$(date +%s)$$"
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy
@@ -1516,13 +1971,25 @@ run_bounded() { s="$1"; shift
   if command -v gtimeout >/dev/null 2>&1; then gtimeout -k 30 "$s" "$@"; return $?; fi
   perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
 
+# One clock over the whole run, not just over each phase: phases that each finish
+# inside their own bound can still add up past the point where the next scheduled
+# run is due. 142 is the timeout code SKILL.md documents.
+DEADLINE=$(( $(date +%s) + {{WALL_CLOCK}} ))
+before_deadline() {
+  [ "$(date +%s)" -lt "$DEADLINE" ] && return 0
+  echo "stopped at the {{WALL_CLOCK}}-second bound before $1" >&2; return 142; }
+
 # Every path stays quoted: on a Mac the config folder has a space in its name.
 phases() {
   rm -rf "$WORK"; mkdir -p "$WORK" || return 70
   run_bounded 120 "$PY" "$BIN/cycle.py" --config "$CONFIG/config.json" drain  || return $?
+  before_deadline read   || return $?
   run_bounded 120 "$PY" "$BIN/cycle.py" --config "$CONFIG/config.json" read   || return $?
+  before_deadline search || return $?
   run_bounded 420 "$PY" "$BIN/cycle.py" --config "$CONFIG/config.json" search || return $?
-{{MODEL_PHASE}}  run_bounded 180 "$PY" "$BIN/cycle.py" --config "$CONFIG/config.json" write  || return $?
+  before_deadline scoring || return $?
+{{MODEL_PHASE}}  before_deadline write || return $?
+  run_bounded 180 "$PY" "$BIN/cycle.py" --config "$CONFIG/config.json" write  || return $?
 }
 
 # The pipeline's status is redact's, not the run's, so carry the code out through a file.
@@ -1534,10 +2001,16 @@ exit "$rc"
 
 
 RUN_PS1_TEMPLATE = """# Homing runtime. Deterministic. Contains no key.
+#
+# Every value below arrived already quoted from install.py as a single-quoted
+# literal, in which PowerShell expands nothing at all - not $x, not $(...), not a
+# backtick. Do not add quotes around one and do not hand-edit a value in.
 $ErrorActionPreference = 'Stop'
 if ($args -contains '--help') { 'usage: run.ps1 [--help]  # one Homing search cycle'; exit 0 }
-$Config = '{{CONFIG}}'; $State = '{{STATE}}'; $Logs = '{{LOGS}}'
-$Work = Join-Path $State 'work'; $Bin = Join-Path $Config 'bin'; $Py = '{{PYTHON}}'
+$Config = {{CONFIG}}; $State = {{STATE}}; $Logs = {{LOGS}}
+$Work = Join-Path $State 'work'; $Bin = Join-Path $Config 'bin'; $Py = {{PYTHON}}
+$Deadline = (Get-Date).AddSeconds({{WALL_CLOCK}})
+$MemoryMb = {{MEMORY_MB}}
 $env:HOMING_RUN_DIR = $Work
 $env:HOMING_SOURCES_STATE = Join-Path $State 'sources-state.json'
 $env:HOMING_NONCE = [guid]::NewGuid().ToString('N').Substring(0, 16)
@@ -1557,16 +2030,47 @@ Get-ChildItem $Logs -Filter 'run-*.log' -ErrorAction SilentlyContinue |
 function Redact { process {
   $_ -replace '(Bearer|Authorization:)\\s*[A-Za-z0-9._~+/=-]{8,}', '$1 <redacted>' `
      -replace '(st_live_|sk-ant-|ghp_|github_pat_)[A-Za-z0-9._-]{8,}', '$1<redacted>' } }
+
+# The judge, bounded from outside itself: a wall clock and a working-set ceiling,
+# both enforced by this script rather than asked of the thing being run. The
+# arguments are passed as an array, so no command line is ever assembled here and
+# no shell is involved - cmd.exe never sees any of it.
+function Invoke-Bounded {
+  param([int]$Seconds, [string[]]$Cmd)
+  $out = Join-Path $Work 'model-out.txt'; $err = Join-Path $Work 'model-err.txt'
+  $rest = @(); if ($Cmd.Count -gt 1) { $rest = $Cmd[1..($Cmd.Count - 1)] }
+  $proc = Start-Process -FilePath $Cmd[0] -ArgumentList $rest -NoNewWindow -PassThru `
+            -WorkingDirectory $Work -RedirectStandardOutput $out -RedirectStandardError $err
+  $stop = (Get-Date).AddSeconds($Seconds)
+  while (-not $proc.HasExited) {
+    if ((Get-Date) -gt $stop) { $proc.Kill(); $script:rc = 142; 'the scoring step timed out'; break }
+    try { $proc.Refresh()
+          if ($proc.WorkingSet64 -gt ($MemoryMb * 1MB)) {
+            $proc.Kill(); $script:rc = 70; 'the scoring step went past its memory bound'; break } }
+    catch { }
+    Start-Sleep -Milliseconds 500
+  }
+  if ($proc.HasExited -and $script:rc -eq 0) { $script:rc = $proc.ExitCode }
+  Get-Content $out, $err -TotalCount 4000 -ErrorAction SilentlyContinue
+}
+function Test-Deadline([string]$Phase) {
+  if ((Get-Date) -gt $Deadline) {
+    $script:rc = 142; "stopped at the {{WALL_CLOCK}}-second bound before $Phase"; return $false }
+  return $true
+}
 $rc = 0
 try {
   Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
   New-Item -ItemType Directory $Work | Out-Null
   foreach ($phase in @('drain', 'read', 'search')) {
+    if (-not (Test-Deadline $phase)) { throw "out of time before $phase" }
     & $Py (Join-Path $Bin 'cycle.py') --config (Join-Path $Config 'config.json') $phase *>&1 |
       Redact | Tee-Object -Append $Log
     if ($LASTEXITCODE -ne 0) { $rc = $LASTEXITCODE; throw "phase $phase exited $rc" }
   }
-{{MODEL_PHASE_PS}}  & $Py (Join-Path $Bin 'cycle.py') --config (Join-Path $Config 'config.json') write *>&1 |
+{{MODEL_PHASE_PS}}  if ($rc -ne 0) { throw "the scoring step exited $rc" }
+  if (-not (Test-Deadline 'write')) { throw 'out of time before write' }
+  & $Py (Join-Path $Bin 'cycle.py') --config (Join-Path $Config 'config.json') write *>&1 |
     Redact | Tee-Object -Append $Log
   if ($LASTEXITCODE -ne 0) { $rc = $LASTEXITCODE }
 } catch { if ($rc -eq 0) { $rc = 70 } }
@@ -1575,9 +2079,142 @@ exit $rc
 """
 
 
+CONNECT_SH = """#!/bin/sh
+# Connect this computer to Homing. Run this yourself; nothing else runs it.
+#
+# You never type, paste or see an access key. Homing shows you a short code, you
+# approve it in your own browser, and the key travels from Homing into this
+# computer's key store without passing through the screen, a file you can read,
+# this script's arguments, or anything the search agent can reach.
+set -eu
+umask 077
+
+PY={{PYTHON}}
+HOMING_PY={{HOMING_PY}}
+PRIVATE={{PRIVATE}}
+DEVICE_CODE={{DEVICE_CODE}}
+META={{META}}
+RESULT={{RESULT}}
+
+# The same key store the scheduled run reads from, named the same way. Without
+# these, `pair-poll --store` writes the key to the platform default, its own
+# verifying read finds it there, pairing reports success - and every run
+# afterwards fails with "no key stored", because the run looks somewhere else.
+{{STORE_ENV}}
+
+# The device code is the one short-lived secret in this exchange. It lives here,
+# owner-only, in a folder nothing else in the install ever points at, and it is
+# deleted when this script ends however it ends.
+mkdir -p "$PRIVATE"
+chmod 700 "$PRIVATE" 2>/dev/null || true
+rm -f "$DEVICE_CODE"
+trap 'rm -f "$DEVICE_CODE"' EXIT INT TERM HUP
+
+if ! "$PY" "$HOMING_PY" pair-request --label {{LABEL}} --note {{NOTE}} \\
+      --cadence {{CADENCE}} --out "$META" --device-code-out "$DEVICE_CODE" >/dev/null; then
+  printf 'Homing would not start the pairing. Nothing was changed.\\n' >&2
+  exit 1
+fi
+chmod 600 "$DEVICE_CODE" "$META" 2>/dev/null || true
+
+# Read back only what is safe to show. This file holds no code that grants access.
+field() { sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$META" | head -n1; }
+CODE=$(field user_code)
+LINK=$(field verification_uri_complete)
+[ -n "$LINK" ] || LINK=$(field verification_uri)
+
+printf '\\n'
+printf 'Open this in your browser:\\n\\n    %s\\n\\n' "$LINK"
+if [ -n "$CODE" ]; then printf 'and confirm the code:  %s\\n\\n' "$CODE"; fi
+printf 'Waiting for you to approve it. Leave this window open; press Ctrl-C to stop.\\n'
+
+if "$PY" "$HOMING_PY" pair-poll --device-code-file "$DEVICE_CODE" --store --result "$RESULT"; then
+  rm -f "$DEVICE_CODE"
+  chmod 600 "$RESULT" 2>/dev/null || true
+  if "$PY" "$HOMING_PY" projects >/dev/null 2>&1; then
+    printf '\\nConnected. The key is kept in the safe place this computer provides, and\\n'
+    printf 'nothing here can read it back out or send it anywhere else.\\n'
+    exit 0
+  fi
+  printf '\\nHoming approved the pairing but would not answer with the stored key.\\n' >&2
+  printf 'The reason is in %s.\\n' "$RESULT" >&2
+  exit 1
+fi
+
+printf '\\nNot connected. What happened is written, without any secret, in:\\n    %s\\n' "$RESULT" >&2
+printf 'Run this again to retry. If pairing cannot be used at all here, the older\\n' >&2
+printf 'paste-the-key path still works:\\n    sh %s\\n' {{SET_TOKEN}} >&2
+exit 1
+"""
+
+
+CONNECT_PS1 = """# Connect this PC to Homing. Run this yourself; nothing else runs it.
+#
+# You never type, paste or see an access key. Homing shows you a short code, you
+# approve it in your own browser, and the key travels from Homing into this PC's
+# credential store without passing through the screen, a readable file, this
+# script's arguments, or anything the search agent can reach.
+$ErrorActionPreference = 'Stop'
+$Py = {{PYTHON}}
+$HomingPy = {{HOMING_PY}}
+$Private = {{PRIVATE}}
+$DeviceCode = {{DEVICE_CODE}}
+$Meta = {{META}}
+$Result = {{RESULT}}
+
+# The same key store the scheduled run reads from, named the same way. Without
+# these, pair-poll stores the key where the run will not look for it, and the
+# breakage does not show up until the first scheduled run.
+{{STORE_ENV}}
+
+New-Item -ItemType Directory -Force -Path $Private | Out-Null
+icacls $Private /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" | Out-Null
+Remove-Item -Force -ErrorAction SilentlyContinue $DeviceCode
+
+try {
+  & $Py $HomingPy pair-request --label {{LABEL}} --note {{NOTE}} `
+      --cadence {{CADENCE}} --out $Meta --device-code-out $DeviceCode | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Homing would not start the pairing.' }
+  icacls $DeviceCode /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null
+
+  $safe = Get-Content $Meta -Raw | ConvertFrom-Json
+  $link = $safe.verification_uri_complete
+  if (-not $link) { $link = $safe.verification_uri }
+  ''
+  "Open this in your browser:`n`n    $link`n"
+  if ($safe.user_code) { "and confirm the code:  $($safe.user_code)`n" }
+  'Waiting for you to approve it. Leave this window open; press Ctrl-C to stop.'
+
+  & $Py $HomingPy pair-poll --device-code-file $DeviceCode --store --result $Result
+  if ($LASTEXITCODE -ne 0) {
+    throw "Not connected. What happened is written, without any secret, in $Result."
+  }
+  Remove-Item -Force -ErrorAction SilentlyContinue $DeviceCode
+  & $Py $HomingPy projects | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "Homing approved the pairing but would not answer with the stored key. See $Result."
+  }
+  ''
+  "Connected. The key is kept in this PC's own credential store, and nothing here"
+  'can read it back out or send it anywhere else.'
+}
+catch {
+  Write-Error $_
+  "If pairing cannot be used at all here, the older paste-the-key path still works:"
+  "    powershell -NoProfile -ExecutionPolicy Bypass -File {{SET_TOKEN}}"
+  exit 1
+}
+finally { Remove-Item -Force -ErrorAction SilentlyContinue $DeviceCode }
+"""
+
+
 SET_TOKEN_SH = """#!/bin/sh
-# Store the Homing access key on this computer. Run this yourself:
-#     bash "{{CONFIG}}/set-token.sh"
+# FALLBACK ONLY. connect.sh is the way this computer is meant to be connected:
+# it pairs without anyone handling a key. Use this one only where pairing cannot
+# work - no browser on this machine, or an operator handing over a key minted
+# elsewhere. Whoever runs it is holding the key in their own hands, which
+# pairing exists to avoid.
+#     sh {{CONNECT}}      <- do this instead, if you can
 # The key is read from your keyboard, handed straight to this computer's own
 # safe place, and never written to a file, a log, or the screen.
 set -eu
@@ -1591,53 +2228,54 @@ stty echo 2>/dev/null || true
 printf '\\n' >&2
 [ -n "$HOMING_KEY" ] || { printf 'Nothing was entered, so nothing was saved.\\n' >&2; exit 1; }
 
-case "{{STORE}}" in
+case {{STORE}} in
   keychain)
     # Prompt mode asks for the value twice; every published one-liner that pipes
     # it once is wrong. Never -w <value> (that puts it in argv), never -A.
     printf '%s\\n%s\\n' "$HOMING_KEY" "$HOMING_KEY" |
-      /usr/bin/security add-generic-password -U -a "$USER" -s "{{SERVICE}}" -w
+      /usr/bin/security add-generic-password -U -a "$USER" -s {{SERVICE}} -w
     ;;
   systemd-creds)
-    install -d -m 0700 "$(dirname "{{TOKEN_PATH}}")"
+    install -d -m 0700 "$(dirname {{TOKEN_PATH}})"
     printf '%s' "$HOMING_KEY" |
-      systemd-creds encrypt --user --uid=self --name="{{SERVICE}}" - "{{TOKEN_PATH}}"
-    chmod 600 "{{TOKEN_PATH}}" 2>/dev/null || true
+      systemd-creds encrypt --user --uid=self --name={{SERVICE}} - {{TOKEN_PATH}}
+    chmod 600 {{TOKEN_PATH}} 2>/dev/null || true
     ;;
   *)
-    install -d -m 0700 "$(dirname "{{TOKEN_PATH}}")"
-    printf '%s' "$HOMING_KEY" | install -m 600 /dev/stdin "{{TOKEN_PATH}}"
+    install -d -m 0700 "$(dirname {{TOKEN_PATH}})"
+    printf '%s' "$HOMING_KEY" | install -m 600 /dev/stdin {{TOKEN_PATH}}
     ;;
 esac
 unset HOMING_KEY
 
 # Verified by whether Homing accepts it, not by reading it back. Reading it back
 # would undo the whole point of storing it there.
-if "{{PYTHON}}" "{{CONFIG}}/bin/homing.py" projects >/dev/null 2>&1; then
+if {{PYTHON}} {{HOMING_PY}} projects >/dev/null 2>&1; then
   printf 'Connected. Homing accepted the key, and it is now kept safely on this computer.\\n'
 else
   printf 'Homing did not accept that key. Nothing else was changed - open\\n'
-  printf '{{ORIGIN}}/agent-setup/ and get a fresh one, then run this again.\\n' >&2
+  printf '%s/agent-setup/ and get a fresh one, then run this again.\\n' {{ORIGIN}} >&2
   exit 1
 fi
 """
 
 
-SET_TOKEN_PS1 = """# Store the Homing access key on this PC. Run this yourself:
-#     powershell -NoProfile -ExecutionPolicy Bypass -File "{{CONFIG}}\\set-token.ps1"
+SET_TOKEN_PS1 = """# FALLBACK ONLY. connect.ps1 pairs this PC without anyone handling a key; use
+# this one only where pairing cannot work. Whoever runs it is holding the key in
+# their own hands, which pairing exists to avoid.
 $ErrorActionPreference = 'Stop'
-$dir = '{{CONFIG}}'
+$dir = {{CONFIG}}
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$file = '{{TOKEN_PATH}}'
+$file = {{TOKEN_PATH}}
 $sec = Read-Host -AsSecureString 'Paste your Homing access key, then press Enter'
 $sec | ConvertFrom-SecureString | Set-Content -Path $file -Encoding ascii -NoNewline
 icacls $file /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null
 Remove-Variable sec
-& '{{PYTHON}}' (Join-Path $dir 'bin\\homing.py') projects > $null 2>&1
+& {{PYTHON}} {{HOMING_PY}} projects > $null 2>&1
 if ($LASTEXITCODE -eq 0) {
   'Connected. Homing accepted the key, and it is now kept safely on this PC.'
 } else {
-  Write-Error "Homing did not accept that key. Open {{ORIGIN}}/agent-setup/ for a fresh one."
+  Write-Error ('Homing did not accept that key. Open ' + {{ORIGIN}} + '/agent-setup/ for a fresh one.')
   exit 1
 }
 """
@@ -1682,9 +2320,13 @@ WantedBy=timers.target
 REGISTER_TASK_PS1 = """# Registers the Homing check with Task Scheduler. No key ever appears here:
 # the task XML under C:\\Windows\\System32\\Tasks is readable text.
 $ErrorActionPreference = 'Stop'
-$Root = '{root}'
+$Root = {root}
+# Task Scheduler takes one command line, so the runner path gets exactly one pair
+# of double quotes - and a Windows path cannot contain a double quote, which is
+# checked before this file is written. The path itself is a literal: inside
+# single quotes PowerShell expands nothing.
 $Action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-  -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{runner}"' `
+  -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + {runner} + '"') `
   -WorkingDirectory $Root
 $Trigger = {trigger}
 $Principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\\$env:USERNAME" `
@@ -1694,9 +2336,9 @@ $Settings = New-ScheduledTaskSettingsSet `
   -MultipleInstances IgnoreNew -StartWhenAvailable `
   -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries -WakeToRun:$false `
   -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 10)
-Register-ScheduledTask -TaskName '{task}' -Action $Action -Trigger $Trigger `
+Register-ScheduledTask -TaskName {task} -Action $Action -Trigger $Trigger `
   -Principal $Principal -Settings $Settings -Force | Out-Null
-Start-ScheduledTask -TaskName '{task}'
+Start-ScheduledTask -TaskName {task}
 """
 
 
@@ -1743,6 +2385,14 @@ OK, PAUSED, AUTH, FORBIDDEN, CONFLICT, TRASHED = 0, 3, 4, 5, 6, 7
 CURSOR, RATE, UNAVAILABLE, LOCAL, NO_KEY = 8, 9, 10, 70, 78
 MAX_RECORD_LINES = 40
 
+# A completion that Homing has not acknowledged is not a finished run. The payload
+# and the claim it belongs to are kept here, outside the work directory that every
+# run wipes, and replayed at the start of the next run until Homing answers or
+# until the answer is one that retrying cannot change.
+PENDING_DIR = "pending-complete"
+MAX_COMPLETE_ATTEMPTS = 6      # across runs, not within one
+IN_RUN_COMPLETE_TRIES = 3      # within one run, with a short backoff
+
 
 def iso(when=None):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
@@ -1768,8 +2418,15 @@ class Ctx(object):
         # is the bare slug, because a slash is refused there.
         self.slug = worker.get("slug") or self.label.split("/")[-1]
         self.egress = self.config.get("egress_class") or "unknown"
+        self.pending = os.path.join(self.state, PENDING_DIR)
         os.makedirs(self.work, mode=0o700, exist_ok=True)
         os.makedirs(self.park, mode=0o700, exist_ok=True)
+        os.makedirs(self.pending, mode=0o700, exist_ok=True)
+        # One request budget for the whole cycle, spent by every kit call. It is a
+        # ceiling on what a wedged loop can do to Homing or to a website, and it is
+        # counted here rather than asked of the thing being counted.
+        self.calls = 0
+        self.max_calls = self.limit("requests_per_run", 200)
 
     def limit(self, name, fallback):
         try:
@@ -1795,12 +2452,18 @@ class Ctx(object):
 
 
 def call(ctx, script, *args):
-    """Run one kit script. Returns (exit_code, parsed_json_or_None).
+    """Run one kit script. Returns (exit_code, parsed_json_or_None, stderr_text).
 
     homing.py's codes are translated to the ones SKILL.md documents; sources.py's
     are returned raw, because a robots refusal is a fact about a site, not a
-    Homing status.
+    Homing status. Every argument is passed as an argument: there is no shell here
+    and no command line is ever assembled.
     """
+    if ctx.calls >= ctx.max_calls:
+        message = "request budget of %d calls is spent; stopping this run" % ctx.max_calls
+        sys.stderr.write(message + "\n")
+        return LOCAL, None, message
+    ctx.calls += 1
     argv = [sys.executable, os.path.join(ctx.bin, script)] + [str(a) for a in args]
     result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
@@ -1816,7 +2479,8 @@ def call(ctx, script, *args):
             except ValueError:
                 continue
     code = result.returncode
-    return (translate(code, err) if script.startswith("homing") else code), payload
+    code = translate(code, err) if script.startswith("homing") else code
+    return code, payload, err
 
 
 def translate(code, stderr):
@@ -1847,14 +2511,23 @@ def fail(ctx, code, summary, extra=None):
 
 
 def phase_drain(ctx):
-    """Every run drains parked batches before it searches anything."""
+    """Every run finishes last run's business before it starts any of its own.
+
+    Order matters: an unacknowledged completion still holds a lease, and the
+    project behind it is locked until the lease is closed or expires. Parked
+    batches come second.
+    """
+    code = replay_pending(ctx)
+    if code != OK:
+        return fail(ctx, code, "a run left open by an earlier attempt is still open")
     state = ctx.read_json(os.path.join(ctx.state, "state.json"), {})
     drained = 0
     for project_id in sorted((state.get("projects") or {}).keys()):
         if not os.path.isdir(os.path.join(ctx.park, project_id)):
             continue
-        code, payload = call(ctx, "homing.py", "leads-upsert", "--project", project_id,
-                             "--drain-parked", "--park-dir", ctx.park, "--verify-sample", "0")
+        code, payload, _err = call(ctx, "homing.py", "leads-upsert", "--project", project_id,
+                                   "--drain-parked", "--park-dir", ctx.park,
+                                   "--verify-sample", "0")
         if code not in (OK,):
             return fail(ctx, code, "could not send the batches held over from last time")
         drained += int(((payload or {}).get("counts") or {}).get("drained") or 0)
@@ -1864,7 +2537,7 @@ def phase_drain(ctx):
 
 
 def phase_read(ctx):
-    code, payload = call(ctx, "homing.py", "projects")
+    code, payload, _err = call(ctx, "homing.py", "projects")
     if code != OK:
         return fail(ctx, code, "could not read the searches from Homing")
     payload = payload or {}
@@ -1881,7 +2554,7 @@ def phase_read(ctx):
         project_id = str(project.get("id") or "")
         if not project_id:
             continue
-        code, detail = call(ctx, "homing.py", "project", "--project", project_id)
+        code, detail, _err = call(ctx, "homing.py", "project", "--project", project_id)
         if code != OK:
             return fail(ctx, code, "could not read one of the searches")
         body = ((detail or {}).get("project") or {})
@@ -1929,17 +2602,22 @@ def phase_search(ctx):
         slug = str(source.get("slug") or "")
         if lane not in ctx.lanes or not slug:
             continue
-        code, _meta = call(ctx, "sources.py", "fetch", "--slug", slug,
+        code, _meta, _err = call(ctx, "sources.py", "fetch", "--slug", slug,
                            "--sources", ctx.sources_file, "--state", ctx.sources_state,
                            "--out-dir", raw_dir, "--egress-class", ctx.egress)
         if code != 0:
             # 77 is robots.txt withholding consent, which is the site's answer and final.
             lanes.append({"lane": lane, "status": "blocked" if code == 77 else "error"})
             continue
-        code, result = call(ctx, "sources.py", "extract", "--slug", slug,
-                            "--sources", ctx.sources_file, "--state", ctx.sources_state,
-                            "--in-dir", raw_dir, "--out", records_path,
-                            "--max-records", ctx.limit("candidates_per_project", 40))
+        # Revalidation re-checks each listing is still live, and sources.py exits
+        # 73 if it is asked to do that for a source that never said how to build a
+        # listing URL. Ask for it only where the source can answer.
+        revalidate = ("--revalidate" if str(source.get("listing_url_pattern") or "").strip()
+                      else "--no-revalidate")
+        code, result, _err = call(ctx, "sources.py", "extract", "--slug", slug,
+                                  "--sources", ctx.sources_file, "--state", ctx.sources_state,
+                                  "--in-dir", raw_dir, "--out", records_path, revalidate,
+                                  "--max-records", ctx.limit("candidates_per_project", 40))
         result = result or {}
         counts = result.get("counts") or {}
         lanes.append({"lane": lane,
@@ -1951,15 +2629,34 @@ def phase_search(ctx):
     return OK
 
 
+# The site's own answer, which is durable and worth reporting as a block.
+BLOCK_STATUSES = ("BLOCKED-EDGE", "BLOCKED-IP", "BLOCKED-JS", "BLOCKED-UNKNOWN",
+                  "LOGIN-WALL", "GEOFENCED", "SILENT-DEGRADATION", "POISONED",
+                  "ROBOTS-DISALLOWED")
+
+
 def lane_status(code, result):
+    """What one lane did, in the four words the rest of this file understands.
+
+    `sources.py` already decides this and says so in `report_as`; the status only
+    has to separate a durable refusal from a condition of the moment. A cooldown -
+    a robots.txt that did not answer, a challenge page, a 5xx - is a normal
+    outcome, not a failure, and never becomes `needs_local`.
+    """
     if code != 0:
         return "blocked" if code == 77 else "error"
+    result = result or {}
     status = str(result.get("status") or "")
-    if status.startswith("BLOCKED") or status == "LOGIN-WALL":
+    report = str(result.get("report_as") or "")
+    if report == "ok":
+        return "ok"
+    if report == "nothing_new" or status in ("EMPTY-GENUINE", "NOT-MODIFIED"):
+        return "empty"
+    if status in BLOCK_STATUSES:
         return "blocked"
-    if int((result.get("counts") or {}).get("new") or 0) == 0:
-        return "empty" if status in ("OK", "EMPTY-GENUINE", "") else "skipped"
-    return "ok"
+    if report == "source_unchecked" or status:
+        return "cooldown"
+    return "empty" if int((result.get("counts") or {}).get("new") or 0) == 0 else "ok"
 
 
 def build_candidates(ctx, projects, records_path):
@@ -2063,17 +2760,19 @@ def phase_write(ctx):
 
     sources_ok = len([l for l in lanes if l.get("status") == "ok"])
     sources_blocked = len([l for l in lanes if l.get("status") == "blocked"])
+    sources_cooling = len([l for l in lanes if l.get("status") == "cooldown"])
     totals = {"created": 0, "updated": 0, "unchanged": 0, "conflicts": 0, "trashed": 0,
               "restored": 0, "sources_ok": sources_ok, "sources_blocked": sources_blocked,
-              "suspected_injection": sum(injected.values()), "urls_refused": 0}
-    deferred, worst, written = 0, OK, 0
+              "suspected_injection": sum(injected.values()), "urls_refused": 0,
+              "sources_cooling": sources_cooling, "completions_pending": 0}
+    deferred, worst, written, acknowledged = 0, OK, 0, 0
 
     for project in projects:
         project_id = project["id"]
         leads = by_project.get(project_id) or []
         # The run snapshots the prompt at create time: if a person edited it while
         # we were searching, those candidates answer a question nobody asked.
-        code, detail = call(ctx, "homing.py", "project", "--project", project_id)
+        code, detail, _err = call(ctx, "homing.py", "project", "--project", project_id)
         if code != OK:
             worst = max(worst, code)
             continue
@@ -2082,7 +2781,7 @@ def phase_write(ctx):
             sys.stderr.write("prompt changed mid-search; dropping stale candidates\n")
             leads = []
 
-        code, created = call(ctx, "homing.py", "run-create", "--project", project_id,
+        code, created, _err = call(ctx, "homing.py", "run-create", "--project", project_id,
                              "--agent-label", ctx.label)
         if code != OK:
             worst = max(worst, code)
@@ -2092,7 +2791,8 @@ def phase_write(ctx):
             worst = max(worst, UNAVAILABLE)
             continue
 
-        code, claim = call(ctx, "homing.py", "run-claim", "--project", project_id, "--run", run_id)
+        code, claim, _err = call(ctx, "homing.py", "run-claim", "--project", project_id,
+                                 "--run", run_id)
         if code != OK:
             worst = max(worst, code)
             continue
@@ -2105,7 +2805,7 @@ def phase_write(ctx):
         if leads:
             items = ctx.path("leads-%s.json" % project_id[:8])
             ctx.write_json(items, {"items": leads})
-            code, result = call(ctx, "homing.py", "leads-upsert", "--project", project_id,
+            code, result, _err = call(ctx, "homing.py", "leads-upsert", "--project", project_id,
                                 "--items-file", items, "--run-id", run_id,
                                 "--park-dir", ctx.park, "--verify-sample", "5",
                                 "--max-leads", ctx.limit("leads_per_batch", 100))
@@ -2123,7 +2823,17 @@ def phase_write(ctx):
                          "suspected_injection": injected.get(project_id, 0)}
         for name in ("created", "updated", "unchanged", "conflicts"):
             result_counts[name] = int(counts.get(name) or 0)
-        complete(ctx, project_id, run_id, lanes, counts, result_counts)
+        # Nothing above is a finished run until Homing says so. A completion that
+        # is not acknowledged carries the whole cycle's exit code with it.
+        verdict, complete_code = complete(ctx, project_id, run_id, lanes, counts,
+                                          result_counts)
+        if verdict != "success":
+            totals["completions_pending"] += 1
+            worst = max(worst, complete_code)
+            if verdict == "unauthorized":
+                break
+        else:
+            acknowledged += 1
 
     state_file = os.path.join(ctx.state, "state.json")
     state = ctx.read_json(state_file, {"schema": 1})
@@ -2138,6 +2848,14 @@ def phase_write(ctx):
         written, len(projects), "search" if len(projects) == 1 else "searches")
     if deferred:
         summary += "; %d left for the next run (another copy was writing)" % deferred
+    if totals["completions_pending"]:
+        # Said plainly, because "found 12 places" and "Homing knows about this run"
+        # are different facts and only one of them is in doubt.
+        summary += ("; %d of %d %s not confirmed by Homing yet and will be sent again "
+                    "next run" % (totals["completions_pending"],
+                                  totals["completions_pending"] + acknowledged,
+                                  "run was" if totals["completions_pending"] == 1
+                                  else "runs were"))
     return fail(ctx, worst, summary, {"counts": totals, "lanes": lanes})
 
 
@@ -2169,6 +2887,134 @@ def output_cursor(lanes):
     return "" if cursor == "v1" else cursor
 
 
+def pending_paths(ctx, run_id):
+    """Where an unacknowledged completion waits: its payload, and the claim it
+    belongs to. Both outside the work directory, which every run wipes."""
+    stem = os.path.join(ctx.pending, "".join(
+        ch for ch in str(run_id) if ch.isalnum() or ch in "-_")[:64] or "unknown")
+    return stem + ".json", stem + ".claim.json"
+
+
+def classify_complete(code, err):
+    """What Homing's answer to run-complete means for what happens next.
+
+    The five outcomes are different actions, not different wordings: retry now,
+    retry later, stop retrying because the lease is gone, stop everything because
+    the key is not accepted, or stop because the run is no longer ours.
+    """
+    text = (err or "").lower()
+    if code == OK:
+        return "success"
+    if "claim" in text and ("no claim" in text or "different run" in text):
+        return "no-claim"
+    if code in (AUTH, FORBIDDEN, NO_KEY):
+        return "unauthorized"
+    if "410" in text or "lease_expired" in text or "lease_lost" in text or "expired" in text:
+        return "expired"
+    if "409" in text or code == CONFLICT:
+        return "conflict"
+    if code in (RATE, UNAVAILABLE, 142) or code == LOCAL:
+        return "retry"
+    return "fatal"
+
+
+def send_complete(ctx, record):
+    """One attempt at acknowledging a run, bounded and safe to repeat.
+
+    `homing.py` sends an idempotency key derived from the run, so replaying the
+    same completion is the same completion, never a second one. Returns
+    (verdict, exit_code) and never reports success on its own authority: only
+    Homing's answer decides that.
+    """
+    payload_path, claim_path = pending_paths(ctx, record["run_id"])
+    if not os.path.exists(claim_path):
+        return "no-claim", LOCAL
+    ctx.write_json(payload_path, record)
+    args = ["run-complete", "--project", record["project_id"], "--run", record["run_id"],
+            "--claim-file", claim_path, "--payload-file", payload_path,
+            "--status", record["payload"].get("status") or "completed"]
+    verdict, code = "retry", UNAVAILABLE
+    for attempt in range(IN_RUN_COMPLETE_TRIES):
+        record["attempts"] = int(record.get("attempts") or 0) + 1
+        code, _out, err = call(ctx, "homing.py", *args)
+        verdict = classify_complete(code, err)
+        record["last_code"] = code
+        record["last_verdict"] = verdict
+        record["last_error"] = (err or "").strip().splitlines()[-1][:200] if err else ""
+        record["last_attempt_at"] = iso()
+        if verdict != "retry" or record["attempts"] >= MAX_COMPLETE_ATTEMPTS:
+            break
+        if attempt + 1 < IN_RUN_COMPLETE_TRIES:
+            time.sleep(2 * (attempt + 1))
+    if verdict == "success":
+        for path in (payload_path, claim_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return verdict, OK
+    outcome = verdict_code(verdict, code)
+    if verdict in ("expired", "conflict", "no-claim", "fatal"):
+        # The lease is not ours any more, so no number of retries changes the
+        # answer. Keep the record - a person can see what was found and not filed -
+        # and drop the claim, which is now only a stale secret.
+        record["terminal"] = True
+        try:
+            os.remove(claim_path)
+        except OSError:
+            pass
+    elif record.get("attempts", 0) >= MAX_COMPLETE_ATTEMPTS:
+        record["terminal"] = True
+        record["needs_human"] = True
+    ctx.write_json(payload_path, record)
+    return verdict, outcome
+
+
+def verdict_code(verdict, code):
+    """The run's exit code for a completion that did not succeed."""
+    if verdict == "unauthorized":
+        return code if code in (AUTH, FORBIDDEN, NO_KEY) else AUTH
+    if verdict in ("expired", "conflict", "no-claim"):
+        return CONFLICT
+    return code if code != OK else UNAVAILABLE
+
+
+def replay_pending(ctx):
+    """Finish last run's business before starting new business.
+
+    A run whose completion never landed still holds a lease at Homing, and the
+    project stays locked behind it. This is the only place that clears one, and it
+    runs before anything is searched or written.
+    """
+    if not os.path.isdir(ctx.pending):
+        return OK
+    worst = OK
+    for name in sorted(os.listdir(ctx.pending)):
+        if not name.endswith(".json") or name.endswith(".claim.json"):
+            continue
+        path = os.path.join(ctx.pending, name)
+        record = ctx.read_json(path, None)
+        if not isinstance(record, dict) or not record.get("run_id"):
+            try:
+                os.remove(path)      # unreadable is not retryable
+            except OSError:
+                pass
+            continue
+        if record.get("terminal"):
+            continue
+        verdict, code = send_complete(ctx, record)
+        if verdict == "success":
+            sys.stderr.write("closed a run left open by an earlier attempt\n")
+            continue
+        sys.stderr.write("a run from an earlier attempt is still open (%s)\n" % verdict)
+        if verdict == "unauthorized":
+            # The key is refused or revoked. Nothing later in this cycle can work,
+            # and retrying would only repeat the refusal.
+            return code
+        worst = max(worst, code) if verdict != "retry" else worst
+    return worst
+
+
 def complete(ctx, project_id, run_id, lanes, counts, result_counts):
     payload = {
         "status": "completed",
@@ -2187,14 +3033,44 @@ def complete(ctx, project_id, run_id, lanes, counts, result_counts):
                     % (ctx.slug, int(counts.get("created") or 0),
                        int(counts.get("updated") or 0), int(counts.get("unchanged") or 0)))[:1000],
     }
-    path = ctx.path("complete-%s.json" % run_id[:8])
-    ctx.write_json(path, payload)
-    call(ctx, "homing.py", "run-complete", "--project", project_id, "--run", run_id,
-         "--payload-file", path, "--status", "completed")
+    # Written down before it is sent, and kept until Homing says it landed. The
+    # claim travels with it: without the claim token a later attempt cannot close
+    # the run, and the work directory this claim currently lives in is wiped by
+    # every run, including the next one.
+    record = {"schema": 1, "project_id": project_id, "run_id": run_id,
+              "created_at": iso(), "attempts": 0, "terminal": False, "payload": payload}
+    payload_path, claim_path = pending_paths(ctx, run_id)
+    ctx.write_json(payload_path, record)
+    if not preserve_claim(ctx, claim_path):
+        record["terminal"] = True
+        record["last_verdict"] = "no-claim"
+        ctx.write_json(payload_path, record)
+        sys.stderr.write("no claim on file to close this run with\n")
+        return "no-claim", CONFLICT
+    return send_complete(ctx, record)
+
+
+def preserve_claim(ctx, claim_path):
+    """Copy this run's claim beside its pending completion, owner-only.
+
+    The claim token is a secret with a short life. It moves from one 0600 file in
+    a 0700 directory to another; it is never printed, never put in an argument,
+    and it is deleted the moment the completion is acknowledged or the lease is
+    known to be gone.
+    """
+    source = os.path.join(ctx.work, "claim.json")
     try:
-        os.remove(path)
+        with open(source, "rb") as handle:
+            blob = handle.read()
     except OSError:
-        pass
+        return False
+    try:
+        fd = os.open(claim_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(blob)
+    except OSError:
+        return False
+    return True
 
 
 PHASES = {"drain": phase_drain, "read": phase_read,

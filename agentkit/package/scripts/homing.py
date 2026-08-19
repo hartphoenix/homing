@@ -7,6 +7,10 @@ Do not read it into a model's context, and do not reimplement it with curl.
     homing.py --help
     homing.py projects
     homing.py leads-upsert --project <uuid> --items-file leads.json
+    homing.py pair-request --label "Claude on the laptop" \
+        --out <state>/pair-request.json --device-code-out <private>/device-code
+    homing.py pair-poll --device-code-file <private>/device-code --store \
+        --result <state>/pair-result.json
 
 Design rules this file enforces mechanically (they are not advice):
 
@@ -15,6 +19,11 @@ Design rules this file enforces mechanically (they are not advice):
   * The key is read from the OS secret store at call time, sent in exactly one
     header, and never placed in argv, an environment value, a URL, a log line,
     stdout, or an exception message.
+  * Pairing spends the device code and receives the key inside this process.
+    Both are added to the redaction filter the moment they exist; the device
+    code arrives from a private file (never argv) and the key goes straight
+    out to the secret store on a pipe. Neither is ever written anywhere a
+    model can read.
   * Zero redirects are followed. A redirect off the Homing origin would carry
     the Authorization header with it, so it is a hard error instead.
   * Any response whose body or headers echo the key exits 65 without printing.
@@ -29,8 +38,11 @@ Exit codes:
    69   5xx after retries, or a bot-wall wearing a 429 costume
    70   a hard bound was violated (write budget, destructive call, huge body)
    73   an outbound payload failed the closed-schema check
-   75   transient network failure - try again on the next run
-   77   401/403 - stop all writes. Do not retry, do not loop, do not prompt.
+   74   a permanent conflict: the run is no longer claimable
+   75   transient network failure, an expired or unanswered pairing, or a
+        pairing throttle - try again on the next run
+   77   401/403, or a pairing the user denied - stop. Do not retry, do not
+        loop, do not prompt.
    78   no key available from the secret store, or the kit was never installed
 """
 
@@ -48,6 +60,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 # --- installed constants -----------------------------------------------------
 
@@ -74,6 +87,7 @@ EXIT_REDIRECT = 66
 EXIT_UNAVAILABLE = 69
 EXIT_BOUND = 70
 EXIT_VALIDATION = 73
+EXIT_CONFLICT = 74   # a permanent 409: retrying cannot resolve it
 EXIT_TEMPFAIL = 75
 EXIT_AUTH = 77
 EXIT_CONFIG = 78
@@ -392,30 +406,36 @@ def _bot_wall(response):
 
 
 def request(method, path, payload=None, idempotency_key=None, if_match=None,
-            retries=2, allow=()):
+            retries=2, allow=(), auth=True):
     """One HTTP call. Implements the BRIEF 4.4 error table.
 
     `allow` names status codes the caller will handle itself; everything else
     that is not 2xx ends the process with the documented exit code.
+
+    `auth=False` is only for the two pairing endpoints, which are the one part
+    of the API reachable before a key exists. Such a call carries no
+    Authorization header and spends no write budget, so it needs no run
+    directory either.
     """
     if method == "DELETE":
         die(EXIT_BOUND, "refuse: DELETE is not implemented and never will be")
     url = _url(path)
-    tok = token()
+    tok = token() if auth else ""
 
     body = None
     if payload is not None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        if tok.encode("utf-8") in body:
+        if tok and tok.encode("utf-8") in body:
             die(EXIT_TOKEN_ECHO, "refuse: the request body contains the account key")
-    if method != "GET":
+    if method != "GET" and auth:
         _spend_write()
 
     headers = {
-        "Authorization": "Bearer " + tok,  # the one and only place this appears
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
+    if tok:
+        headers["Authorization"] = "Bearer " + tok  # the one and only place this appears
     if body is not None:
         headers["Content-Type"] = "application/json"
     if idempotency_key:
@@ -832,6 +852,344 @@ def cmd_token_info(args):
     emit({"ok": True, "available": True, "token": body})
 
 
+# --- pairing (device code) ---------------------------------------------------
+#
+# Two values passing through here are credentials: the device code, which is a
+# bearer of the pending pairing, and the account key it is exchanged for once.
+# `pair-request` writes the device code to a private file that the installer
+# keeps outside the agent-readable tree. `pair-poll` reads it back from there,
+# spends it, and hands the key straight to the OS secret store on a pipe. The
+# person never sees either value and neither reaches stdout, argv, an
+# environment value, a log line, or any file the model is allowed to read.
+
+PAIR_DEFAULT_INTERVAL = 5
+PAIR_SLOW_DOWN_STEP = 5
+PAIR_DEFAULT_TIMEOUT = 600  # the server's expires_in
+PAIR_MAX_INTERVAL = 60
+
+# Crockford base32 with I, L, O and U removed, exactly as the server mints it.
+_USER_CODE = re.compile(r"^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{4,12}$")
+
+
+def _write_private_text(path, text):
+    """Owner-only from the moment it exists: 0600 at open(), never chmod after."""
+    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _feed_quiet(argv, text, timeout=30):
+    """Run a store helper with the secret on stdin. Nothing it says is captured."""
+    try:
+        proc = subprocess.run(
+            argv,
+            input=text.encode("utf-8"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return 127
+    except subprocess.TimeoutExpired:
+        return 62  # a locked keychain parks the helper on a GUI prompt forever
+    return proc.returncode
+
+
+def _store_in_keychain(value):
+    service = os.environ.get("HOMING_KEYCHAIN_SERVICE", "homing-api-token")
+    account = os.environ.get("HOMING_KEYCHAIN_ACCOUNT") or os.environ.get("USER") or ""
+    argv = ["/usr/bin/security", "add-generic-password", "-U",
+            "-s", service, "-l", "Homing API token", "-w"]
+    if account:
+        argv[3:3] = ["-a", account]
+    # `-w` last with no value is prompt mode, and prompt mode asks twice.
+    return _feed_quiet(argv, "%s\n%s\n" % (value, value))
+
+
+def _store_in_secret_tool(value):
+    # No trailing newline: secret-tool reads to EOF and a \n becomes the secret.
+    return _feed_quiet(
+        ["secret-tool", "store", "--label=Homing API token",
+         "service", "homing", "account", "api-token"],
+        value,
+    )
+
+
+def _store_in_dpapi(value):
+    """DPAPI, keyed to this user on this machine. The key arrives on stdin."""
+    path = os.environ.get("HOMING_TOKEN_FILE") or os.path.join(
+        os.environ.get("LOCALAPPDATA", ""), "Homing", "token.dpapi"
+    )
+    quoted = path.replace("'", "''")
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "$t = [Console]::In.ReadToEnd().Trim(); "
+        "$dir = Split-Path -Parent '%s'; "
+        "if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }; "
+        "ConvertTo-SecureString $t -AsPlainText -Force | ConvertFrom-SecureString | "
+        "Set-Content -Path '%s' -Encoding ascii -NoNewline; "
+        "icacls '%s' /inheritance:r /grant:r \"$($env:USERNAME):(R,W)\" | Out-Null"
+        % (quoted, quoted, quoted)
+    )
+    return _feed_quiet(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script], value
+    )
+
+
+def _token_file_target():
+    """Where the file store writes. Never CREDENTIALS_DIRECTORY: systemd owns it."""
+    explicit = os.environ.get("HOMING_TOKEN_FILE")
+    if explicit:
+        return explicit
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(xdg, "homing", "token")
+
+
+def _store_in_file(value):
+    _write_private_text(_token_file_target(), value + "\n")
+    return 0
+
+
+def store_token(value):
+    """Write the key into the same store `token()` reads. Returns (store, status)."""
+    store = os.environ.get("HOMING_TOKEN_STORE") or _default_store()
+    writers = {
+        "keychain": _store_in_keychain,
+        "secret-tool": _store_in_secret_tool,
+        "dpapi": _store_in_dpapi,
+        "file": _store_in_file,
+    }
+    if store not in writers:
+        die(EXIT_CONFIG, "unknown key store %r" % store)
+    try:
+        return store, writers[store](value)
+    except OSError as exc:
+        return store, exc.errno or 1
+
+
+def _origin_link(suffix=""):
+    origin = _origin_parts()
+    return "%s://%s/link/%s" % (origin.scheme, origin.netloc, suffix)
+
+
+def _safe_link(value, fallback):
+    """The person is told to open this, so it has to be on the installed origin."""
+    text = clean_text(value or "", 500)
+    if not text:
+        return fallback
+    origin = _origin_parts()
+    parts = urllib.parse.urlsplit(text)
+    if parts.scheme != origin.scheme or parts.netloc != origin.netloc:
+        LOG.info("the pairing response offered a link off the installed origin; using ours")
+        return fallback
+    return text
+
+
+def _in_seconds_iso(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+
+
+def _bounded_int(value, default, low, high):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(number, high))
+
+
+def cmd_pair_request(args):
+    """Ask for a device code. Unauthenticated: no key exists yet, by design."""
+    label = clean_text(args.label, 120).strip()
+    if not label:
+        die(EXIT_USAGE, "--label is required and must be printable text")
+    payload = {"agent_label": label}
+    note = clean_text(args.note or "", 200).strip()
+    if note:
+        payload["environment_note"] = note
+    if args.cadence:
+        if args.cadence < 1 or args.cadence > 10080:
+            die(EXIT_USAGE, "--cadence must be between 1 and 10080 minutes")
+        payload["requested_cadence_minutes"] = args.cadence
+
+    response = request("POST", "/agent-link", payload=payload, auth=False, allow=(429, 422))
+    if response.status == 429:
+        die(EXIT_TEMPFAIL, "too many pairing requests from this address; try again later")
+    if response.status == 422:
+        die(EXIT_USAGE, "Homing refused the pairing request: %s" % (response.error_code() or "422"))
+    body = response.json if isinstance(response.json, dict) else {}
+
+    device_code = body.get("device_code")
+    user_code = body.get("user_code")
+    if not isinstance(device_code, str) or not device_code.strip():
+        die(EXIT_UNAVAILABLE, "the pairing request came back without a device code")
+    device_code = device_code.strip()
+    REDACTOR.add(device_code)  # before anything else can log
+    if not isinstance(user_code, str) or not _USER_CODE.match(user_code.strip()):
+        die(EXIT_UNAVAILABLE, "the pairing request came back without a usable user code")
+    user_code = user_code.strip()
+
+    safe = {
+        "user_code": user_code,
+        "verification_uri": _safe_link(body.get("verification_uri"), _origin_link()),
+        "verification_uri_complete": _safe_link(
+            body.get("verification_uri_complete"), _origin_link("?code=" + user_code)
+        ),
+        "expires_at": _in_seconds_iso(
+            _bounded_int(body.get("expires_in"), PAIR_DEFAULT_TIMEOUT, 1, 86400)
+        ),
+        "interval": _bounded_int(body.get("interval"), PAIR_DEFAULT_INTERVAL, 1, PAIR_MAX_INTERVAL),
+    }
+
+    _write_private_text(args.device_code_out, device_code)
+    try:
+        write_private(args.out, safe)
+    except OSError as exc:
+        _remove_quietly(args.device_code_out)  # unusable metadata, so spend nothing
+        die(EXIT_CONFIG, "cannot write %s: %s" % (args.out, exc.strerror))
+    emit(dict(safe, ok=True))
+
+
+def _read_device_code(path):
+    if not path or not os.path.isfile(path):
+        die(EXIT_CONFIG, "no device-code file at %s; run pair-request first" % path)
+    if os.stat(path).st_mode & 0o077 and os.name != "nt":
+        die(EXIT_CONFIG, "the device-code file is readable by other users; refusing to spend it")
+    with open(path, "rb") as handle:
+        value = handle.read(4096).decode("utf-8", "replace").strip()
+    if not value:
+        die(EXIT_CONFIG, "the device-code file is empty; run pair-request again")
+    REDACTOR.add(value)
+    return value
+
+
+def _verify_stored_key():
+    """One authenticated read - token-info's own path - reported as status only."""
+    del _TOKEN_CACHE[:]  # force a read back out of the store we just wrote
+    try:
+        response = request("GET", "/me/token", allow=(404,))
+    except SystemExit:
+        return False
+    return response.status == 200
+
+
+def _pair_finish(args, response, result):
+    body = response.json if isinstance(response.json, dict) else {}
+    raw = body.get("token")
+    if not isinstance(raw, str) or not raw.strip():
+        result["error_class"] = "malformed_response"
+        die(EXIT_UNAVAILABLE, "the pairing was approved but no key came back")
+    raw = raw.strip()
+    REDACTOR.add(raw)  # before anything else can log
+
+    result["paired"] = True
+    expires_at = body.get("expires_at")
+    if isinstance(expires_at, str) and expires_at.strip():
+        result["expires_at"] = clean_text(expires_at, 64)
+    scopes = body.get("scopes")
+    if isinstance(scopes, list):
+        result["scopes"] = [clean_text(s, 64) for s in scopes if isinstance(s, str)][:40]
+
+    if not args.store:
+        # Nothing here can print it and nothing may write it down, so it dies
+        # with this process. --store is what an installer always passes.
+        result["error_class"] = "not_stored"
+        emit({"ok": True, "paired": True, "stored": False, "verified": False,
+              "error_class": "not_stored", "expires_at": result["expires_at"],
+              "scopes": result["scopes"]})
+        return
+
+    store, status = store_token(raw)
+    if status:
+        result["error_class"] = "store_write_failed"
+        die(EXIT_CONFIG, "the %s store rejected the key (status %s)" % (store, status))
+
+    verified = _verify_stored_key()
+    if not verified:
+        result["error_class"] = "verify_failed"
+    emit({"ok": bool(verified), "paired": True, "stored": True, "store": store,
+          "verified": bool(verified), "error_class": result["error_class"],
+          "expires_at": result["expires_at"], "scopes": result["scopes"]})
+    if not verified:
+        die(EXIT_CONFIG, "the key was written to the %s store but did not read back" % store)
+
+
+def _pair_poll(args, path, result):
+    try:
+        payload = {"device_code": _read_device_code(path)}
+    except SystemExit:
+        result["error_class"] = "no_device_code"
+        raise
+    interval = _bounded_int(args.interval, PAIR_DEFAULT_INTERVAL, 1, PAIR_MAX_INTERVAL)
+    timeout = _bounded_int(args.timeout, PAIR_DEFAULT_TIMEOUT, 1, 86400)
+    deadline = time.time() + timeout
+    while True:
+        response = request("POST", "/agent-link/token", payload=payload,
+                           auth=False, allow=(400, 429))
+        if response.status == 200:
+            _pair_finish(args, response, result)
+            return
+        code = "rate_limited" if response.status == 429 else response.error_code()
+        if code == "authorization_pending":
+            pass
+        elif code == "slow_down":
+            # Never shorten it again: the server counts every poll, not just
+            # the ones it answered.
+            interval = min(interval + PAIR_SLOW_DOWN_STEP, PAIR_MAX_INTERVAL)
+        elif code == "access_denied":
+            result["error_class"] = "access_denied"
+            die(EXIT_AUTH, "the pairing was not approved; not retrying and not asking again")
+        elif code == "expired_token":
+            result["error_class"] = "expired_token"
+            die(EXIT_TEMPFAIL, "the pairing request expired; start over with pair-request")
+        elif code == "rate_limited":
+            result["error_class"] = "rate_limited"
+            die(EXIT_TEMPFAIL, "Homing is throttling this address; try again later")
+        else:
+            result["error_class"] = "malformed_response"
+            die(EXIT_UNAVAILABLE,
+                "unrecognised pairing response (%s)" % (code or response.status))
+        if time.time() + interval > deadline:
+            result["error_class"] = "timeout"
+            die(EXIT_TEMPFAIL, "gave up waiting for approval after %ds" % timeout)
+        time.sleep(interval)
+
+
+def cmd_pair_poll(args):
+    """Spend the device code and put the key in the store. Prints neither.
+
+    The finally clause is the point of this function: however it ends -
+    approval, denial, expiry, a dropped network, Ctrl-C - the device code file
+    is gone and a non-secret result is on disk for the caller to read.
+    """
+    result = {"paired": False, "error_class": None, "expires_at": None, "scopes": []}
+    try:
+        _pair_poll(args, args.device_code_file, result)
+    except KeyboardInterrupt:
+        result["error_class"] = "interrupted"
+        raise
+    except SystemExit:
+        # Whatever ended this - a dropped network, an unwritable store - the
+        # result file says something rather than reading like a fresh no-op.
+        if result["error_class"] is None:
+            result["error_class"] = "unavailable"
+        raise
+    finally:
+        _remove_quietly(args.device_code_file)
+        if args.result:
+            try:
+                write_private(args.result, result)
+            except OSError as exc:
+                LOG.error("cannot write the result file: %s", exc.strerror)
+
+
 # --- run lifecycle -----------------------------------------------------------
 
 
@@ -843,8 +1201,13 @@ def cmd_run_create(args):
     if args.continuation_from_run_id:
         payload["continuation_from_run_id"] = need_uuid(
             args.continuation_from_run_id, "--continuation-from-run-id")
-    key = idempotency_key("runcreate", project_id, payload["agent_label"],
-                          time.strftime("%Y-%m-%dT%H", time.gmtime()))
+    # Bucketing this key by the hour made the second run of any hour reuse the
+    # first run's id - including one already completed, which can never be
+    # claimed again. The key exists to make ONE create retry-safe, so it is
+    # per-invocation: the caller passes --idempotency-key to retry the same
+    # create, and omitting it means a genuinely new run.
+    key = args.idempotency_key or idempotency_key(
+        "runcreate", project_id, payload["agent_label"], uuid.uuid4().hex)
     response = request("POST", "/projects/%s/search-runs" % project_id,
                        payload=payload, idempotency_key=key)
     body = response.json if isinstance(response.json, dict) else {}
@@ -890,8 +1253,14 @@ def cmd_run_claim(args):
             emit({"ok": True, "claimed": True, "run_id": run_id,
                   "lease_expires_at": claim["lease_expires_at"]})
             return
-        if response.error_code() not in ("run_already_claimed", ""):
-            die(EXIT_UNAVAILABLE, "claim refused: %s" % response.error_code())
+        code = response.error_code()
+        if code == "run_not_claimable":
+            # Permanent: the run is already completed, failed or cancelled.
+            # Retrying can never resolve it, so it must not look like a 5xx.
+            die(EXIT_CONFLICT, "claim refused: run_not_claimable (the run is no "
+                               "longer claimable; create a new run)")
+        if code not in ("run_already_claimed", ""):
+            die(EXIT_UNAVAILABLE, "claim refused: %s" % code)
         if index == 0:
             holder = _describe_holder(project_id)
     # A peer holding a live lease is normal. Deferred is not a failure and is
@@ -1196,6 +1565,39 @@ def build_parser():
             sub.add_argument("--project", required=True, metavar="UUID")
         return sub
 
+    pair_request = add(
+        "pair-request",
+        "ask Homing for a device code so the user can approve this agent",
+        needs_project=False,
+    )
+    pair_request.add_argument("--label", required=True,
+                              help="what the user will see on the approval card (<=120 chars)")
+    pair_request.add_argument("--note", default="",
+                              help="where this agent runs, in plain words (<=200 chars)")
+    pair_request.add_argument("--cadence", type=int, default=0, metavar="MINUTES",
+                              help="how often this agent expects to run")
+    pair_request.add_argument("--out", required=True, metavar="PATH",
+                              help="0600 JSON: user_code, verification URIs, expires_at, interval")
+    pair_request.add_argument("--device-code-out", required=True, metavar="PATH",
+                              help="0600 file holding the device code alone; keep it out of "
+                                   "any directory the model can read")
+
+    pair_poll = add(
+        "pair-poll",
+        "wait for approval, then put the key in the OS secret store (prints neither secret)",
+        needs_project=False,
+    )
+    pair_poll.add_argument("--device-code-file", required=True, metavar="PATH",
+                           help="the file pair-request wrote; deleted however this ends")
+    pair_poll.add_argument("--store", action="store_true",
+                           help="write the key to the secret store named by HOMING_TOKEN_STORE "
+                                "(default: this platform's store) and verify it by one read")
+    pair_poll.add_argument("--result", default="", metavar="PATH",
+                           help="0600 JSON: paired, error_class, expires_at, scopes - no key")
+    pair_poll.add_argument("--timeout", type=int, default=PAIR_DEFAULT_TIMEOUT, metavar="SECONDS")
+    pair_poll.add_argument("--interval", type=int, default=PAIR_DEFAULT_INTERVAL,
+                           metavar="SECONDS", help="starting poll interval; slow_down raises it")
+
     subparsers.add_parser("projects", help="list every project this key can see")
     add("project", "read one project, its current prompt, and its ETag")
     add("prompt", "read one project's current prompt")
@@ -1209,6 +1611,8 @@ def build_parser():
     create.add_argument("--agent-label", required=True)
     create.add_argument("--input-cursor", default="")
     create.add_argument("--continuation-from-run-id", default="")
+    create.add_argument("--idempotency-key", default="",
+                        help="reuse to retry the SAME create; omit for a new run")
 
     claim = add("run-claim", "claim the run lease; parks and defers if a peer holds it")
     claim.add_argument("--run", required=True, metavar="UUID")
@@ -1248,6 +1652,8 @@ def build_parser():
 
 
 COMMANDS = {
+    "pair-request": cmd_pair_request,
+    "pair-poll": cmd_pair_poll,
     "projects": cmd_projects,
     "project": cmd_project,
     "prompt": cmd_prompt,
@@ -1273,6 +1679,9 @@ def main(argv=None):
         COMMANDS[args.command](args)
     except SystemExit:
         raise
+    except KeyboardInterrupt:
+        # Interrupting pair-poll still runs its finally: the device code is gone.
+        die(EXIT_TEMPFAIL, "interrupted")
     except Exception as exc:  # never let a traceback carry a fragment of the key
         die(EXIT_UNAVAILABLE, "%s: %s" % (type(exc).__name__, exc))
     return EXIT_OK

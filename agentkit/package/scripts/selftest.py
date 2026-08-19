@@ -195,12 +195,32 @@ def parse_mode(value):
         return None
 
 
-def run_quiet(argv, timeout=CMD_TIMEOUT):
+def store_env(manifest):
+    """The key-store variables the generated runner exports.
+
+    Without these the client looks in the platform default, so `api-read`
+    reported "no key stored" on every file / systemd-creds / container-secret
+    install even though the key was present and working.
+    """
+    store = manifest.get("secret_store") or {}
+    env = {}
+    kind = store.get("kind") or ""
+    if kind:
+        env["HOMING_TOKEN_STORE"] = kind
+    if store.get("path"):
+        env["HOMING_TOKEN_FILE"] = store["path"]
+    if store.get("service"):
+        env["HOMING_KEYCHAIN_SERVICE"] = store["service"]
+    return env
+
+
+def run_quiet(argv, timeout=CMD_TIMEOUT, env=None):
     """Run a read-only query. Output is returned for parsing, never printed:
     `launchctl print` and `systemctl show` both dump a job's environment."""
     try:
         proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              stdin=subprocess.DEVNULL, timeout=timeout)
+                              stdin=subprocess.DEVNULL, timeout=timeout,
+                              env=dict(os.environ, **env) if env else None)
     except (OSError, subprocess.SubprocessError):
         return None, 127
     return proc.stdout.decode("utf-8", "replace"), proc.returncode
@@ -918,6 +938,38 @@ def check_token_leak(report, manifest, dirs, skill_dirs, token, token_note):
 # --- check: a scheduled run cannot reach the installer -----------------------
 
 
+PATHISH = re.compile(r"\S*/\S*")
+
+
+def without_paths(line):
+    """Blank out path-like tokens before looking for a model command.
+
+    `~/.claude/skills/...` is a directory, not an invocation of Claude. Matching
+    the word inside a path made the check fail for every Claude Code user, and
+    for anyone whose install path merely contains one of these names.
+    """
+    return PATHISH.sub(" ", line)
+
+
+def strip_comment(line):
+    """Drop a #/;-style trailing comment outside quotes, for reachability scans."""
+    out, quote = [], ""
+    for ch in line:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "'\"":
+            quote = ch
+            out.append(ch)
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out)
+
+
 INSTALLER_MARKERS = re.compile(
     r"homing-setup|install\.py|probe\.sh|probe\.ps1|selftest\.py|"
     r"references/(?:probe|pairing|security|sources|reachability|environments|"
@@ -1020,7 +1072,9 @@ def check_no_reprobe(report, manifest, dirs, skill_dirs):
             continue
         values = shell_vars(text)
         for lineno, line in enumerate(text.splitlines(), 1):
-            match = INSTALLER_MARKERS.search(line)
+            # A comment naming install.py is provenance, not a path a scheduled
+            # run can follow. Matching it failed every correct install.
+            match = INSTALLER_MARKERS.search(strip_comment(line))
             if match:
                 problems.append("%s:%d reaches the installer (%s)"
                                 % (path, lineno, match.group(0)))
@@ -1028,7 +1082,7 @@ def check_no_reprobe(report, manifest, dirs, skill_dirs):
             if danger:
                 problems.append("%s:%d passes %s into an unattended run"
                                 % (path, lineno, danger.group(0)))
-            if depth == 0 and MODEL_INVOCATION.search(line):
+            if depth == 0 and MODEL_INVOCATION.search(without_paths(strip_comment(line))):
                 saw_model_line = True
         if depth == 0 and "JUDGE.md" in text:
             judge_pinned = True
@@ -1147,7 +1201,8 @@ def check_api(report, dirs, manifest, offline):
     if not os.path.isfile(client):
         report.bad("api-read", "The Homing client is not installed at %s." % client)
         return
-    out, code = run_quiet([sys.executable, client, "projects"], timeout=90)
+    out, code = run_quiet([sys.executable, client, "projects"], timeout=90,
+                          env=store_env(manifest))
     if code == 0:
         count = ""
         try:
@@ -1213,7 +1268,9 @@ CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # Fields the schema allows to hold a sentence, and fields allowed to hold a URL
 # (already constrained to the install-time allowlist by whatever wrote them).
 PROSE_ALLOWED = ("summary", "description", "title", "label", "message")
-URL_ALLOWED = ("last_url", "url", "final_url", "source_url", "canonical_url")
+URL_ALLOWED = ("last_url", "url", "final_url", "source_url", "canonical_url",
+               # pairing.json holds the approval links by design
+               "verification_uri", "verification_uri_complete")
 
 
 def free_text(value, key=""):
