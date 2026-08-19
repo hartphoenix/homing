@@ -63,6 +63,14 @@ affirmative machine-readable permission with terms (zumper.com's lists
 `rental_search_assistants`, `listing_content_ttl: 1 days`, required `Source: Zumper.com`
 attribution — VERIFIED). Record and obey them.
 
+**A non-answer is a cooldown, never a retirement.** A robots.txt 4xx is RFC 9309 "unavailable" —
+no restrictions apply, proceed. A 5xx, a network error, or a 200 that is not `text/plain` (a
+challenge page) is a different non-answer, and the runtime's response is the same either way: the
+source goes into a temporary cooldown and is re-probed on a later run. Only a robots.txt that
+actually answers and disallows the path is the publisher's own durable decision — that, or three
+consecutive blocks on the retirement ladder, is what retires a source. A transient failure never
+retires anything by itself; status `ROBOTS-UNAVAILABLE` marks the non-answer, not the verdict.
+
 Identity: default to the browser on this machine (`BROWSER_UA`, checked against robots.txt's `*`
 group) — honest, not spoofing, since it is what this machine's browser would send for a page a
 person is reading a few times a day. `sources.py --ua crawler` sends
@@ -160,7 +168,7 @@ Copy these rows byte-identically into `sources.json`. **V** = VERIFIED 2026-08-1
 | `craigslist-org` | US/intl | robots permissive, sitemap 200, RSS 403 from datacenter egress — ToS discourages automation, so alerts are the routing choice (§2), not a hard block | **inbox** | **V** |
 | `zillow-com` | US | Re-measured 2026-08-17, browser-shaped default client: 200, 580 KB, 38 merged listings (36 carrying a price). The earlier `x-px-blocked: 1` reading was against the crawler token; PerimeterX let the browser-shaped request through untouched. `/api/` still disallowed | sanctioned | **V** |
 | `streeteasy-com` | US | Re-measured 2026-08-17, browser-shaped default client: 200, 1,066 KB, 17 listings, all carrying an address. `/api/` and `/rental/*` still disallowed | sanctioned | **V** |
-| `hotpads-com` | US | robots.txt itself returns 200 with an HTML challenge body, not `text/plain` — RFC 9309 treats that shape as unreachable, not a policy answer. Retired pending re-probe, not fetched | inbox | **V** |
+| `hotpads-com` | US | robots.txt itself returns 200 with an HTML challenge body, not `text/plain` — RFC 9309 treats that shape as unreachable, not a policy answer. A non-answer is a **cooldown**, not a retirement; re-probed on a later run, not fetched now | inbox | **V** |
 | `trulia-com` | US | Measured 2026-08-17, browser-shaped default client: 200, 1,189 KB, 38 JSON-LD listings. robots.txt terms not yet captured | unverified | re-probe for `permitted_by` |
 | `renthop-com` | US | Measured 2026-08-17: real 403, Cloudflare (`cf-mitigated`/`cf-ray`) — an edge block, not a robots.txt shape | inbox | **V** |
 | `apartments-com` | US | 403 Akamai on the robots.txt request itself. Under RFC 9309 §2.3.1 a 4xx there reads as **unavailable** — no restrictions, proceed — so this no longer disqualifies the source by itself; whether the listing page is also Akamai-blocked needs a fresh probe | unverified | re-probe needed |
@@ -206,12 +214,13 @@ a host absent from it is never fetched.
 |---|---|
 | `slug` | §4. Becomes the lead's `source`. |
 | `tier` | `sanctioned` \| `inbox` \| `community` \| `residential` \| `human` |
-| `channel` | `rss` \| `sitemap` \| `json` \| `html` — **exactly these four.** `sources.py` rejects any other value, so a source with `channel: "api"` or `"jsonld"` fails schema validation and never runs. A documented JSON API is `json`; a page carrying JSON-LD is `html` (the extractor reads the structured data out of it). Tiers that are not machine-fetched (`inbox`, `human`) have no entry in this list at all — they reach you by mail or by hand, not through a fetch. |
+| `channel` | `rss` \| `sitemap` \| `json` \| `html` — **exactly these four.** `sources.py` rejects any other value, so a source with `channel: "api"` or `"jsonld"` fails schema validation and never runs. A documented JSON API is `json`; a page carrying JSON-LD is `html` (the extractor reads the structured data out of it). `sitemap` is **discovery-only, by design**: it yields listing URLs and `lastmod` dates and never fetches a detail page, so title, price and location come back empty on every sitemap record — that is not a failure, and nothing should imply richer matching from this channel. Tiers that are not machine-fetched (`inbox`, `human`) have no entry in this list at all — they reach you by mail or by hand, not through a fetch. |
 | `url_template` | Exact URL with `{}` slots. No guessed `/api/` routes — disallowed on zillow, rightmove, zoopla, streeteasy, daft, wg-gesucht, hotpads, zumper (**V** each). |
 | `permitted_by` | The literal granting rule: `robots:Allow /api/sitemap*` · `llms.txt:rental_search_assistants` · `api-key:domain-au` · `user-mailbox` · `tos:default-allow`. **If this cannot be filled with a specific citation, the source is not usable.** |
-| `id_rule` | How `source_listing_id` is extracted: `path_segment:-1` (daft → `6645832`), `feed:guid`, `kyero:<id>`, `reddit:fullname`, `jsonld:@id`. |
+| `id_rule` | How `source_listing_id` is extracted. Exhaustive — `sources.py` rejects anything else as a schema error at load: `path_segment:<i>` / `path:<i>` (negative `<i>` counts from the end, so `path_segment:-1` on daft → `6645832`), `query:<name>`, `feed:guid`, `feed:id`, bare `guid`, `jsonld:@id`, `jsonld:identifier`, `jsonld:sku`, `jsonld:url`, `kyero:<field>` (a named field of the parsed Kyero record — `kyero:id`, `kyero:ref`, never a bare `kyero:<id>` placeholder), `reddit:fullname` (also `reddit:name`, `reddit:id`), or the field left absent, which falls back to whatever the parser already called `native_id`. |
 | `lastmod_path` | `sitemap:lastmod` · `rss:pubDate` · `jsonld:datePosted` · `socrata::updated_at` · `null`. `null` is honest and required — never substitute `first_seen_at`. |
 | `fingerprint` | `{shell_markers: [2–4 strings], listing_selector: "<count rule>", min_ok_bytes: <int>}` — the empty-vs-populated calibration, run once per source at install. |
+| `listing_url_pattern` | A regex a discovered listing URL must match before it is fetched or revalidated (checked alongside the host allowlist — both gates must pass). Required, and must compile, for any source that runs with `--revalidate`; a source with no pattern or an invalid one is a configuration error there, not a silently-skipped check. |
 | `lane` | `<slug>:<channel>`. The unit of worker ownership. |
 | `owner_worker` | Assigned once at install to the worker with the **narrowest** capability that can legitimately serve the lane: `residential` and `email` → local; everything else → cloud if one exists. Two workers never contend, because neither knows how to run the other's lanes. |
 | `egress_class_measured` | `residential` \| `datacenter` \| `unknown` — the class the probe ran in. |

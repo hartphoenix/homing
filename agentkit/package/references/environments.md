@@ -146,8 +146,18 @@ Write and read with the **same binary**. A language keyring library (Python `key
 upgrade changes the signature and the job starts an un-dismissable 3am password-prompt storm
 that "Always Allow" does not fix, because that edits the ACL, not the partition list.
 
-The installer writes `<config>/set-token.sh` (0700, in a 0700 dir) and prints exactly one line
-for the user to run: `bash "<config>/set-token.sh"`. It reads stdin with `IFS= read -rs`, feeds
+The installer writes `<config>/connect.sh` (0700, in a 0700 dir) and prints exactly one line
+for the user to run: `sh "<config>/connect.sh"`. That is the pairing path, and it is the one to
+offer: the user approves a short code in their own browser and the key travels from Homing into
+the keychain without anyone typing or seeing it. The wrapper exports the same
+`HOMING_TOKEN_STORE` / `HOMING_KEYCHAIN_SERVICE` / `HOMING_TOKEN_FILE` values the runner
+exports, then calls `homing.py pair-poll --store`; without that export the key lands in the
+platform default, pairing still reports success because its own verifying read is defaulted the
+same way, and the first scheduled run fails with exit 78.
+
+`<config>/set-token.sh` is still written, and it is the **fallback**, not the default: use it
+only where pairing cannot work — no browser on the machine, or an operator handing over a key
+minted elsewhere. It reads stdin with `stty -echo` + `IFS= read -r`, feeds
 `security add-generic-password -U -a "$USER" -s homing-api-token -w` the value **twice**
 (prompt mode asks twice; every published one-liner that pipes once is wrong), and verifies by
 HTTP status code alone against `__HOMING_ORIGIN__/api/v1/me/projects`. Never `-w <value>` (argv),
@@ -461,7 +471,10 @@ When nothing writable answers — no LaunchAgent dir, no systemd, no Task Schedu
 harness — **do not fake it**. Install the on-demand runner: `homing-check` in the skill
 directory, `run.sh` in the config directory, no scheduler artifact, and one plain sentence:
 *"I couldn't find a way to run this on its own here. I can search whenever you ask — just say
-'check Homing'."* The same applies at isolation rung 0 even when a scheduler exists.
+'check Homing'."*
+
+Isolation rung 0 is **not** this case. A scheduler that exists still gets used at rung 0, once
+the person has said yes — see §8.
 
 Never substitute Claude Code's `/loop` for a scheduler: it is session-scoped, dies with the
 conversation, and a recurring task auto-expires seven days after creation. Claude Code Desktop
@@ -561,8 +574,38 @@ Climb to the highest rung the probe finds, and record which one in `config.json`
 | 6 | Managed harness with network config | Claude Code cloud Routine with Custom network access |
 
 Rung ≥3 → full unattended capability. Rung 1–2 only → keep the wrapper gates, halve the write
-budget, prefer pull sources (feeds, sitemaps, official APIs) over page fetching. Rung 0 → **no
-unattended runner at all**; install the on-demand runner and say so.
+budget, prefer pull sources (feeds, sitemaps, official APIs) over page fetching.
+
+### Rung 0 — one policy, stated once
+
+An ordinary laptop has no sandbox, no egress allowlist and no container, so it reports rung 0.
+That is the machine this product is built for, so **rung 0 does schedule** — but only on a
+decision the person made, never one the installing agent made for them.
+
+`install.py` refuses a rung-0 plan that schedules anything unless the plan carries
+`"unattended_rung0_opt_in": true`, and the refusal names the sentence to say to the person:
+a background search will run on this computer with nothing on the computer limiting what it
+can reach; it cannot delete or restore anything; the part that reads websites holds no account
+key; and it can be stopped from Homing at any time. Say it, get an answer, then set the flag —
+or set `scheduler.kind` to `none` and install the on-demand runner instead. Do not set the flag
+on the person's behalf.
+
+What holds the run at rung 0 is not the OS, and the install report says so in those words:
+
+* the paired token carries no `leads:destroy` scope, and the client has no destructive verb;
+* `sources.py` holds no credential at all, so an untrusted page can never reach one;
+* the model is started with a fixed argument list and gets `JUDGE.md` plus two files — no
+  shell, no network of its own, no credential, no other file on the machine;
+* the runner bounds every run from outside the model: wall clock, memory, largest file, kit
+  calls per run, writes per run, zero deletes;
+* the install writes only into `<config>`, `<state>` and `<logs>`; `bin/` is 0500, the plan and
+  source list are 0400, and the pairing helper's `<config>/private/` is 0700 and named in no
+  config, state or skill file;
+* pause is one command locally and one click in Homing, which works when the machine is off;
+  revocation is in Homing only, and holds even when the machine is out of the person's hands.
+
+The write budget is still halved below rung 3, and feeds are still preferred over page
+fetching. Rung 0 changes who decides, not what the run is allowed to do.
 
 **The honest note about blanket-approval flags.** Some schedulers can only invoke an agent by
 turning every approval off. Never emit `--dangerously-skip-permissions`,

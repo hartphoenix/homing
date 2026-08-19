@@ -141,14 +141,26 @@ verbatim blocks (the black-box paragraph, the four absolute rules).
 
 ## 4. `bin/run.sh` (mode 0500)
 
+**`install.py` generates this file; nobody writes it by hand, and nothing below is a place to
+paste a value into.** Every `{{PLACEHOLDER}}` here arrives *already quoted* for its shell —
+`shlex.quote` for POSIX, a single-quoted literal with the inner quote doubled for PowerShell —
+which is why the placeholders below carry no quotes of their own. Adding quotes around one, or
+splicing a value in by hand, is how a path with a space or an apostrophe becomes syntax. There
+is exactly one quoting routine per platform and it lives in `install.py`.
+
 ```sh
 #!/bin/sh
 # Homing runtime. Deterministic. Contains no key. Never add `set -x`.
 set -eu
 umask 077
 ulimit -c 0
-CONFIG="{{CONFIG}}"; STATE="{{STATE}}"; LOGS="{{LOGS}}"; WORK="$STATE/work"
-BIN="$CONFIG/bin"; NONCE=$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  Darwin) : ;;                                  # -v caps address space, not memory
+  *) ulimit -v {{MEMORY_KB}} 2>/dev/null || true ;;
+esac
+ulimit -f {{OUTPUT_BLOCKS}} 2>/dev/null || true  # largest single file this run may write
+CONFIG={{CONFIG}}; STATE={{STATE}}; LOGS={{LOGS}}; WORK="$STATE/work"
+BIN="$CONFIG/bin"; PY={{PYTHON}}; NONCE=$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy
 
 [ "${1:-}" = "--help" ] && { echo "usage: run.sh [--help]  # one Homing search cycle"; exit 0; }
@@ -173,14 +185,25 @@ run_bounded() { s="$1"; shift
   if command -v gtimeout >/dev/null 2>&1; then gtimeout -k 30 "$s" "$@"; return $?; fi
   perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
 
+# One clock over the whole run, not only over each phase.
+DEADLINE=$(( $(date +%s) + {{WALL_CLOCK}} ))
+before_deadline() {
+  [ "$(date +%s)" -lt "$DEADLINE" ] && return 0
+  echo "stopped at the {{WALL_CLOCK}}-second bound before $1" >&2; return 142; }
+
+# The runner sequences four phases of bin/cycle.py and nothing else. cycle.py is
+# the only caller of homing.py and sources.py, so their flags live in one file
+# instead of in a shell script that drifts away from them.
 phases() {
   rm -rf "$WORK"; mkdir -p "$WORK" || return 70
-  run_bounded 120 "$BIN/homing.py" drain-parked --state "$STATE"          || return $?
-  run_bounded 120 "$BIN/homing.py" read --state "$STATE" --out "$WORK"    || return $?  # 3 = paused
-  run_bounded 420 "$BIN/sources.py" fetch --config "$CONFIG/sources.json" \
-      --state "$STATE" --lanes "{{LANES}}" --nonce "$NONCE" --out "$WORK" || return $?
-  run_bounded 180 {{MODEL_INVOCATION}}                                    || return $?  # JUDGE.md only
-  run_bounded 180 "$BIN/homing.py" write --state "$STATE" --in "$WORK"    || return $?
+  run_bounded 120 "$PY" "$BIN/cycle.py" --config "$CONFIG/config.json" drain  || return $?
+  before_deadline read   || return $?
+  run_bounded 120 "$PY" "$BIN/cycle.py" --config "$CONFIG/config.json" read   || return $?  # 3 = paused
+  before_deadline search || return $?
+  run_bounded 420 "$PY" "$BIN/cycle.py" --config "$CONFIG/config.json" search || return $?
+  before_deadline scoring || return $?
+{{MODEL_PHASE}}  before_deadline write || return $?
+  run_bounded 180 "$PY" "$BIN/cycle.py" --config "$CONFIG/config.json" write  || return $?
 }
 
 # The pipeline's status is redact's, not the run's, so carry the code out through a file.
@@ -190,19 +213,47 @@ rc=$(cat "$RC" 2>/dev/null || echo 70); rm -f "$RC"
 exit "$rc"
 ```
 
-`{{MODEL_INVOCATION}}` is the runtime's non-interactive form with its **least-privilege**
-approval mode and the judge prompt — e.g.
-`claude --bare -p --permission-mode dontAsk --max-budget-usd 0.50 --append-system-prompt-file
-"{{SKILL_DIR}}/JUDGE.md"`. Never a flag containing "dangerous", "yolo", "bypass" or
-"skip-permissions"; if that is the only unattended form the runtime offers, do not schedule it.
+### The model command is a list, never a command line
 
-`homing.py` reads the key itself, at call time, from the OS store. `run.sh` never touches it.
+`{{MODEL_PHASE}}` expands to one `run_bounded {{MODEL_SECONDS}} <argv...>` line, or to nothing
+at all when no model runs unattended here. The plan supplies it as **`runtime.invocation_argv`,
+a list with one entry per argument**:
+
+```json
+"runtime": {"kind": "claude-code",
+            "invocation_argv": ["claude", "--bare", "-p",
+                                "--permission-mode", "dontAsk",
+                                "--max-budget-usd", "0.50",
+                                "--append-system-prompt-file", "{{SKILL_DIR}}/JUDGE.md"]}
+```
+
+Each entry is rendered through the platform quoter, so an entry containing `;`, `&&`, `|`,
+a backtick, `$(...)`, `${...}`, `%VAR%`, a quote, a space or a newline reaches the program as
+**data** and can never become syntax. Nothing anywhere reassembles these into a string.
+
+`runtime.invocation` (one string) is still read for older plans, and only that: it is parsed
+with `shlex.split`, and if any word it produces carries shell syntax — an operator, a
+redirection, a substitution, a backslash, a control character, or quoting that will not parse —
+the install **stops** with a plain-language refusal naming the character. It is never repaired,
+re-quoted or reinterpreted, because both repairs are wrong: quoting the whole thing runs
+something the person did not ask for, and dropping the syntax runs less than they asked for.
+
+Never a flag containing "dangerous", "yolo", "bypass" or "skip-permissions"; if that is the only
+unattended form the runtime offers, do not schedule it. That check is a second line — the first
+is that no command line is ever assembled.
+
+The model gets `JUDGE.md` and two files in `<state>/work/`. It gets no shell, no network of its
+own, no credential and no other file on the machine, and it is killed at `{{MODEL_SECONDS}}`
+seconds. `homing.py` reads the key itself, at call time, from the OS store; `run.sh` never
+touches it, and no key is ever in an argument or an environment value — only the *name* of the
+store is.
 
 ## 5. `bin\run.ps1` (Windows equivalent)
 
 ```powershell
 $ErrorActionPreference='Stop'
-$Config='{{CONFIG}}'; $State='{{STATE}}'; $Logs='{{LOGS}}'; $Work=Join-Path $State 'work'
+$Config={{CONFIG}}; $State={{STATE}}; $Logs={{LOGS}}; $Work=Join-Path $State 'work'
+$Py={{PYTHON}}; $Bin=Join-Path $Config 'bin'
 $Lock=Join-Path $State 'run.lock'
 try { $d=New-Item -ItemType Directory -Path $Lock -ErrorAction Stop }
 catch {
@@ -215,17 +266,27 @@ $Log = Join-Path $Logs ("run-{0}.log" -f (Get-Date -f 'yyyyMMdd-HHmmss'))
 Get-ChildItem $Logs -Filter 'run-*.log' | Where LastWriteTime -lt (Get-Date).AddDays(-14) | Remove-Item
 try {
   Remove-Item -Recurse -Force $Work -EA SilentlyContinue; New-Item -ItemType Directory $Work | Out-Null
-  & py "$Config\bin\homing.py" drain-parked --state $State  *>&1 | Tee-Object -Append $Log
-  & py "$Config\bin\homing.py" read  --state $State --out $Work *>&1 | Tee-Object -Append $Log
-  & py "$Config\bin\sources.py" fetch --config "$Config\sources.json" --state $State `
-       --lanes '{{LANES}}' --out $Work *>&1 | Tee-Object -Append $Log
-  {{MODEL_INVOCATION}}                                        *>&1 | Tee-Object -Append $Log
-  & py "$Config\bin\homing.py" write --state $State --in $Work *>&1 | Tee-Object -Append $Log
+  foreach ($phase in @('drain','read','search')) {
+    & $Py (Join-Path $Bin 'cycle.py') --config (Join-Path $Config 'config.json') $phase `
+      *>&1 | Redact | Tee-Object -Append $Log
+    if ($LASTEXITCODE -ne 0) { $rc = $LASTEXITCODE; throw "phase $phase exited $rc" }
+  }
+{{MODEL_PHASE_PS}}  & $Py (Join-Path $Bin 'cycle.py') --config (Join-Path $Config 'config.json') write `
+    *>&1 | Redact | Tee-Object -Append $Log
 } finally { Remove-Item -Recurse -Force $Lock,$Work -EA SilentlyContinue }
 ```
 
-The 20-minute bound comes from the task's `-ExecutionTimeLimit`, not from the script.
-Redact before `Tee-Object` with the same three patterns as `redact()` above.
+`{{MODEL_PHASE_PS}}` expands to `Invoke-Bounded {{MODEL_SECONDS}} @('claude', '-p', ...)` — the
+same argument list, each entry a PowerShell single-quoted literal with the inner quote doubled,
+which expands nothing at all: not a variable, not a subexpression, not a backtick escape.
+`Invoke-Bounded` starts the process with an argument **array**, so no command line is assembled
+here and `cmd.exe` is never involved; it polls, and kills the process at the time bound (142) or
+the working-set bound (70). Never `Invoke-Expression`, never `iex`, never a double-quoted string
+holding a value.
+
+The outer 20-minute bound comes from the task's `-ExecutionTimeLimit` as well as from the
+script's own deadline. Redact before `Tee-Object` with the same three patterns as `redact()`
+above.
 
 ## 6. `config.json` (mode 0400) — decisions, never secrets
 
@@ -235,7 +296,9 @@ Redact before `Tee-Object` with the same three patterns as `redact()` above.
   "api_base_url": "__HOMING_ORIGIN__/api/v1",
   "installed_version": {{PKG_VERSION}},
   "worker": {"label": "homing/{{ROLE}}-{{MACHINE_SLUG}}", "role": "{{ROLE}}"},
-  "runtime": {"kind": "{{RUNTIME}}", "invocation": "{{MODEL_INVOCATION}}"},
+  "runtime": {"kind": "{{RUNTIME}}",
+              "invocation_argv": ["claude", "-p", "--permission-mode", "dontAsk"],
+              "invocation": "claude -p --permission-mode dontAsk"},
   "secret_store": {"kind": "keychain|systemd-creds|dpapi|file|container-secret",
                    "service": "homing-api-token"},
   "scheduler": {"kind": "launchd|systemd-user|schtasks|container-loop|routine|none",
@@ -243,9 +306,11 @@ Redact before `Tee-Object` with the same three patterns as `redact()` above.
   "paths": {"config": "{{CONFIG}}", "state": "{{STATE}}", "logs": "{{LOGS}}",
             "skill": "{{SKILL_DIR}}"},
   "isolation_rung": 3,
+  "unattended_rung0_opt_in": false,
   "limits": {"leads_per_batch": 100, "pages_per_source": 3, "candidates_per_project": 40,
              "writes_per_run": 120, "destroys_per_run": 0, "max_page_bytes": 200000,
-             "wall_clock_seconds": 720},
+             "wall_clock_seconds": 720, "model_seconds": 180, "memory_mb": 2048,
+             "max_output_bytes": 4000000, "requests_per_run": 200},
   "lanes_owned": ["daft:sitemap", "listingsproject:rss"]
 }
 ```
@@ -293,6 +358,44 @@ check. The effective host is re-checked after **every** redirect hop.
 ≤120 write calls · **0 destructive calls** · skip any page over 200 KB as `skipped: oversize` ·
 heartbeat only if the write phase exceeds 4 minutes · wall clock ≤12 minutes, then mark the run
 `failed` with `summary: timeout`.
+
+Four of these are enforced by the generated runner and `cycle.py`, from outside whatever they
+are bounding, and they are what "unattended" rests on at every rung:
+
+| Bound | Where it is enforced | Default |
+|---|---|---|
+| Time, per phase | `run_bounded` (`timeout`/`gtimeout`/`perl alarm`) | 120 / 120 / 420 / 180 s |
+| Time, per run | `before_deadline` between phases; `Test-Deadline` on Windows | `wall_clock_seconds`, 720 |
+| Time, the model | `run_bounded` / `Invoke-Bounded` around the argv | `model_seconds`, 180 |
+| Memory | `ulimit -v` (skipped on macOS, where it caps address space); working-set poll on Windows | `memory_mb`, 2048 |
+| Output | `ulimit -f`, largest single file the run may write | `max_output_bytes`, 4 MB |
+| Requests | one counter in `cycle.py` over every `homing.py`/`sources.py` call | `requests_per_run`, 200 |
+| Writes | `homing.py`'s own write budget | `writes_per_run`, 120 (halved below rung 3) |
+
+## 8a. Completion is not local state
+
+`cycle.py` never records a run as finished on its own authority. `run-complete`'s status is
+read, and the five answers are five different actions:
+
+| Answer | What it means | What happens |
+|---|---|---|
+| success | Homing acknowledged it | payload and claim deleted; counted as done |
+| retryable (429, 5xx, timeout, local) | the moment, not the state | up to 3 tries in-run with backoff, then left for the next run |
+| expired lease (410) | the lease is gone | stop retrying; keep the payload, drop the stale claim |
+| conflict (409) | the run is no longer ours | stop retrying; keep the payload for a person to see |
+| unauthorized (401/403/no key) | the key is refused or revoked | stop the whole cycle immediately |
+
+An unacknowledged completion is written to `<state>/pending-complete/<run>.json`, with a copy of
+its claim beside it at mode 0600 — the work directory is wiped by every run, so without that
+copy no later attempt could close the run at all. The next run replays it **before** it searches
+anything, because the project stays locked behind a live lease. Replays are idempotent
+(`homing.py` sends an idempotency key derived from the run) and bounded (6 attempts across runs,
+then the record is marked for a person). `install.py --uninstall` closes every pending
+completion as well as any in-flight claim, so uninstalling never strands a lease.
+
+Pause and revocation both stop future work by this path: a paused project exits 3 at the read
+phase, and a revoked key turns every call — including a completion replay — into 401, which
+ends the cycle rather than looping.
 
 ## 9. Token budget, per run
 

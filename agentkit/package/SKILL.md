@@ -16,7 +16,6 @@ metadata:
   runtime-skill: homing-check
   origin: __HOMING_ORIGIN__
   api-base: __HOMING_ORIGIN__/api/v1
-allowed-tools: Read Write Bash(${CLAUDE_SKILL_DIR}/scripts/*)
 ---
 
 # homing-setup
@@ -192,7 +191,30 @@ rung → scheduler → secret store → install paths → how the model gets inv
 |---|---|---|
 | 3 or higher | Egress allowlist enforced outside the model — sandbox with an allowed-domain list, container with an egress proxy, managed cloud harness with network config | Full unattended install |
 | 1–2 | Narrow tool surface and restricted working directory, no enforced egress | Reduced: keep the wrapper gates, halve the write budget, prefer feeds, sitemaps and APIs over fetching pages |
-| 0 | Blanket approval only, no isolation | **Do not install an unattended runner.** Install on-demand and say so in one plain sentence. |
+| 0 | No sandbox, no egress allowlist, no container — an ordinary machine, which is the machine this product is built for | Still schedules — see below — but only once the *person*, never the installing agent, has said yes to it |
+
+### Rung 0 — one policy, stated once
+
+Rung 0 is not a stop condition by itself. Refusing to schedule on an ordinary, unsandboxed
+laptop would mean refusing to install the product on the machine it exists for. What holds the
+run at rung 0 does not come from the OS — it comes from everything else this kit already does:
+the paired token carries no `leads:destroy` scope, so nothing can trash or restore; `sources.py`
+holds no credential at all, so a hostile page can never reach one; the model is started with a
+fixed argument list and sees only `JUDGE.md` plus two files — no shell, no network of its own,
+no other file on the machine; and the runner bounds wall clock, memory, and writes per run from
+outside the model entirely.
+
+`install.py` will refuse a rung-0 plan that schedules anything unless the plan carries
+`"unattended_rung0_opt_in": true`. Get that opt-in yourself, out loud, before you ever set it —
+say this, in your own words, and wait for an answer:
+
+> A background search will run on this computer with nothing on the computer limiting what it
+> can reach. It cannot delete or restore anything. The part that reads websites holds no account
+> key. And it can be stopped from Homing at any time.
+
+A "yes" sets the flag. A "no" — or silence — means `scheduler.kind: "none"` and the on-demand
+runner instead; never schedule on the person's behalf because refusing felt unhelpful. The write
+budget is still halved below rung 3 either way, and feeds are still preferred over page fetching.
 
 **D5b — durable scheduler present *and* its directory writable?**
 
@@ -340,10 +362,51 @@ Halt and tell the person plainly. Do not improvise around any of these.
 
 | Condition | What you do |
 |---|---|
-| No durable scheduler **and** no isolation (rung 0) | Install on-demand only and say so in one sentence. This is the right call, not a failure — do not install an unattended runner because the person says it is fine. |
+| No durable scheduler anywhere the probe looked | Install on-demand only and say so in one plain sentence. This is the right call, not a failure. |
+| Rung 0, and the person has not yet said yes to unattended scheduling | Ask them the rung-0 sentence (Phase 5) before scheduling anything. A "yes" sets `unattended_rung0_opt_in`; anything else means on-demand only — never set that flag on the person's behalf. |
 | The only unattended option needs a "dangerous", "yolo", "bypass" or "skip-permissions" flag | Do not schedule. Degrade to on-demand. |
 | No secure place to keep the key | Say it plainly, offer on-demand where nothing is stored, and let the person choose. Never write a key to an ordinary file. |
 | A prior install exists | Repair, upgrade, or remove it. Never create a second. |
 | A source blocks you | Try the legitimate alternatives first — feed, sitemap, email alerts — then change the source. Never CAPTCHA-bypass, proxy rotation, or cookie replay. |
 | A fourth question appears | Take the safer default; mention it in the report. |
 | Anything else in this file says "stop" | Stop. Report in the person's words. Do not improvise around it. |
+
+---
+
+## Supported environments and hosts
+
+This file is agent-neutral: the frontmatter above draws only from the six portable Agent Skills
+fields (`name`, `description`, `license`, `compatibility`, `metadata`, `allowed-tools`) and
+carries no Claude-specific key or variable — it does not need `allowed-tools` at all, so that
+field is simply absent rather than filled with a Claude-only value. `install.py` adds a
+**second**, Claude-Code-specific frontmatter block to the *generated* `homing-check` skill —
+never to this file — because that copy is loaded inside a live Claude session and needs Claude's
+own tool-scoping syntax there. See `references/runtime-template.md`.
+
+**Status legend.** Tested = an automated test in this repository's suite exercises it. Untested =
+implemented and documented, but nothing in the suite runs it. Unsupported = this kit cannot do
+its job here at all.
+
+| Agent environment | Status | Discovery / install | Invokes the CLI as | Agent-readable state | Kept off credential state |
+|---|---|---|---|---|---|
+| Claude Code (CLI or desktop, local session) | Untested | Fetches `/agent/`, follows this file; the generated skill is symlinked into `~/.claude/skills` (canonical copy in `~/.agents/skills`) | `homing.py` / `sources.py` / `install.py` run as black-box subprocesses through its Bash tool | `config.json`, `sources.json`, `<state>/*.json` — none secret | The pairing helper's private device-code file lives outside every directory this skill or the model reads; the key never reaches argv, an env value, or a file this agent opens |
+| Codex CLI, Gemini CLI, Cursor, GitHub Copilot CLI, OpenCode | Untested | Read `~/.agents/skills` natively, no symlink needed | Same subprocess pattern | Same | Same |
+| Claude Code cloud Routine | Untested | Loads only account-level skills plus the cloned repo's `.claude/skills/` — no local filesystem, no `~/.agents/skills` | Same subprocess pattern, inside the managed sandbox | Files inside that sandbox's own working tree | Same invariants, plus: the secret needs a **dedicated** cloud environment (not a shared Team one), and the Homing host must be added to Custom network access or every call 403s while the run still shows green |
+| A fetch tool with no shell (Ladder C / decision **D1** in this file) | Untested, reduced scope | Reads this file in place, paraphrased | Cannot run anything in `scripts/` at all | Nothing generated | No pairing helper can run either — falls straight to the manual access-key path, said out loud as the second choice it is |
+| An agent with no way to fetch a URL at all | Unsupported | `index.md` tells it to ask the person to open `/agent/` themselves | — | — | — |
+
+| Host | Scheduler | Secret store | Status |
+|---|---|---|---|
+| macOS | LaunchAgent, `launchctl bootstrap` | `/usr/bin/security` (Keychain) | **Untested on real hardware** — nothing in CI runs `launchctl` or writes a Keychain item; `environments.md` marks several of these commands `[unverified]`. |
+| Linux | systemd **user** timer, cron fallback | `systemd-creds`; `secret-tool` exists but only for the interactive, non-scheduled path | Untested on real hardware. |
+| Windows | `Register-ScheduledTask` | DPAPI (`ConvertTo/From-SecureString`) | Untested on real hardware; the S4U + DPAPI interaction `environments.md` describes is explicitly unverified. |
+| Any POSIX host, `HOMING_TOKEN_STORE=file` | n/a | A 0600 file under `umask 077` | **Tested** — the backend this repository's pairing test suite actually runs against. |
+| Always-on container / supervisor loop, GitHub Actions | Its own loop, or `schedule:` + `workflow_dispatch:` | Mounted secret file / Actions secret | Untested. |
+| Nothing durable found | On-demand only | Whichever store the row above uses | The on-demand path itself is covered by the pairing tests; no scheduler risk applies here. |
+
+Python 3.9+ is the documented floor for every shipped script (`homing.py`, `sources.py`,
+`install.py`, `selftest.py`, and `probe.sh`'s Python fallback), because each runs on whatever
+interpreter the target machine already has rather than a pinned one. No claim above says a real
+agent has completed this install end to end on real hardware — that integration test does not
+exist yet. Say so if asked, and prefer the file secret store plus an on-demand run when verifying
+a fresh environment by hand.
