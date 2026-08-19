@@ -914,7 +914,8 @@ class Plan(object):
         if self.windows:
             model_ps = ""
             if self.invocation_argv:
-                model_ps = ("  Invoke-Bounded %d @(%s) | Redact | Tee-Object -Append $Log\n"
+                model_ps = ("  Invoke-Bounded %d @(%s) $Judge | Redact | "
+                            "Tee-Object -Append $Log\n"
                             % (self.limits["model_seconds"],
                                ", ".join(ps_quote(part, "model command argument")
                                          for part in self.invocation_argv)))
@@ -923,6 +924,8 @@ class Plan(object):
                     .replace("{{CONFIG}}", ps_quote(self.config_dir, "config folder"))
                     .replace("{{STATE}}", ps_quote(self.state_dir, "state folder"))
                     .replace("{{LOGS}}", ps_quote(self.logs_dir, "logs folder"))
+                    .replace("{{JUDGE}}", ps_quote(
+                        self.join(self.skill_dir, "JUDGE.md"), "judge prompt path"))
                     .replace("{{PYTHON}}", ps_quote(self.python, "python program"))
                     .replace("{{STORE_ENV}}", self.store_env())
                     .replace("{{MEMORY_MB}}", str(self.limits["memory_mb"]))
@@ -931,13 +934,15 @@ class Plan(object):
         if self.invocation_argv:
             # JUDGE.md only: no key in argv or environment, no network of its own,
             # and a wall clock outside the model's control.
-            model_line = ("  run_bounded %d %s || return $?\n"
+            model_line = ("  run_bounded %d %s < \"$JUDGE\" || return $?\n"
                           % (self.limits["model_seconds"],
                              posix_argv(self.invocation_argv, "model command argument")))
         return (RUN_SH_TEMPLATE
                 .replace("{{CONFIG}}", posix_quote(self.config_dir, "config folder"))
                 .replace("{{STATE}}", posix_quote(self.state_dir, "state folder"))
                 .replace("{{LOGS}}", posix_quote(self.logs_dir, "logs folder"))
+                .replace("{{JUDGE}}", posix_quote(
+                    self.join(self.skill_dir, "JUDGE.md"), "judge prompt path"))
                 .replace("{{PYTHON}}", posix_quote(self.python, "python program"))
                 .replace("{{STORE_ENV}}", self.store_env())
                 .replace("{{MODEL_PHASE}}", model_line)
@@ -1939,6 +1944,7 @@ case "$(uname -s 2>/dev/null || echo unknown)" in
 esac
 ulimit -f {{OUTPUT_BLOCKS}} 2>/dev/null || true
 CONFIG={{CONFIG}}; STATE={{STATE}}; LOGS={{LOGS}}; WORK="$STATE/work"
+JUDGE={{JUDGE}}
 BIN="$CONFIG/bin"; PY={{PYTHON}}
 NONCE=$(od -An -tx1 -N8 /dev/urandom 2>/dev/null | tr -d ' \\n')
 [ -n "$NONCE" ] || NONCE="$(date +%s)$$"
@@ -2007,7 +2013,7 @@ RUN_PS1_TEMPLATE = """# Homing runtime. Deterministic. Contains no key.
 # backtick. Do not add quotes around one and do not hand-edit a value in.
 $ErrorActionPreference = 'Stop'
 if ($args -contains '--help') { 'usage: run.ps1 [--help]  # one Homing search cycle'; exit 0 }
-$Config = {{CONFIG}}; $State = {{STATE}}; $Logs = {{LOGS}}
+$Config = {{CONFIG}}; $State = {{STATE}}; $Logs = {{LOGS}}; $Judge = {{JUDGE}}
 $Work = Join-Path $State 'work'; $Bin = Join-Path $Config 'bin'; $Py = {{PYTHON}}
 $Deadline = (Get-Date).AddSeconds({{WALL_CLOCK}})
 $MemoryMb = {{MEMORY_MB}}
@@ -2036,11 +2042,12 @@ function Redact { process {
 # arguments are passed as an array, so no command line is ever assembled here and
 # no shell is involved - cmd.exe never sees any of it.
 function Invoke-Bounded {
-  param([int]$Seconds, [string[]]$Cmd)
+  param([int]$Seconds, [string[]]$Cmd, [string]$PromptPath)
   $out = Join-Path $Work 'model-out.txt'; $err = Join-Path $Work 'model-err.txt'
   $rest = @(); if ($Cmd.Count -gt 1) { $rest = $Cmd[1..($Cmd.Count - 1)] }
   $proc = Start-Process -FilePath $Cmd[0] -ArgumentList $rest -NoNewWindow -PassThru `
-            -WorkingDirectory $Work -RedirectStandardOutput $out -RedirectStandardError $err
+            -WorkingDirectory $Work -RedirectStandardInput $PromptPath `
+            -RedirectStandardOutput $out -RedirectStandardError $err
   $stop = (Get-Date).AddSeconds($Seconds)
   while (-not $proc.HasExited) {
     if ((Get-Date) -gt $stop) { $proc.Kill(); $script:rc = 142; 'the scoring step timed out'; break }

@@ -390,6 +390,31 @@ class GeneratedRunnerTests(InstallerCase):
         with open(python_record) as handle:
             self.assertIn("drain", handle.read())
 
+    def test_the_model_receives_exactly_judge_md_on_stdin(self):
+        python, _record = self.stub_python()
+        model = self.path("stdin-model")
+        stdin_record = self.path("stub", "model-stdin.bin")
+        os.makedirs(self.path("stub"), exist_ok=True)
+        with open(model, "w") as handle:
+            handle.write(
+                "#!%s\n"
+                "import pathlib, sys\n"
+                "pathlib.Path(%r).write_bytes(sys.stdin.buffer.read())\n"
+                % (sys.executable, stdin_record))
+        os.chmod(model, 0o700)
+        plan, _manifest = self.apply(self.plan_config(
+            python=python,
+            runtime={"kind": "claude-code", "invocation_argv": [model]}))
+
+        result = subprocess.run(["sh", plan.run_path], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=120)
+        self.assertEqual(result.returncode, 0,
+                         (result.stdout or b"").decode("utf-8", "replace"))
+        with open(os.path.join(plan.skill_dir, "JUDGE.md"), "rb") as handle:
+            expected = handle.read()
+        with open(stdin_record, "rb") as handle:
+            self.assertEqual(handle.read(), expected)
+
     def test_no_process_other_than_the_stubs_is_started(self):
         """A payload that would spawn something leaves no trace of having spawned it."""
         python, _record = self.stub_python()
@@ -503,6 +528,8 @@ class WindowsRenderingTests(InstallerCase):
         self.assertIn("Invoke-Bounded", runner)
         self.assertNotIn("Invoke-Expression", runner)
         self.assertNotIn("iex ", runner)
+        self.assertIn("-RedirectStandardInput $PromptPath", runner)
+        self.assertIn("$Judge", runner)
         for payload in SHELL_PAYLOADS[:20]:
             with self.subTest(payload=payload[:40]):
                 self.assertIn(install.ps_quote(payload), runner)
