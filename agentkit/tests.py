@@ -863,3 +863,17 @@ class KeychainWriteIsProvenNotAssumed(SimpleTestCase):
     def test_timeout_sentinel_is_not_a_plausible_exit_code(self):
         self.assertEqual(self.homing.EXIT_STORE_PROMPTED, 79)
         self.assertNotEqual(self.homing.EXIT_STORE_PROMPTED, 62)
+
+    def test_the_helpers_own_error_is_kept_and_redacted(self):
+        """Three real failures reported only an exit number.
+
+        `security` explained itself every time and the explanation went to
+        /dev/null, so each round of debugging was a guess. It is captured now,
+        and scrubbed, because the text can quote the key back at us.
+        """
+        self.homing.REDACTOR.add("SECRET-KEY-VALUE")
+        code = self.homing._feed_quiet(
+            ["/bin/sh", "-c", "echo 'refused: SECRET-KEY-VALUE bad'; exit 3"], "x")
+        self.assertEqual(code, 3)
+        self.assertIn("refused", self.homing.STORE_DIAGNOSTIC)
+        self.assertNotIn("SECRET-KEY-VALUE", self.homing.STORE_DIAGNOSTIC)

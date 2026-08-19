@@ -889,17 +889,31 @@ def _remove_quietly(path):
         pass
 
 
+STORE_DIAGNOSTIC = ""
+
+
 def _feed_quiet(argv, text, timeout=30, new_session=False):
-    """Run a store helper with the secret on stdin. Nothing it says is captured."""
+    """Run a store helper with the secret on stdin.
+
+    Its output is captured rather than discarded, then run through the redactor
+    and kept for the failure message. Sending it to /dev/null meant three real
+    failures in a row reported only an exit number, and the helper's own
+    explanation - which said exactly what was wrong each time - was thrown away.
+    """
+    global STORE_DIAGNOSTIC
     try:
         proc = subprocess.run(
             argv,
             input=text.encode("utf-8"),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             timeout=timeout,
             start_new_session=new_session,
         )
+        said = (proc.stdout or b"").decode("utf-8", "replace").strip()
+        if said:
+            # REDACTOR holds the key; this can never echo it back into a log.
+            STORE_DIAGNOSTIC = REDACTOR.scrub(said)[:400]
     except FileNotFoundError:
         return 127
     except subprocess.TimeoutExpired:
@@ -1183,10 +1197,11 @@ def _pair_finish(args, response, result):
             die(EXIT_CONFIG,
                 "the %s store helper is not installed on this machine. Use "
                 "HOMING_TOKEN_STORE=file with HOMING_TOKEN_FILE instead." % store)
+        detail = (" It said: %s" % STORE_DIAGNOSTIC) if STORE_DIAGNOSTIC else ""
         die(EXIT_CONFIG,
             "the %s store refused the key (exit %s). The pairing succeeded, so approving "
-            "again will not help; fix the store, then run the connect helper again."
-            % (store, status))
+            "again will not help; fix the store, then run the connect helper again.%s"
+            % (store, status, detail))
 
     verified = _verify_stored_key()
     if not verified:
