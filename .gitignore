@@ -20,3 +20,4 @@ media/
 *.sql
 
 /docs/private/
+.build-logs/
