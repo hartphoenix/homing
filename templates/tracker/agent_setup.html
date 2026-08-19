@@ -2,6 +2,17 @@
 {% block title %}Your search assistant · Homing{% endblock %}
 {% block content %}
 
+{% if source_plan_review_count %}
+<section class="panel source-review-panel" aria-labelledby="source-review-heading">
+  <p class="eyebrow">Source plan review</p>
+  <h2 id="source-review-heading">Your assistant needs to review the existing setup</h2>
+  <p>Homing flagged {{ source_plan_review_count }} active search{{ source_plan_review_count|pluralize }} for review. The assistant will inspect the existing installation and repair it only when needed.</p>
+  <p class="form-help">Copy this server-authored instruction and paste it into the assistant that manages your search.</p>
+  <p class="agent-actions"><button type="button" class="button button-primary" data-copy data-copy-source="source-review-prompt" aria-live="polite">Copy the repair prompt</button></p>
+  <details class="prompt-preview"><summary>See what it says</summary><label class="sr-only" for="source-review-prompt">The repair prompt for your assistant</label><textarea id="source-review-prompt" readonly rows="12">{{ source_review_prompt }}</textarea></details>
+</section>
+{% endif %}
+
 {% if state == 'new' %}
 <div class="page-heading agent-heading"><div><p class="eyebrow">Your assistant</p><h1>Let an assistant do the searching</h1><p class="muted">Give your AI assistant this instruction once. It will set itself up, ask you to approve the connection, then keep checking for new places on its own.</p></div></div>
 

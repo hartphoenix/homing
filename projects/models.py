@@ -281,6 +281,59 @@ class ProjectChange(models.Model):
         indexes = [models.Index(fields=("project", "created_at"))]
 
 
+class SourcePlanReview(models.Model):
+    """Per-user assertion that an installed source plan needs review.
+
+    This is deliberately a small state machine.  It contains no prompt,
+    source, listing, or agent-authored text; the prompt remains server state
+    and the local installation remains outside Homing's visibility.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        RESOLVED = "resolved", "Resolved"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="source_plan_reviews")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="source_plan_reviews"
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.OPEN)
+    observed_prompt_revision = models.PositiveIntegerField(default=0)
+    resolved_prompt_revision = models.PositiveIntegerField(null=True, blank=True)
+    reporting_agent_token = models.ForeignKey(
+        "accounts.AgentToken",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reported_source_plan_reviews",
+    )
+    resolving_agent_token = models.ForeignKey(
+        "accounts.AgentToken",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="resolved_source_plan_reviews",
+    )
+    opened_at = models.DateTimeField(auto_now_add=True)
+    last_reported_at = models.DateTimeField(default=timezone.now)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-last_reported_at", "-opened_at", "-id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("user", "project"),
+                condition=models.Q(status="open"),
+                name="projects_sourceplanreview_open_user_project_uniq",
+            )
+        ]
+        indexes = [
+            models.Index(fields=("user", "status", "last_reported_at")),
+            models.Index(fields=("project", "status")),
+        ]
+
+
 class AuditEvent(models.Model):
     project = models.ForeignKey(Project, null=True, blank=True, on_delete=models.CASCADE, related_name="audit_events")
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="audit_events")

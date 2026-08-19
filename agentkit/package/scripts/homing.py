@@ -787,6 +787,69 @@ def sanitize_cursor(value):
     return text, 0
 
 
+SOURCE_REVIEW_STATUSES = ("open", "resolved")
+SOURCE_REVIEW_KEYS = {
+    "id", "project_id", "status", "observed_prompt_revision",
+    "resolved_prompt_revision", "opened_at", "last_reported_at", "resolved_at",
+}
+
+
+def source_review_revision(value, label="prompt_revision"):
+    """Validate the wire integer without allowing bool/int coercion."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        die(EXIT_VALIDATION, "%s is not an integer" % label)
+    if value < 0 or value > 2147483647:
+        die(EXIT_VALIDATION, "%s is outside the database range" % label)
+    return value
+
+
+def validate_source_review(value):
+    """Validate and normalize the closed review response before using it."""
+    if not isinstance(value, dict):
+        die(EXIT_VALIDATION, "source-plan review response is not an object")
+    unknown = set(value) - SOURCE_REVIEW_KEYS
+    missing = SOURCE_REVIEW_KEYS - set(value)
+    if unknown or missing:
+        die(EXIT_VALIDATION, "source-plan review response failed the closed-schema check")
+    if not _UUID.match(str(value.get("id", ""))) or not _UUID.match(str(value.get("project_id", ""))):
+        die(EXIT_VALIDATION, "source-plan review response contains an invalid UUID")
+    if value.get("status") not in SOURCE_REVIEW_STATUSES:
+        die(EXIT_VALIDATION, "source-plan review response contains an invalid status")
+    observed = source_review_revision(value.get("observed_prompt_revision"), "observed_prompt_revision")
+    resolved = value.get("resolved_prompt_revision")
+    if resolved is not None:
+        resolved = source_review_revision(resolved, "resolved_prompt_revision")
+    for field in ("opened_at", "last_reported_at", "resolved_at"):
+        stamp = value.get(field)
+        if stamp is not None and (not isinstance(stamp, str) or len(stamp) > 64 or not _ISO.match(stamp)):
+            die(EXIT_VALIDATION, "source-plan review response contains an invalid timestamp")
+    if value.get("status") == "open" and resolved is not None:
+        die(EXIT_VALIDATION, "open source-plan review contains a resolution")
+    if value.get("status") == "resolved" and resolved is None:
+        die(EXIT_VALIDATION, "resolved source-plan review has no resolution revision")
+    return {
+        "id": str(value["id"]),
+        "project_id": str(value["project_id"]),
+        "status": value["status"],
+        "observed_prompt_revision": observed,
+        "resolved_prompt_revision": resolved,
+        "opened_at": value["opened_at"],
+        "last_reported_at": value["last_reported_at"],
+        "resolved_at": value["resolved_at"],
+    }
+
+
+def validate_source_review_list(value):
+    if not isinstance(value, dict) or set(value) != {"items"} or not isinstance(value["items"], list):
+        die(EXIT_VALIDATION, "source-plan review list failed the closed-schema check")
+    if len(value["items"]) > 100:
+        die(EXIT_VALIDATION, "source-plan review list exceeded its bound")
+    reviews = [validate_source_review(item) for item in value["items"]]
+    if any(review["status"] != "open" for review in reviews):
+        die(EXIT_VALIDATION, "source-plan review list contains a non-open review")
+    return reviews
+
+
 # --- read subcommands --------------------------------------------------------
 
 
@@ -854,6 +917,43 @@ def cmd_token_info(args):
     body = response.json if isinstance(response.json, dict) else {}
     body.pop("token", None)
     emit({"ok": True, "available": True, "token": body})
+
+
+def cmd_source_reviews(args):
+    response = request("GET", "/me/source-plan-reviews?status=open")
+    reviews = validate_source_review_list(response.json)
+    emit({"ok": True, "count": len(reviews), "reviews": reviews})
+
+
+def cmd_source_review_report(args):
+    project_id = need_uuid(args.project, "--project")
+    revision = source_review_revision(args.prompt_revision)
+    response = request(
+        "POST",
+        "/projects/%s/source-plan-review" % project_id,
+        payload={"prompt_revision": revision},
+    )
+    review = validate_source_review(response.json)
+    if review["project_id"].lower() != project_id.lower():
+        die(EXIT_VALIDATION, "source-plan review response belongs to another project")
+    emit({"ok": True, "review": review})
+
+
+def cmd_source_review_resolve(args):
+    project_id = need_uuid(args.project, "--project")
+    review_id = need_uuid(args.review, "--review")
+    revision = source_review_revision(args.prompt_revision)
+    response = request(
+        "POST",
+        "/projects/%s/source-plan-review/%s/resolve" % (project_id, review_id),
+        payload={"prompt_revision": revision},
+    )
+    review = validate_source_review(response.json)
+    if review["project_id"].lower() != project_id.lower() or review["id"].lower() != review_id.lower():
+        die(EXIT_VALIDATION, "source-plan review response identifies another review")
+    if review["status"] != "resolved":
+        die(EXIT_VALIDATION, "source-plan review did not resolve")
+    emit({"ok": True, "review": review})
 
 
 # --- pairing (device code) ---------------------------------------------------
@@ -1659,8 +1759,8 @@ def build_parser():
     parser.add_argument("--verbose", action="store_true", help="redacted debug logging on stderr")
     subparsers = parser.add_subparsers(dest="command")
 
-    def add(name, help_text, needs_project=True):
-        sub = subparsers.add_parser(name, help=help_text, description=help_text)
+    def add(name, help_text, needs_project=True, aliases=()):
+        sub = subparsers.add_parser(name, aliases=aliases, help=help_text, description=help_text)
         if needs_project:
             sub.add_argument("--project", required=True, metavar="UUID")
         return sub
@@ -1699,6 +1799,24 @@ def build_parser():
                            metavar="SECONDS", help="starting poll interval; slow_down raises it")
 
     subparsers.add_parser("projects", help="list every project this key can see")
+    subparsers.add_parser(
+        "source-reviews",
+        aliases=("source-plan-reviews", "source-review-list", "source-plan-review-list"),
+        help="list open source-plan reviews for accessible projects",
+    )
+    report = add(
+        "source-review-report",
+        "report an open source-plan review at the current prompt revision",
+        aliases=("source-plan-review-report", "source-plan-review"),
+    )
+    report.add_argument("--prompt-revision", "--revision", dest="prompt_revision", required=True, type=int, metavar="INTEGER")
+    resolve = add(
+        "source-review-resolve",
+        "resolve a source-plan review after the installation was verified",
+        aliases=("source-plan-review-resolve",),
+    )
+    resolve.add_argument("--review", "--review-id", dest="review", required=True, metavar="UUID")
+    resolve.add_argument("--prompt-revision", "--revision", dest="prompt_revision", required=True, type=int, metavar="INTEGER")
     add("project", "read one project, its current prompt, and its ETag")
     add("prompt", "read one project's current prompt")
 
@@ -1755,6 +1873,15 @@ COMMANDS = {
     "pair-request": cmd_pair_request,
     "pair-poll": cmd_pair_poll,
     "projects": cmd_projects,
+    "source-reviews": cmd_source_reviews,
+    "source-plan-reviews": cmd_source_reviews,
+    "source-review-list": cmd_source_reviews,
+    "source-plan-review-list": cmd_source_reviews,
+    "source-review-report": cmd_source_review_report,
+    "source-plan-review-report": cmd_source_review_report,
+    "source-plan-review": cmd_source_review_report,
+    "source-review-resolve": cmd_source_review_resolve,
+    "source-plan-review-resolve": cmd_source_review_resolve,
     "project": cmd_project,
     "prompt": cmd_prompt,
     "changes": cmd_changes,

@@ -66,7 +66,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 
 EXIT_OK = 0
 EXIT_USAGE = 64
@@ -107,6 +109,11 @@ LANE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}:[a-z0-9][a-z0-9-]{0,39}$")
 WORKER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,40}$")
 IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\\/\-]{0,80}$")
+
+# Project.prompt_revision is a Django PositiveIntegerField.  Keep the client
+# bound in step with the field's portable (32-bit) range, and do not let JSON's
+# bool-as-int behaviour turn a malformed basis into a real revision.
+MAX_PROMPT_REVISION = 2147483647
 
 
 class Refuse(Exception):
@@ -510,11 +517,44 @@ def origin_baked_into(text):
     return value or None
 
 
+def validate_project_prompt_revisions(value, what="project_prompt_revisions"):
+    """Validate the install-time prompt basis without retaining any prompt text.
+
+    JSON decoders expose object keys as strings, so UUID parsing is deliberately
+    done on the key itself.  ``bool`` is rejected explicitly: Python considers it
+    an ``int``, while the API/database schema does not.
+    """
+    if not isinstance(value, dict):
+        raise Refuse("The %s field must be an object keyed by project UUID." % what)
+    clean = {}
+    for project_id, revision in value.items():
+        if not isinstance(project_id, str):
+            raise Refuse("The %s field has a project key that is not a UUID." % what)
+        try:
+            uuid.UUID(project_id)
+        except (ValueError, AttributeError, TypeError):
+            raise Refuse("The %s field has malformed project UUID %r." %
+                         (what, project_id))
+        if isinstance(revision, bool) or not isinstance(revision, int):
+            raise Refuse("The %s revision for %s must be a non-negative integer." %
+                         (what, project_id))
+        if revision < 0 or revision > MAX_PROMPT_REVISION:
+            raise Refuse("The %s revision for %s is outside the supported range." %
+                         (what, project_id))
+        clean[project_id] = revision
+    return clean
+
+
 class Plan(object):
     """Everything the install will do, decided before anything is touched."""
 
-    def __init__(self, config):
+    def __init__(self, config, preserve_effective_limits=False):
         self.raw = config
+        # config.json records the limits that are actually enforced.  A normal
+        # plan starts with the person's requested limits and applies the rung
+        # adjustment below; a repair must not halve an already-adjusted value a
+        # second time.
+        self.preserve_effective_limits = bool(preserve_effective_limits)
         self.dirs = []       # (path, mode)
         self.files = []      # (path, text, mode)
         self.links = []      # (path, target, kind)
@@ -667,7 +707,7 @@ class Plan(object):
                 except (TypeError, ValueError):
                     raise Refuse("The limit %r must be a whole number." % name)
         self.limits["destroys_per_run"] = 0
-        if self.isolation_rung < 3:
+        if self.isolation_rung < 3 and not self.preserve_effective_limits:
             self.limits["writes_per_run"] = max(1, self.limits["writes_per_run"] // 2)
             self.warnings.append(
                 "isolation rung %d: halving the write budget to %d and preferring feeds"
@@ -733,7 +773,15 @@ class Plan(object):
             if not str(entry.get("permitted_by") or "").strip():
                 raise Refuse("Source %s has no \"permitted_by\" note recording how consent was "
                              "established." % slug)
-        return {"schema": 1, "allowed_hosts": sorted(set(hosts)), "sources": entries}
+        result = {"schema": 1, "allowed_hosts": sorted(set(hosts)), "sources": entries}
+        # The absence of this field is meaningful: it identifies an older
+        # installation whose source plan has no prompt basis yet.  Preserve that
+        # compatibility path instead of manufacturing an empty map which would
+        # make self-test claim tracking is available.
+        if "project_prompt_revisions" in document:
+            result["project_prompt_revisions"] = validate_project_prompt_revisions(
+                document.get("project_prompt_revisions"))
+        return result
 
     def parse_lanes(self, config):
         known = [str(entry.get("lane")) for entry in self.sources["sources"]]
@@ -863,6 +911,10 @@ class Plan(object):
             "installed_version": self.package_version,
             "worker": {"label": self.worker_label, "role": self.role,
                        "slug": self.worker_slug, "machine_slug": self.machine_slug},
+            # Kept as a path only (never a key): repair uses it to keep the
+            # scheduler's interpreter invocation exactly as installed.
+            "python": self.python,
+            "home": self.home,
             # The list is the record. `invocation` is the same thing written out for
             # a person to read, and nothing parses it back.
             "runtime": {"kind": self.runtime_kind, "invocation_argv": self.invocation_argv,
@@ -872,7 +924,8 @@ class Plan(object):
                           "cadence_minutes": self.cadence_minutes,
                           "at": "%02d:%02d" % (self.hour, self.minute)},
             "paths": {"config": self.config_dir, "state": self.state_dir,
-                      "logs": self.logs_dir, "skill": self.skill_dir, "bin": self.bin_dir},
+                      "logs": self.logs_dir, "skill": self.skill_dir, "bin": self.bin_dir,
+                      "extra_skill_dirs": self.extra_skill_dirs},
             "isolation_rung": self.isolation_rung,
             "unattended_rung0_opt_in": bool(self.rung0_opt_in and self.isolation_rung <= 0
                                             and self.unattended),
@@ -1268,15 +1321,134 @@ def write_file(path, text, mode):
     parent = os.path.dirname(path)
     if parent and not os.path.isdir(parent):
         ensure_dir(parent, MODE_DIR_PRIVATE, "files that go in it")
+    temporary = None
     try:
-        if os.path.lexists(path) and not os.path.islink(path):
-            os.chmod(path, MODE_FILE_STATE)
-        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, MODE_FILE_STATE)
-        with os.fdopen(handle, "w") as stream:
+        # Write beside the destination and replace it in one filesystem
+        # operation.  In particular, never chmod/truncate through a symlink and
+        # never leave a half-written JSON document for the next scheduled run.
+        fd, temporary = tempfile.mkstemp(prefix=".homing-write-",
+                                         dir=parent or ".")
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w") as stream:
             stream.write(text)
-        os.chmod(path, mode)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        try:
+            directory = os.open(parent or ".", os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError:
+            # Directory fsync is not available on every supported platform; the
+            # replace itself is still atomic and durable enough for those hosts.
+            pass
     except OSError as exc:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
         raise Refuse("I could not write %s (%s)." % (path, exc.strerror or exc), EXIT_PATH)
+
+
+def _backup_file(path):
+    """Make a same-directory rollback copy without following a symlink."""
+    if not os.path.lexists(path):
+        return None
+    if os.path.isdir(path) and not os.path.islink(path):
+        raise Refuse("I expected %s to be a file, but it is a folder; refusing to replace it."
+                     % path, EXIT_PATH)
+    parent = os.path.dirname(path) or "."
+    fd, backup = tempfile.mkstemp(prefix=".homing-backup-", dir=parent)
+    os.close(fd)
+    try:
+        os.unlink(backup)
+        if os.path.islink(path):
+            os.symlink(os.readlink(path), backup)
+        else:
+            shutil.copy2(path, backup)
+        return backup
+    except OSError:
+        try:
+            os.unlink(backup)
+        except OSError:
+            pass
+        raise
+
+
+def _remove_rollback_backup(path):
+    if path:
+        try:
+            if os.path.lexists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def _restore_file(path, backup):
+    """Restore one transaction entry; never recursively remove an unknown path."""
+    if backup:
+        try:
+            os.replace(backup, path)
+            return
+        except OSError:
+            # A failure-injection or a platform-specific replace refusal should
+            # not strand the old file. rename() is also an atomic same-directory
+            # replacement on the POSIX hosts this installer supports.
+            try:
+                os.rename(backup, path)
+                return
+            except OSError:
+                return
+    if os.path.islink(path) or os.path.isfile(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _stage_files_transaction(entries):
+    """Stage replacements and return rollback records kept until the caller commits."""
+    backups = []
+    try:
+        for path, _text, _mode in entries:
+            backups.append((path, _backup_file(path)))
+        for path, text, mode in entries:
+            write_file(path, text, mode)
+    except Exception:
+        for path, backup in reversed(backups):
+            _restore_file(path, backup)
+        for _path, backup in backups:
+            _remove_rollback_backup(backup)
+        raise
+    return backups
+
+
+def _commit_files_transaction(backups):
+    for _path, backup in backups:
+        _remove_rollback_backup(backup)
+
+
+def _rollback_files_transaction(backups):
+    for path, backup in reversed(backups):
+        _restore_file(path, backup)
+    for _path, backup in backups:
+        _remove_rollback_backup(backup)
+
+
+def write_files_transaction(entries):
+    """Replace a group of installed files with rollback on any failure.
+
+    Each entry is ``(path, text, mode)``. Existing files are copied to private,
+    same-directory rollback names before the first replacement. This public
+    wrapper commits immediately; ``apply_plan`` uses the staged form so a later
+    scheduler or permission failure can restore the complete old install.
+    """
+    backups = _stage_files_transaction(entries)
+    _commit_files_transaction(backups)
 
 
 def link_or_copy(target, source_dir, results):
@@ -1291,8 +1463,11 @@ def link_or_copy(target, source_dir, results):
         except OSError:
             pass
         os.unlink(target)
-    if os.path.isdir(target) and not os.path.islink(target):
-        shutil.rmtree(target, ignore_errors=True)
+    # A runtime skill directory can contain files owned by another tool.  The
+    # old repair path removed the whole directory before copying, which made an
+    # otherwise harmless package refresh delete unrelated user files.  Overlay
+    # only the two files this installer owns; copytree(dirs_exist_ok=True) keeps
+    # everything else in place.
     try:
         os.symlink(source_dir, target)
         results.append({"path": target, "target": source_dir, "kind": "symlink"})
@@ -1390,6 +1565,294 @@ def load_manifest(path):
     except (OSError, ValueError, UnicodeDecodeError) as exc:
         raise Refuse("I could not read the record of what was installed at %s (%s). "
                      "Without it I will not guess what to remove." % (path, exc), EXIT_USAGE)
+
+
+def _read_json_object(path, what, require_absolute=False):
+    path = str(path or "")
+    check_renderable(path, "%s path" % what)
+    if require_absolute and not os.path.isabs(path):
+        raise Refuse("The %s path must be absolute (got %r)." % (what, path))
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise Refuse("The %s at %s is not a regular file. I will not guess around it."
+                     % (what, path))
+    try:
+        with open(path, "rb") as handle:
+            value = json.loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise Refuse("The %s at %s is not valid JSON (%s)." % (what, path, exc))
+    if not isinstance(value, dict):
+        raise Refuse("The %s at %s must be a JSON object." % (what, path))
+    return value
+
+
+def _repair_absolute_path(path, what, os_id):
+    path = str(path or "")
+    check_renderable(path, "%s path" % what)
+    if not is_absolute(os_id, path):
+        raise Refuse("The %s path must be absolute (got %r)." % (what, path))
+    return path
+
+
+def _path_parent(path, os_id):
+    if os_id == "windows":
+        return path.rsplit("\\", 1)[0] if "\\" in path else path.rsplit("/", 1)[0]
+    return os.path.dirname(path)
+
+
+def _installed_python(config, runner_path, os_id):
+    value = config.get("python")
+    if value:
+        return str(value)
+    if os.path.islink(runner_path) or not os.path.isfile(runner_path):
+        raise Refuse("The installed runner is missing its interpreter path. I will not guess "
+                     "one during repair.")
+    try:
+        with open(runner_path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise Refuse("I could not read the installed runner to preserve its interpreter (%s)."
+                     % exc)
+    if os_id == "windows":
+        match = re.search(r"\$Py\s*=\s*('(?:''|[^'])*')", text)
+        if match:
+            literal = match.group(1)[1:-1].replace("''", "'")
+            return literal
+    else:
+        for line in text.splitlines():
+            match = re.search(r"(?:^|;)\s*PY=(.+)$", line)
+            if not match:
+                continue
+            try:
+                argv = shlex.split(match.group(1), posix=True)
+            except ValueError:
+                argv = []
+            if len(argv) == 1 and argv[0]:
+                return argv[0]
+    raise Refuse("The installed runner has no readable interpreter path. I will not guess "
+                 "one during repair.")
+
+
+def repair_config_from_manifest(manifest_path, sources_path=None, basis_path=None):
+    """Reconstruct a safe plan from the installed record and config.
+
+    This is intentionally a closed projection: callers cannot supply scheduler,
+    path, runtime, isolation, lane, egress, or limit decisions for repair. Those
+    values come from the installed config and manifest, while the package version
+    comes from this copy of install.py. A replacement source document is the only
+    optional input.
+    """
+    manifest_path = str(manifest_path or "")
+    if not os.path.isabs(manifest_path):
+        raise Refuse("The repair manifest path must be absolute (got %r)." % manifest_path,
+                     EXIT_USAGE)
+    if os.path.islink(manifest_path):
+        raise Refuse("The repair manifest path is a symlink. I will not follow it.")
+    manifest = load_manifest(manifest_path)
+    if int(manifest.get("schema") or 0) != 1:
+        raise Refuse("The install manifest is not schema 1; I will not guess its paths.")
+    scan_for_secrets(manifest)
+    origin = clean_origin(manifest.get("origin"))
+    os_id = str(manifest.get("os") or "").lower()
+    if os_id not in ("macos", "linux", "windows"):
+        raise Refuse("The install manifest has an unknown operating system %r." % os_id)
+
+    manifest_paths = manifest.get("paths")
+    if not isinstance(manifest_paths, dict):
+        raise Refuse("The install manifest has no paths object; I will not guess its install.")
+    roles = {}
+    for role in ("config", "state", "logs", "skill"):
+        roles[role] = _repair_absolute_path(manifest_paths.get(role), role, os_id)
+        if os.path.islink(roles[role]):
+            raise Refuse("The installed %s folder is a symlink; I will not repair through it."
+                         % role)
+    config_dir, state_dir = roles["config"], roles["state"]
+    config_path = os.path.join(config_dir, "config.json")
+    installed_config = _read_json_object(config_path, "installed config", True)
+    scan_for_secrets(installed_config)
+    if int(installed_config.get("schema") or 0) != 1:
+        raise Refuse("The installed config is not schema 1; I will not guess its decisions.")
+    manifest_version = manifest.get("package_version")
+    if (isinstance(manifest_version, bool) or not isinstance(manifest_version, int) or
+            installed_config.get("installed_version") != manifest_version):
+        raise Refuse("The manifest and installed config package versions disagree.")
+    config_origin = str(installed_config.get("api_base_url") or "")
+    expected_api = origin.rstrip("/") + "/api/v1"
+    if config_origin.rstrip("/") != expected_api:
+        raise Refuse("The manifest origin and installed config origin disagree; refusing repair.")
+    if str(installed_config.get("os") or os_id).lower() != os_id:
+        raise Refuse("The manifest and installed config operating systems disagree.")
+    config_paths = installed_config.get("paths")
+    if not isinstance(config_paths, dict):
+        raise Refuse("The installed config has no paths object; I will not guess its install.")
+    expected_bin = os.path.join(config_dir, "bin") if os_id != "windows" else config_dir.rstrip("\\/") + "\\bin"
+    for role in ("config", "state", "logs", "skill"):
+        value = _repair_absolute_path(config_paths.get(role), "config " + role, os_id)
+        if os.path.normcase(value.rstrip("\\/")) != os.path.normcase(roles[role].rstrip("\\/")):
+            raise Refuse("The manifest and installed config %s paths disagree." % role)
+    config_bin = _repair_absolute_path(config_paths.get("bin"), "config bin", os_id)
+    if os.path.normcase(config_bin.rstrip("\\/")) != os.path.normcase(expected_bin.rstrip("\\/")):
+        raise Refuse("The installed config bin path is inconsistent with its config path.")
+    runner_path = str(manifest.get("runner") or "")
+    expected_runner = (expected_bin.rstrip("\\/") + ("\\run.ps1" if os_id == "windows" else "/run.sh"))
+    if os.path.normcase(runner_path) != os.path.normcase(expected_runner):
+        raise Refuse("The manifest runner path is inconsistent with the installed config.")
+    if manifest_scheduler := manifest.get("scheduler"):
+        program = manifest_scheduler.get("program")
+        if program is not None and program != [runner_path]:
+            raise Refuse("The manifest scheduler program is inconsistent with its runner.")
+
+    scheduler = installed_config.get("scheduler")
+    manifest_scheduler = manifest.get("scheduler")
+    if not isinstance(scheduler, dict) or not isinstance(manifest_scheduler, dict):
+        raise Refuse("The installed scheduler record is incomplete; I will not create another.")
+    scheduler_kind = str(scheduler.get("kind") or "").lower()
+    identifier = str(scheduler.get("identifier") or "")
+    if scheduler_kind != str(manifest_scheduler.get("kind") or "").lower() or \
+            identifier != str(manifest_scheduler.get("identifier") or ""):
+        raise Refuse("The manifest and installed config scheduler decisions disagree.")
+    artifacts = manifest_scheduler.get("artifacts") or []
+    if not isinstance(artifacts, list) or any(not isinstance(path, str) for path in artifacts):
+        raise Refuse("The install manifest scheduler artifacts are malformed.")
+    for artifact in artifacts:
+        _repair_absolute_path(artifact, "scheduler artifact", os_id)
+    scheduler_dir = str(manifest_scheduler.get("directory") or "")
+    if not scheduler_dir and artifacts and scheduler_kind in ("launchd", "systemd-user"):
+        scheduler_dir = _path_parent(artifacts[0], os_id)
+    if scheduler_dir:
+        scheduler_dir = _repair_absolute_path(scheduler_dir, "scheduler", os_id)
+    if scheduler_kind == "none":
+        expected_artifacts = []
+    elif scheduler_kind == "launchd":
+        expected_artifacts = [os.path.join(scheduler_dir, identifier + ".plist")]
+    elif scheduler_kind == "systemd-user":
+        expected_artifacts = [os.path.join(scheduler_dir, identifier + ".service"),
+                              os.path.join(scheduler_dir, identifier + ".timer")]
+    elif scheduler_kind == "schtasks":
+        expected_artifacts = [expected_bin.rstrip("\\/") +
+                              ("\\register-task.ps1" if os_id == "windows" else "/register-task.ps1")]
+    elif scheduler_kind == "container-loop":
+        expected_artifacts = [expected_bin.rstrip("\\/") +
+                              ("\\loop.sh" if os_id == "windows" else "/loop.sh")]
+    else:
+        raise Refuse("The installed scheduler kind is unknown; refusing repair.")
+    if [os.path.normcase(path) for path in artifacts] != \
+            [os.path.normcase(path) for path in expected_artifacts]:
+        raise Refuse("The manifest scheduler artifacts do not match its identifier and kind.")
+    if str(manifest_scheduler.get("path") or "") != (artifacts[0] if artifacts else ""):
+        raise Refuse("The manifest scheduler path is inconsistent with its artifacts.")
+    at = str(scheduler.get("at") or "")
+    match = re.match(r"^(\d{2}):(\d{2})$", at)
+    if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+        raise Refuse("The installed scheduler time is malformed; I will not guess a cadence.")
+    if not isinstance(scheduler.get("cadence_minutes"), int) or \
+            isinstance(scheduler.get("cadence_minutes"), bool) or scheduler["cadence_minutes"] < 60:
+        raise Refuse("The installed scheduler cadence is malformed; I will not guess it.")
+
+    store = installed_config.get("secret_store")
+    manifest_store = manifest.get("secret_store")
+    if not isinstance(store, dict) or not isinstance(manifest_store, dict):
+        raise Refuse("The installed key-store record is incomplete; refusing repair.")
+    if str(store.get("kind") or "").lower() != str(manifest_store.get("kind") or "").lower() or \
+            str(store.get("service") or "") != str(manifest_store.get("service") or ""):
+        raise Refuse("The manifest and installed config key-store decisions disagree.")
+    store_path = manifest_store.get("path") or ""
+    if store_path:
+        store_path = _repair_absolute_path(store_path, "key-store", os_id)
+
+    links = manifest.get("links") or []
+    if not isinstance(links, list):
+        raise Refuse("The install manifest links are malformed; refusing repair.")
+    extra_skill_dirs = []
+    for entry in links:
+        if not isinstance(entry, dict) or entry.get("kind") not in ("symlink", "copy"):
+            raise Refuse("The install manifest has an unusable skill link.")
+        link_path = _repair_absolute_path(entry.get("path"), "skill link", os_id)
+        target = str(entry.get("target") or "")
+        if os.path.normcase(target.rstrip("\\/")) != os.path.normcase(roles["skill"].rstrip("\\/")):
+            raise Refuse("The install manifest skill link target is inconsistent.")
+        if os.path.normcase(link_path.rstrip("\\/")) != os.path.normcase(roles["skill"].rstrip("\\/")):
+            if not link_path.rstrip("\\/").endswith("homing-check"):
+                raise Refuse("The install manifest skill link path is malformed.")
+            extra_skill_dirs.append(_path_parent(link_path, os_id))
+
+    if sources_path and basis_path:
+        raise Refuse("Choose either replacement sources or a prompt-revision basis, not both.",
+                     EXIT_USAGE)
+    sources_file = sources_path or os.path.join(config_dir, "sources.json")
+    sources_file = _repair_absolute_path(sources_file, "sources", os_id)
+    replacement_sources = _read_json_object(sources_file, "sources", True)
+    if basis_path:
+        basis_file = _repair_absolute_path(basis_path, "basis", os_id)
+        basis_document = _read_json_object(basis_file, "basis", True)
+        if set(basis_document) != {"project_prompt_revisions"}:
+            raise Refuse("The basis file must contain only project_prompt_revisions.")
+        replacement_sources["project_prompt_revisions"] = validate_project_prompt_revisions(
+            basis_document.get("project_prompt_revisions"), "basis project_prompt_revisions")
+
+    worker = installed_config.get("worker") or {}
+    runtime = installed_config.get("runtime") or {}
+    limits = installed_config.get("limits")
+    lanes = installed_config.get("lanes_owned")
+    if not isinstance(worker, dict) or not isinstance(runtime, dict) or not isinstance(limits, dict):
+        raise Refuse("The installed config is missing safe repair decisions.")
+    if any(not isinstance(worker.get(name), str) or not worker.get(name)
+           for name in ("role", "machine_slug", "label")):
+        raise Refuse("The installed config has an incomplete worker decision.")
+    if "invocation_argv" not in runtime:
+        raise Refuse("The installed config has no invocation list; refusing to guess a runtime.")
+    isolation = installed_config.get("isolation_rung")
+    if isinstance(isolation, bool) or not isinstance(isolation, int) or isolation < 0:
+        raise Refuse("The installed config has an unusable isolation rung.")
+    egress = installed_config.get("egress_class")
+    if not isinstance(egress, str) or not egress:
+        raise Refuse("The installed config has no egress class; refusing to guess one.")
+    if not isinstance(lanes, list) or not lanes:
+        raise Refuse("The installed config has no lanes; refusing to guess coverage.")
+
+    # macOS stores HOME in the plist rather than config.json in older packages.
+    home = str(installed_config.get("home") or "")
+    if not home and os_id == "macos" and artifacts:
+        try:
+            with open(artifacts[0], "rb") as handle:
+                plist = plistlib.load(handle)
+            home = str(((plist.get("EnvironmentVariables") or {}).get("HOME")) or "")
+        except (OSError, plistlib.InvalidFileException, ValueError, TypeError):
+            home = ""
+    home = home or os.path.expanduser("~")
+    home = _repair_absolute_path(home, "home", os_id)
+    python = _installed_python(installed_config, runner_path, os_id)
+    python = _repair_absolute_path(python, "python", os_id) if is_absolute(os_id, python) else python
+    repair = {
+        "schema": 1, "origin": origin, "package_version": read_package_version(), "os": os_id,
+        "home": home, "python": python,
+        "worker": {"role": worker.get("role"), "machine_slug": worker.get("machine_slug"),
+                   "label": worker.get("label")},
+        # Plan input names the skill root; config.json records the canonical
+        # homing-check directory. Derive the former so repair does not nest a
+        # second homing-check directory.
+        "paths": {"config": config_dir, "state": state_dir, "logs": roles["logs"],
+                  "skill": _path_parent(roles["skill"], os_id),
+                  "extra_skill_dirs": sorted(set(extra_skill_dirs)),
+                  "scheduler": scheduler_dir},
+        "scheduler": {"kind": scheduler_kind, "identifier": identifier,
+                       "hour": int(match.group(1)), "minute": int(match.group(2)),
+                       "cadence_minutes": scheduler["cadence_minutes"]},
+        "secret_store": {"kind": str(store.get("kind") or "").lower(),
+                         "service": store.get("service"), "path": store_path},
+        "runtime": dict(runtime), "isolation_rung": isolation,
+        "unattended_rung0_opt_in": installed_config.get("unattended_rung0_opt_in") is True,
+        "lanes": list(lanes), "sources": replacement_sources,
+        "limits": dict(limits), "notes": {"egress_class": egress},
+    }
+    return repair
+
+
+def repair_plan(manifest_path, sources_path=None, basis_path=None):
+    """Build a current-package plan without inventing any installed decision."""
+    plan = Plan(repair_config_from_manifest(manifest_path, sources_path, basis_path),
+                preserve_effective_limits=True)
+    plan.repair_existing = True
+    return plan
 
 
 def render_uninstall(plan, manifest):
@@ -1495,6 +1958,25 @@ def shell_join(argv):
 # --- actions -----------------------------------------------------------------
 
 
+def scheduler_rollback_commands(plan):
+    """Restore the existing scheduler after a failed replacement."""
+    if plan.scheduler_kind == "launchd":
+        target = "gui/%d/%s" % (os.getuid() if hasattr(os, "getuid") else 0,
+                                plan.identifier)
+        domain = target.rsplit("/", 1)[0]
+        path = (plan.scheduler_artifacts or [""])[0]
+        return [["launchctl", "bootstrap", domain, path]] if path else []
+    if plan.scheduler_kind == "systemd-user":
+        timer_unit = plan.identifier + ".timer"
+        return [["systemctl", "--user", "daemon-reload"],
+                ["systemctl", "--user", "enable", "--now", timer_unit]]
+    if plan.scheduler_kind == "schtasks":
+        name = ps_quote(plan.identifier, "task name")
+        return [["powershell", "-NoProfile", "-Command",
+                 "Enable-ScheduledTask -TaskName %s" % name]]
+    return []
+
+
 def show_plan(plan):
     say("Plan (nothing has been created):")
     say("  origin        %s" % plan.origin)
@@ -1522,7 +2004,10 @@ def show_plan(plan):
         say("  %-6s %-7d %s%s" % (oct(mode)[2:], len(text.encode("utf-8")), path, kept))
     for target, source, _kind in plan.links:
         say("  link         %s -> %s" % (target, source))
-    if plan.commands:
+    if getattr(plan, "repair_existing", False):
+        say("Scheduler state:")
+        say("  left unchanged (repair does not register, enable, restart, or run the job)")
+    elif plan.commands:
         say("Scheduler commands:")
         for label, argv in plan.commands:
             say("  %-28s %s" % (label, shell_join(argv)))
@@ -1557,9 +2042,11 @@ def apply_plan(plan):
         "runner": plan.run_path,
         "dirs": [], "files": [], "links": [],
         "scheduler": {"kind": plan.scheduler_kind, "identifier": plan.identifier,
+                      "directory": plan.scheduler_dir,
                       "path": (plan.scheduler_artifacts or [""])[0],
                       "program": [plan.run_path],
                       "artifacts": plan.scheduler_artifacts,
+                      "register": [argv for _l, argv in plan.register_commands],
                       "pause": [argv for _l, argv in plan.pause_commands],
                       "resume": [argv for _l, argv in plan.resume_commands],
                       "unregister": [argv for _l, argv in plan.unregister_commands],
@@ -1571,52 +2058,111 @@ def apply_plan(plan):
                          "remove": plan.secret_removal_command()},
     }
 
-    for path, mode in plan.dirs:
-        if path == plan.bin_dir:
-            continue        # recorded once below, at the mode it is locked down to
-        existed = os.path.isdir(path)
-        if path == plan.work_dir:
-            # Scratch: run.sh recreates it each cycle and its EXIT trap removes
-            # it. Recording it as a required path made selftest fail on every
-            # install that had actually run once.
-            ensure_dir(path, mode, "Homing files")
-            continue
-        actual = ensure_dir(path, mode, "Homing files", adopt_existing=path in plan.shared_dirs)
-        manifest["dirs"].append({"path": path, "mode": oct(actual), "created": not existed})
-    ensure_dir(plan.bin_dir, MODE_DIR_PRIVATE, "installed scripts")
-
-    for path, text, mode in plan.files:
-        if path in plan.create_only and os.path.exists(path):
-            say("  keeping what is already in %s" % path)
-        else:
-            write_file(path, text, mode)
-        manifest["files"].append({"path": path, "mode": oct(mode),
-                                  "sha256": sha256_of(path, text)})
-
-    for target, source, _kind in plan.links:
-        link_or_copy(target, source, manifest["links"])
-    for target, _flavour, how in plan.skill_flavours:
-        if how == "copy":   # a second real copy, not a link: uninstall has to know
-            manifest["links"].append({"path": target, "target": plan.skill_dir, "kind": "copy"})
-
-    # bin/ is narrowed only once everything inside it exists.
+    # Keep enough local rollback state to survive a failure after the file
+    # replacement (including scheduler registration).  Do not snapshot or
+    # recursively remove arbitrary user directories.
+    mode_before = {}
+    for path, _mode in list(plan.dirs) + [(plan.bin_dir, MODE_DIR_PRIVATE)]:
+        if os.path.isdir(path) and not os.path.islink(path):
+            try:
+                mode_before[path] = stat.S_IMODE(os.stat(path).st_mode)
+            except OSError:
+                pass
+    link_backups = []
+    for target, _source, _kind in plan.links:
+        if os.path.islink(target) or os.path.isfile(target):
+            link_backups.append((target, _backup_file(target)))
+    file_backups = None
+    scheduler_touched = False
     try:
-        os.chmod(plan.bin_dir, MODE_DIR_BIN)
-    except OSError as exc:
-        raise Refuse("I could not lock down %s (%s)." % (plan.bin_dir, exc.strerror or exc),
-                     EXIT_PATH)
-    manifest["dirs"].append({"path": plan.bin_dir, "mode": oct(MODE_DIR_BIN), "kind": "dir"})
+        for path, mode in plan.dirs:
+            if path == plan.bin_dir:
+                continue        # recorded once below, at the mode it is locked down to
+            existed = os.path.isdir(path)
+            if path == plan.work_dir:
+                # Scratch: run.sh recreates it each cycle and its EXIT trap removes
+                # it. Recording it as a required path made selftest fail on every
+                # install that had actually run once.
+                ensure_dir(path, mode, "Homing files")
+                continue
+            actual = ensure_dir(path, mode, "Homing files", adopt_existing=path in plan.shared_dirs)
+            manifest["dirs"].append({"path": path, "mode": oct(actual), "created": not existed})
+        ensure_dir(plan.bin_dir, MODE_DIR_PRIVATE, "installed scripts")
 
-    for label, argv in plan.register_commands:
-        run_command(label, argv, required=label not in ("stop any previous copy",
-                                                        "keep it running when signed out",
-                                                        "forget the failure state"))
+        file_entries = []
+        for path, text, mode in plan.files:
+            if path in plan.create_only and os.path.exists(path):
+                say("  keeping what is already in %s" % path)
+                digest = sha256_file(path)
+            else:
+                file_entries.append((path, text, mode))
+                digest = sha256_text(text)
+            manifest["files"].append({"path": path, "mode": oct(mode),
+                                      "sha256": digest})
 
-    write_file(manifest_path_for(plan.state_dir),
-               json.dumps(manifest, indent=2, sort_keys=True) + "\n", MODE_FILE_STATE)
-    write_file(os.path.join(plan.state_dir, "UNINSTALL.md"),
-               render_uninstall(plan, manifest), MODE_FILE_STATE)
-    return manifest
+        for target, source, _kind in plan.links:
+            link_or_copy(target, source, manifest["links"])
+        for target, _flavour, how in plan.skill_flavours:
+            if how == "copy":   # a second real copy, not a link: uninstall has to know
+                manifest["links"].append({"path": target, "target": plan.skill_dir, "kind": "copy"})
+
+        manifest["dirs"].append({"path": plan.bin_dir, "mode": oct(MODE_DIR_BIN), "kind": "dir"})
+
+        # The manifest and uninstall instructions are part of the same replacement
+        # transaction as the installed scripts/config. A failed repair therefore
+        # restores the old package as a whole rather than leaving a new manifest
+        # describing half of an old/new mixture.
+        file_entries.extend([
+            (manifest_path_for(plan.state_dir),
+             json.dumps(manifest, indent=2, sort_keys=True) + "\n", MODE_FILE_STATE),
+            (os.path.join(plan.state_dir, "UNINSTALL.md"),
+             render_uninstall(plan, manifest), MODE_FILE_STATE),
+        ])
+        file_backups = _stage_files_transaction(file_entries)
+        # bin/ is narrowed only once everything inside it exists. Keep this after
+        # the replacement transaction: staged files need a writable directory, and
+        # a failed repair should leave the old package reachable for rollback.
+        try:
+            os.chmod(plan.bin_dir, MODE_DIR_BIN)
+        except OSError as exc:
+            raise Refuse("I could not lock down %s (%s)." % (plan.bin_dir, exc.strerror or exc),
+                         EXIT_PATH)
+        # Source-plan repair must preserve whether the person stopped or removed
+        # the scheduler. Runner paths and cadence do not change, so an active job
+        # keeps using the replaced files while an inactive job stays inactive.
+        if not getattr(plan, "repair_existing", False):
+            for label, argv in plan.register_commands:
+                scheduler_touched = True
+                run_command(label, argv, required=label not in ("stop any previous copy",
+                                                                "keep it running when signed out",
+                                                                "forget the failure state"))
+        _commit_files_transaction(file_backups)
+        file_backups = None
+        for target, backup in link_backups:
+            _remove_rollback_backup(backup)
+        link_backups = []
+        return manifest
+    except Exception:
+        if file_backups is not None:
+            _rollback_files_transaction(file_backups)
+        for target, backup in reversed(link_backups):
+            _restore_file(target, backup)
+        for path, mode in mode_before.items():
+            try:
+                os.chmod(path, mode)
+            except OSError:
+                pass
+        if scheduler_touched and getattr(plan, "repair_existing", False):
+            # Files and links now point to the old package, so restore the old
+            # scheduler against those paths. Never run a search during rollback.
+            for argv in scheduler_rollback_commands(plan):
+                try:
+                    run_command("restore the previous schedule", argv, required=False)
+                except Exception:
+                    # Preserve the original install failure. The attempted
+                    # rollback is still visible to an operator in scheduler logs.
+                    pass
+        raise
 
 
 def report_install(plan):
@@ -1688,6 +2234,14 @@ def report_install(plan):
     say("Longer removal instructions: %s" % os.path.join(plan.state_dir, "UNINSTALL.md"))
     for warning in plan.warnings:
         say("Note: %s" % warning)
+
+
+def report_repair(plan):
+    say("")
+    say("Repaired the existing Homing installation in place.")
+    say("Its key, state, paths, cadence, runtime, and scheduler state were left alone.")
+    say("No second scheduled job was created and a stopped job was not restarted.")
+    say("Run the package self-test and one on-demand check before resolving the review.")
 
 
 def do_pause(manifest, resume=False):
@@ -2386,11 +2940,14 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 
 OK, PAUSED, AUTH, FORBIDDEN, CONFLICT, TRASHED = 0, 3, 4, 5, 6, 7
 CURSOR, RATE, UNAVAILABLE, LOCAL, NO_KEY = 8, 9, 10, 70, 78
 MAX_RECORD_LINES = 40
+MAX_PROMPT_REVISION = 2147483647
 
 # A completion that Homing has not acknowledged is not a finished run. The payload
 # and the claim it belongs to are kept here, outside the work directory that every
@@ -2417,6 +2974,7 @@ class Ctx(object):
         self.park = os.path.join(self.state, "parked")
         self.sources_file = os.path.join(self.config_dir, "sources.json")
         self.sources_state = os.path.join(self.state, "sources-state.json")
+        self.prompt_basis = self._read_prompt_basis()
         self.limits = self.config.get("limits") or {}
         self.lanes = self.config.get("lanes_owned") or []
         worker = self.config.get("worker") or {}
@@ -2453,10 +3011,63 @@ class Ctx(object):
 
     def write_json(self, path, payload):
         os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(payload, sort_keys=True))
+        parent = os.path.dirname(path) or "."
+        temporary = None
+        try:
+            fd, temporary = tempfile.mkstemp(prefix=".homing-state-", dir=parent)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps(payload, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            temporary = None
+            try:
+                directory = os.open(parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except OSError:
+                pass
+        except OSError:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+            raise
 
+    def _read_prompt_basis(self):
+        """Return the validated install basis, or None for a legacy plan.
+
+        The package never stores prompts here.  A malformed present field is a
+        local install error and fails closed; a missing field is the explicitly
+        supported legacy compatibility path.
+        """
+        try:
+            with open(self.sources_file) as handle:
+                document = json.load(handle)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(document, dict):
+            return False
+        if "project_prompt_revisions" not in document:
+            return None
+        basis = document.get("project_prompt_revisions")
+        if not isinstance(basis, dict):
+            return False
+        clean = {}
+        for project_id, revision in basis.items():
+            try:
+                uuid.UUID(str(project_id))
+            except (ValueError, TypeError, AttributeError):
+                return False
+            if (isinstance(revision, bool) or not isinstance(revision, int) or
+                    revision < 0 or revision > MAX_PROMPT_REVISION):
+                return False
+            clean[str(project_id)] = revision
+        return clean
 
 def call(ctx, script, *args):
     """Run one kit script. Returns (exit_code, parsed_json_or_None, stderr_text).
@@ -2544,27 +3155,90 @@ def phase_drain(ctx):
 
 
 def phase_read(ctx):
+    if ctx.prompt_basis is False:
+        return fail(ctx, LOCAL, "the installed source-plan basis is invalid")
     code, payload, _err = call(ctx, "homing.py", "projects")
     if code != OK:
         return fail(ctx, code, "could not read the searches from Homing")
     payload = payload or {}
     if payload.get("paused"):
         return fail(ctx, PAUSED, "paused in Homing", {"paused_until": payload.get("paused_until")})
-    projects = [p for p in (payload.get("projects") or []) if isinstance(p, dict)]
-    projects = projects[:ctx.limit("max_projects", 3)]
+    active_projects = [p for p in (payload.get("projects") or []) if isinstance(p, dict)]
+    if not active_projects:
+        return fail(ctx, OK, "no searches to run")
+
+    # Review is worker-wide. Scan every active project before max_projects
+    # limits which searches this cycle actually fetch.
+    if len({str(p.get("id") or "") for p in active_projects}) != len(active_projects):
+        return fail(ctx, LOCAL, "Homing returned duplicate active searches")
+    details = {}
+    reviews_reported = set()
+    for project in active_projects:
+        project_id = str(project.get("id") or "")
+        try:
+            uuid.UUID(project_id)
+        except (ValueError, TypeError, AttributeError):
+            return fail(ctx, LOCAL, "Homing returned an unusable search id")
+        code, detail, _err = call(ctx, "homing.py", "project", "--project", project_id)
+        if code != OK:
+            return fail(ctx, code, "could not read one of the searches")
+        body = ((detail or {}).get("project") or {})
+        live_revision = body.get("prompt_revision")
+        if (isinstance(live_revision, bool) or not isinstance(live_revision, int) or
+                live_revision < 0 or live_revision > MAX_PROMPT_REVISION):
+            return fail(ctx, LOCAL, "Homing returned an unusable prompt revision")
+        details[project_id] = body
+        if ctx.prompt_basis is not None and live_revision != ctx.prompt_basis.get(project_id):
+            # This is before the change feed and before phase_search can fetch a
+            # website. Do not suppress it using local state: another installation
+            # may have resolved a shared review, but this stale source union still
+            # needs to reopen it until repaired.
+            code, _reported, _err = call(
+                ctx, "homing.py", "source-plan-review", "--project", project_id,
+                "--prompt-revision", str(live_revision))
+            if code != OK:
+                return fail(ctx, code,
+                            "could not report the source-plan review to Homing")
+            reviews_reported.add(project_id)
+
+    if ctx.prompt_basis is not None and set(ctx.prompt_basis) - set(details):
+        # The source union can also become stale when one project is removed.
+        # Reviews are attached to active projects, so use the first remaining
+        # project as a routing anchor for this user-owned, worker-wide review.
+        # The repair workflow compares the complete active set with the basis.
+        anchor_id = str(active_projects[0].get("id") or "")
+        if anchor_id not in reviews_reported:
+            code, _reported, _err = call(
+                ctx, "homing.py", "source-plan-review", "--project", anchor_id,
+                "--prompt-revision", str(details[anchor_id]["prompt_revision"]))
+            if code != OK:
+                return fail(ctx, code,
+                            "could not report the source-plan review to Homing")
+
+    projects = active_projects[:ctx.limit("max_projects", 3)]
     if not projects:
         return fail(ctx, OK, "no searches to run")
+
+    # Revalidate selected project details immediately before building the search
+    # plan. A prompt revision race is a hard stop before any source is fetched.
+    for project in projects:
+        project_id = str(project.get("id") or "")
+        code, detail, _err = call(ctx, "homing.py", "project", "--project", project_id)
+        if code != OK:
+            return fail(ctx, code, "could not re-read one of the searches")
+        body = ((detail or {}).get("project") or {})
+        revision = body.get("prompt_revision")
+        if (isinstance(revision, bool) or not isinstance(revision, int) or
+                revision < 0 or revision > MAX_PROMPT_REVISION):
+            return fail(ctx, LOCAL, "Homing returned an unusable prompt revision")
+        if revision != details[project_id].get("prompt_revision"):
+            return fail(ctx, LOCAL, "a search changed while its source plan was being reviewed")
 
     plan = {"generated_at": iso(), "projects": []}
     cursors = os.path.join(ctx.state, "cursors")
     for project in projects:
         project_id = str(project.get("id") or "")
-        if not project_id:
-            continue
-        code, detail, _err = call(ctx, "homing.py", "project", "--project", project_id)
-        if code != OK:
-            return fail(ctx, code, "could not read one of the searches")
-        body = ((detail or {}).get("project") or {})
+        body = details[project_id]
         # The change feed is read for the other worker's events; a stale cursor
         # resets itself inside homing.py and is never fatal here.
         call(ctx, "homing.py", "changes", "--project", project_id,
@@ -2847,7 +3521,10 @@ def phase_write(ctx):
     state["last_run_at"] = iso()
     known = state.get("projects") if isinstance(state.get("projects"), dict) else {}
     for project in projects:      # merge, never replace: this file outlives one run
-        known[project["id"]] = {"last_run_at": iso()}
+        previous = known.get(project["id"])
+        previous = dict(previous) if isinstance(previous, dict) else {}
+        previous["last_run_at"] = iso()
+        known[project["id"]] = previous
     state["projects"] = known
     ctx.write_json(state_file, state)
 
@@ -3124,6 +3801,12 @@ def build_parser():
                         help="the plan, as JSON; - or omitted reads stdin")
     parser.add_argument("--manifest", metavar="PATH", default=None,
                         help="install-manifest.json, for --pause/--resume/--uninstall")
+    parser.add_argument("--repair", action="store_true",
+                        help="repair the existing install from --manifest; preserve its decisions")
+    parser.add_argument("--sources", metavar="PATH", default=None,
+                        help="with --repair, a complete replacement sources.json")
+    parser.add_argument("--basis", metavar="PATH", default=None,
+                        help="with --repair, update only project_prompt_revisions from exact JSON")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the plan and change nothing at all")
     parser.add_argument("--uninstall", action="store_true",
@@ -3159,8 +3842,11 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     chosen = [name for name in ("uninstall", "pause", "resume") if getattr(args, name)]
-    if len(chosen) > 1:
-        say("Pick one of --uninstall, --pause, --resume.")
+    if (len(chosen) > 1 or (chosen and args.repair) or
+            ((args.sources or args.basis) and not args.repair) or
+            (args.sources and args.basis)):
+        say("Choose one installer action; --sources and --basis are alternatives valid only "
+            "with --repair.")
         return EXIT_USAGE
     try:
         if args.print_config_schema:
@@ -3172,12 +3858,26 @@ def main(argv=None):
                 return do_uninstall(manifest, keep_logs=not args.purge_logs)
             return do_pause(manifest, resume=args.resume)
 
-        plan = Plan(load_config(args.config))
+        if args.repair:
+            if not args.manifest:
+                say("--repair needs --manifest PATH; I will not guess which install to change.")
+                return EXIT_USAGE
+            if args.config:
+                say("--repair takes its decisions from --manifest, not --config.")
+                return EXIT_USAGE
+            plan = repair_plan(args.manifest, args.sources, args.basis)
+        else:
+            if not args.config:
+                # Keep argparse's historical stdin behavior explicit in the help,
+                # while still allowing an omitted --config for a normal install.
+                plan = Plan(load_config(args.config))
+            else:
+                plan = Plan(load_config(args.config))
         if args.dry_run:
             show_plan(plan)
             return EXIT_OK
         apply_plan(plan)
-        report_install(plan)
+        report_repair(plan) if args.repair else report_install(plan)
         return EXIT_OK
     except Refuse as exc:
         sys.stderr.write("%s\n" % exc)

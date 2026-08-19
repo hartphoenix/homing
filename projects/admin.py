@@ -2,7 +2,7 @@ from django.contrib import admin
 
 from .models import (AuditEvent, IdempotencyKey, Lead, LeadComment, LeadInterest,
                      Project, ProjectChange, ProjectInvitation, ProjectMembership,
-                     PromptRevision, SearchRun)
+                     PromptRevision, SearchRun, SourcePlanReview)
 
 
 @admin.register(Project)
@@ -39,6 +39,16 @@ class SearchRunAdmin(admin.ModelAdmin):
     list_display = ("project", "status", "user", "agent_label", "created_at", "completed_at")
     list_filter = ("status",)
     search_fields = ("project__name", "user__email", "agent_label")
+
+
+@admin.register(SourcePlanReview)
+class SourcePlanReviewAdmin(admin.ModelAdmin):
+    list_display = (
+        "project", "user", "status", "observed_prompt_revision", "last_reported_at"
+    )
+    list_filter = ("status",)
+    search_fields = ("project__name", "user__email")
+    readonly_fields = ("opened_at", "last_reported_at", "resolved_at")
 
 
 @admin.register(Lead)

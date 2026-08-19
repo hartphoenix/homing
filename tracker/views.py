@@ -69,6 +69,7 @@ from .forms import (
     TrashLeadForm,
 )
 from .agent_guidance import build_agent_prompt
+from .source_plan_reviews import open_review_count
 
 
 def _safe_next(request, candidate, fallback):
@@ -1217,6 +1218,10 @@ def agent_setup(request):
             "pending_link": link if state == "pending" else None,
             "approved_link": link if link is not None and not link.is_open else None,
             "agent_prompt": build_agent_prompt(_agent_api_base_url(request)),
+            "source_plan_review_count": open_review_count(request.user),
+            "source_review_prompt": build_agent_prompt(
+                _agent_api_base_url(request), repair=True
+            ),
             "new_key": new_key,
             "paused_until": paused_until,
             "cadence_text": _cadence_text(cadence),

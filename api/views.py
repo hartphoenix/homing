@@ -57,6 +57,7 @@ from projects.models import (
     ProjectMembership,
     PromptRevision,
     SearchRun,
+    SourcePlanReview,
 )
 from projects.services.authorization import (
     Principal,
@@ -77,6 +78,13 @@ from projects.services.mutations import (
     set_interest,
     trash_lead,
     update_project_prompt,
+)
+from projects.services.source_reviews import (
+    SourcePlanRevisionConflict,
+    SourcePlanReviewStale,
+    list_source_plan_reviews,
+    open_source_plan_review,
+    resolve_source_plan_review,
 )
 
 
@@ -159,6 +167,24 @@ def _data(request):
         return _body(request), None
     except ValueError as exc:
         return None, _error(request, "invalid_json", str(exc), 422)
+
+
+def _exact_body(request, keys):
+    """Parse a closed JSON object and reject every missing/unknown key."""
+    data, error = _data(request)
+    if error:
+        return None, error
+    expected = set(keys)
+    unknown = set(data) - expected
+    missing = expected - set(data)
+    if unknown or missing:
+        fields = {}
+        if unknown:
+            fields["unknown"] = sorted(str(key)[:80] for key in unknown)[:20]
+        if missing:
+            fields["missing"] = sorted(missing)
+        return None, _error(request, "invalid_schema", "Request fields are not allowed.", 422, fields)
+    return data, None
 
 
 class _SessionCsrf(CsrfViewMiddleware):
@@ -403,6 +429,20 @@ def project_json(project, membership=None):
         "latest_change_sequence": project.latest_change_sequence,
         "created_at": _iso(project.created_at),
         "updated_at": _iso(project.updated_at),
+    }
+
+
+def source_plan_review_json(review):
+    """Serialize only bounded review state; never prompt/source/agent text."""
+    return {
+        "id": str(review.pk),
+        "project_id": str(review.project_id),
+        "status": review.status,
+        "observed_prompt_revision": review.observed_prompt_revision,
+        "resolved_prompt_revision": review.resolved_prompt_revision,
+        "opened_at": _iso(review.opened_at),
+        "last_reported_at": _iso(review.last_reported_at),
+        "resolved_at": _iso(review.resolved_at),
     }
 
 
@@ -1103,6 +1143,98 @@ def my_projects(request):
     if request.method != "GET":
         return _error(request, "method_not_allowed", "GET required", 405)
     return _response(request, _project_list(request))
+
+
+@authenticated
+@endpoint
+def source_plan_reviews(request):
+    """List the caller's open reviews on active, currently accessible projects."""
+    if request.method != "GET":
+        return _error(request, "method_not_allowed", "GET required", 405)
+    keys = set(request.GET.keys())
+    if keys - {"status"}:
+        raise ValueError("Only status=open is supported")
+    if request.GET.getlist("status") and (
+        len(request.GET.getlist("status")) != 1 or request.GET.get("status") != SourcePlanReview.Status.OPEN
+    ):
+        raise ValueError("Only status=open is supported")
+    reviews = list_source_plan_reviews(
+        request.principal.user,
+        token=request.principal.token,
+        status=SourcePlanReview.Status.OPEN,
+        limit=100,
+    )
+    return _response(request, {"items": [source_plan_review_json(review) for review in reviews]})
+
+
+@authenticated
+@endpoint
+def source_plan_review(request, project_id):
+    """Report that the installed source plan needs review for this revision."""
+    project = _project(request, project_id, role=ProjectMembership.Role.VIEWER, scope="runs:write")
+    if request.method != "POST":
+        return _error(request, "method_not_allowed", "POST required", 405)
+    data, error = _exact_body(request, {"prompt_revision"})
+    if error:
+        return error
+    throttled = _spend_writes(request)
+    if throttled:
+        return throttled
+    try:
+        review = open_source_plan_review(
+            project,
+            prompt_revision=data["prompt_revision"],
+            actor=request.principal,
+            request_id=_request_id(request),
+        )
+    except SourcePlanRevisionConflict as exc:
+        return _error(
+            request,
+            "stale_prompt_revision",
+            "The project prompt has changed; read it again before reporting.",
+            409,
+            {"prompt_revision": [f"current revision is {exc.current_revision}"]},
+        )
+    return _response(request, source_plan_review_json(review), 201 if getattr(review, "_created", False) else 200)
+
+
+@authenticated
+@endpoint
+def source_plan_review_resolve(request, project_id, review_id):
+    """Record the owning user's audited assertion that a review is complete."""
+    project = _project(request, project_id, role=ProjectMembership.Role.VIEWER, scope="runs:write")
+    if request.method != "POST":
+        return _error(request, "method_not_allowed", "POST required", 405)
+    data, error = _exact_body(request, {"prompt_revision"})
+    if error:
+        return error
+    throttled = _spend_writes(request)
+    if throttled:
+        return throttled
+    try:
+        review = resolve_source_plan_review(
+            project,
+            review_id,
+            prompt_revision=data["prompt_revision"],
+            actor=request.principal,
+            request_id=_request_id(request),
+        )
+    except SourcePlanRevisionConflict as exc:
+        return _error(
+            request,
+            "stale_prompt_revision",
+            "The project prompt has changed; read it again before resolving.",
+            409,
+            {"prompt_revision": [f"current revision is {exc.current_revision}"]},
+        )
+    except SourcePlanReviewStale:
+        return _error(
+            request,
+            "source_plan_review_stale",
+            "Report the current prompt revision before resolving this review.",
+            409,
+        )
+    return _response(request, source_plan_review_json(review))
 
 
 @authenticated

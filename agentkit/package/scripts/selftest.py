@@ -65,6 +65,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -84,6 +85,7 @@ MAX_WALK_FILES = 40
 MAX_WALK_DEPTH = 4
 CMD_TIMEOUT = 20
 NET_TIMEOUT = 10
+MAX_PROMPT_REVISION = 2147483647
 
 USER_AGENT = "HomingSelftest/1.0 (+%s; post-install verification for one person)"
 
@@ -1392,6 +1394,64 @@ def install_time_sources(dirs):
     return hosts, slugs
 
 
+def check_source_review_tracking(report, dirs):
+    """Verify the prompt basis without ever reading or retaining a prompt.
+
+    A missing basis is the supported pre-feature install path. It remains
+    operational, but must be visible to an operator so an interactive repair or
+    upgrade can write the mapping. A present, malformed basis is a broken
+    installation and fails self-test.
+    """
+    path = os.path.join(dirs.get("config", ""), "sources.json")
+    text = read_text(path)
+    if not text:
+        report.skip("source-review-tracking",
+                    "Source-review tracking is unavailable: no readable sources.json basis "
+                    "was found. This legacy install remains operational; repair or upgrade "
+                    "it interactively to record project prompt revisions.")
+        return
+    try:
+        document = json.loads(text)
+    except ValueError as exc:
+        report.bad("source-review-tracking", "Source-review tracking is unavailable because "
+                   "sources.json is not valid JSON.", [str(exc)])
+        return
+    if not isinstance(document, dict):
+        report.bad("source-review-tracking", "Source-review tracking has an invalid sources "
+                   "document; the prompt basis is not an object.")
+        return
+    if "project_prompt_revisions" not in document:
+        report.skip("source-review-tracking",
+                    "Source-review tracking is unavailable for this legacy install; its "
+                    "sources.json has no prompt-revision basis. The worker remains "
+                    "operational until an interactive repair or upgrade records one.")
+        return
+    basis = document.get("project_prompt_revisions")
+    if not isinstance(basis, dict):
+        report.bad("source-review-tracking",
+                   "Source-review tracking has an invalid prompt-revision basis: expected "
+                   "an object keyed by project UUID.")
+        return
+    problems = []
+    for project_id, revision in basis.items():
+        try:
+            uuid.UUID(str(project_id))
+        except (ValueError, TypeError, AttributeError):
+            problems.append("malformed project UUID")
+            continue
+        if (isinstance(revision, bool) or not isinstance(revision, int) or
+                revision < 0 or revision > MAX_PROMPT_REVISION):
+            problems.append("revision for project UUID is outside the supported range")
+    if problems:
+        report.bad("source-review-tracking",
+                   "Source-review tracking has an invalid prompt-revision basis.",
+                   problems[:20])
+        return
+    report.ok("source-review-tracking",
+              "Source-review tracking is available for %d project prompt revision%s." %
+              (len(basis), "" if len(basis) == 1 else "s"))
+
+
 # --- output ------------------------------------------------------------------
 
 
@@ -1486,6 +1546,7 @@ def main(argv=None):
         token = None  # held only for the comparisons above
     check_no_reprobe(report, manifest, dirs, skill_dirs)
     check_api(report, dirs, manifest, args.offline)
+    check_source_review_tracking(report, dirs)
     check_state(report, dirs)
 
     (print_json if args.json else print_text)(report)

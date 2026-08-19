@@ -327,6 +327,9 @@ never an integer.
 ```json
 {
   "schema": 1,
+  "project_prompt_revisions": {
+    "11111111-1111-4111-8111-111111111111": 12
+  },
   "allowed_hosts": ["www.daft.ie", "www.listingsproject.com"],
   "sources": [
     {
