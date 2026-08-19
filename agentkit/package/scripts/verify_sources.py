@@ -21,7 +21,7 @@ It also runs each source twice - once presenting as a browser, once as a
 self-identified crawler - so the reachability difference is measured on your
 own connection rather than asserted.
 
-    python3 verify_sources.py                      # the built-in sample set
+    python3 verify_sources.py --sources sources.json   # everything Phase 4 found
     python3 verify_sources.py --urls urls.txt      # one URL per line
     python3 verify_sources.py --url https://...    # a single source
     python3 verify_sources.py --both               # A/B the two identities
@@ -41,18 +41,10 @@ import urllib.parse
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCES = os.path.join(HERE, "sources.py")
 
-# A deliberately mixed sample: two that measured clean from a datacenter, several
-# that measured blocked there and are the real question on a residential line.
-SAMPLE = [
-    "https://www.zumper.com/apartments-for-rent/brooklyn-ny",
-    "https://www.apartmentlist.com/ny/brooklyn",
-    "https://www.padmapper.com/apartments/brooklyn-ny",
-    "https://www.zillow.com/brooklyn-new-york-ny/rentals/",
-    "https://streeteasy.com/for-rent/nyc",
-    "https://www.trulia.com/for_rent/Brooklyn,NY/",
-    "https://www.hotpads.com/brooklyn-ny/apartments-for-rent",
-    "https://www.renthop.com/search/nyc",
-]
+# No built-in candidate list. Which sites matter depends entirely on where the
+# person is looking, and a default set would quietly steer every search toward
+# one city. Phase 4 derives candidates for the actual locale (see sources.md);
+# pass them with --url/--urls, or point --sources at a sources.json.
 
 
 def slug_for(url):
@@ -148,6 +140,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", action="append", default=[])
     ap.add_argument("--urls", help="file with one URL per line")
+    ap.add_argument("--sources", help="a sources.json; probes each url_template")
     ap.add_argument("--both", action="store_true",
                     help="also probe as a self-identified crawler, for comparison")
     ap.add_argument("--show", nargs="?", type=int, const=3, default=0, metavar="N",
@@ -161,8 +154,23 @@ def main():
     if args.urls:
         with open(args.urls) as fh:
             urls += [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+    if args.sources:
+        try:
+            with open(args.sources) as fh:
+                document = json.load(fh)
+        except (OSError, ValueError) as exc:
+            sys.exit("could not read %s: %s" % (args.sources, exc))
+        for entry in document.get("sources") or []:
+            template = str(entry.get("url_template") or "")
+            if template and "{" not in template:
+                urls.append(template)
     if not urls:
-        urls = SAMPLE
+        sys.exit(
+            "No candidate URLs. This tool has no built-in list on purpose - which sites\n"
+            "matter depends on where the search is. Give it the candidates Phase 4 found:\n"
+            "  verify_sources.py --url https://<a listing search URL>\n"
+            "  verify_sources.py --urls candidates.txt\n"
+            "  verify_sources.py --sources sources.json")
 
     if not os.path.exists(SOURCES):
         sys.exit("sources.py not found next to this script: %s" % SOURCES)

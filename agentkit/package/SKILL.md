@@ -171,8 +171,10 @@ channels: `robots.txt` → `llms.txt` → the target path, once, with an honest 
 | `robots.txt` 5xx, unreachable, or 200 with a non-text body (a challenge page, e.g. hotpads.com) | **Unreachable** — treat as a temporary full disallow. Skip the source; re-probe another run. |
 
 Never: a site's internal JSON API; any login; Facebook, Marketplace, Groups, Nextdoor, or
-WhatsApp; automated fetching of Craigslist in any form. Those are human tasks, and you present
-them as tasks, not apologies.
+WhatsApp. Those are human tasks, and you present them as tasks, not apologies. Craigslist is a
+routing preference rather than a prohibition — its RSS refuses datacenter egress and its own
+saved-search alerts carry the same inventory sooner, so route it to `inbox`; `sources.md` has the
+reasoning.
 
 Produces: `sources.json` — 5 to 12 sources in the schema `sources.md` defines, each recording the
 egress class it was measured in. It is also the runtime's fetch host allowlist.
