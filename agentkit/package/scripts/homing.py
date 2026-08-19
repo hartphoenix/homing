@@ -940,40 +940,46 @@ def _keychain_read(service, account):
     return out.decode("utf-8", "replace").strip("\r\n")
 
 
+KEYCHAIN_LABEL = "Homing-API-token"   # no spaces: see _store_in_keychain
+
+
 def _store_in_keychain(value):
     """Write to the login keychain, and prove it by reading the value back.
 
-    Two things went wrong on real hardware before this. `-w` with no value is
-    prompt mode and `security` reads that prompt from /dev/tty, not stdin, so a
-    piped key never reached it and the call timed out. Then `security -i` exited
-    0 without the item becoming findable -- a write that reports success it
-    cannot demonstrate is worse than one that fails loudly.
+    Measured on macOS 2026-08-19, all four mechanisms, fake value:
 
-    So: try each mechanism, and after each one read the item back and compare.
-    Nothing here returns 0 on an exit code alone.
+      argv `-w VALUE`            writes, reads back  - but the key is visible in ps
+      `security -i` on stdin     writes, reads back  - no argv, no tty
+      `-w` prompt mode, tty      exits 0, reads back WRONG - it prompts on the
+                                 terminal and stores whatever that gave it
+      `-w` prompt mode, no tty   untested
+
+    So `-i` is the mechanism. Two things it does NOT do: it does not strip shell
+    quotes (quoting the service name stores the quotes as part of the name, and
+    nothing finds it afterwards), and it does not join quoted words (a label of
+    "Homing API token" parses as three arguments and exits 2). Every field must
+    therefore be a single bare token, which is why the label carries hyphens.
     """
     service, account = _keychain_names()
-    if any(bad in value for bad in ('"', "\\")) or any(ch.isspace() for ch in value):
-        return EXIT_STORE_UNQUOTABLE
-    for field in (service, account):
-        if any(bad in field for bad in ('"', "\\")) or any(ch.isspace() for ch in field):
+    fields = [value, service, account, KEYCHAIN_LABEL]
+    for field in fields:
+        if any(bad in field for bad in ('"', "'", "\\")) or any(ch.isspace() for ch in field):
             return EXIT_STORE_UNQUOTABLE
 
-    base = ["/usr/bin/security", "add-generic-password", "-U", "-s", service,
-            "-l", "Homing API token"] + (["-a", account] if account else [])
-    last = EXIT_STORE_PROMPTED
+    base = ["add-generic-password", "-U", "-s", service, "-l", KEYCHAIN_LABEL]
+    if account:
+        base += ["-a", account]
 
-    # 1. Prompt mode with no controlling terminal. Detached from /dev/tty,
-    #    readpassphrase has to fall back to stdin, which is our pipe.
-    last = _feed_quiet(base + ["-w"], "%s\n%s\n" % (value, value), new_session=True)
+    # 1. The proven path: whole command on stdin, nothing in argv, no terminal.
+    last = _feed_quiet(["/usr/bin/security", "-i"], " ".join(base + ["-w", value]) + "\n")
     if _keychain_read(service, account) == value:
         return 0
 
-    # 2. Interactive command stream. Unquoted: `security -i` does not strip
-    #    shell quotes, so quoting the service name stores it with the quotes
-    #    still attached and nothing can find it afterwards.
-    command = " ".join(base[1:] + ["-w", value])
-    last = _feed_quiet(["/usr/bin/security", "-i"], command + "\n")
+    # 2. Prompt mode, detached so it cannot reach /dev/tty and must fall back to
+    #    the pipe. With a terminal this silently stores the wrong thing, so it is
+    #    only ever attempted without one, and only after the read-back above failed.
+    last = _feed_quiet(["/usr/bin/security"] + base + ["-w"],
+                       "%s\n%s\n" % (value, value), new_session=True)
     if _keychain_read(service, account) == value:
         return 0
 

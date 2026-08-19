@@ -826,23 +826,40 @@ class KeychainWriteIsProvenNotAssumed(SimpleTestCase):
         self.assertEqual(self.homing._store_in_keychain("the-key"),
                          self.homing.EXIT_STORE_UNVERIFIED)
 
-    def test_first_mechanism_has_no_controlling_terminal(self):
+    def test_the_proven_mechanism_runs_first(self):
+        """`security -i` is the one measured to write and read back."""
+        calls = []
+        self.homing._feed_quiet = lambda argv, text, **kw: calls.append(argv) or 0
+        self.homing._keychain_read = lambda s, a: "k"
+        self.homing._store_in_keychain("k")
+        self.assertEqual(calls[0], ["/usr/bin/security", "-i"])
+
+    def test_prompt_mode_is_only_tried_detached(self):
+        """With a terminal it exits 0 and stores the wrong value."""
         calls = []
         self.homing._feed_quiet = lambda argv, text, **kw: (
             calls.append((argv, kw.get("new_session"))) or 0)
-        self.homing._keychain_read = lambda s, a: "k"
+        self.homing._keychain_read = lambda s, a: None
         self.homing._store_in_keychain("k")
-        self.assertTrue(calls[0][1], "prompt mode must run detached from any tty")
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[1][1], "prompt mode must run detached from any tty")
 
-    def test_the_second_mechanism_does_not_quote_the_service(self):
-        """Quoting stored the item under a name with the quotes still on it."""
+    def test_nothing_passed_to_security_i_contains_a_space(self):
+        """`-i` neither strips quotes nor joins quoted words.
+
+        A label of "Homing API token" parsed as three arguments and exited 2;
+        quoting the service stored the quotes as part of the name.
+        """
         texts = []
         self.homing._feed_quiet = lambda argv, text, **kw: texts.append(text) or 0
         self.homing._keychain_read = lambda s, a: None
         self.homing._store_in_keychain("k")
-        stream = [t for t in texts if "add-generic-password" in t]
-        self.assertTrue(stream)
-        self.assertNotIn('"', stream[0])
+        stream = [t for t in texts if "add-generic-password" in t][0]
+        self.assertNotIn('"', stream)
+        self.assertNotIn("'", stream)
+        # every token after the flags is a single bare word
+        self.assertNotIn(" API ", stream)
+        self.assertIn("Homing-API-token", stream)
 
     def test_the_key_never_reaches_argv(self):
         seen = []
