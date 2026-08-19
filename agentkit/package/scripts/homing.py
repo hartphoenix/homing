@@ -91,6 +91,8 @@ EXIT_CONFLICT = 74   # a permanent 409: retrying cannot resolve it
 EXIT_TEMPFAIL = 75
 EXIT_AUTH = 77
 EXIT_CONFIG = 78
+EXIT_STORE_PROMPTED = 79    # the store helper waited on a prompt
+EXIT_STORE_UNQUOTABLE = 80  # the key has characters the store cannot take
 
 LOG = logging.getLogger("homing")
 
@@ -886,7 +888,7 @@ def _remove_quietly(path):
         pass
 
 
-def _feed_quiet(argv, text, timeout=30):
+def _feed_quiet(argv, text, timeout=30, new_session=False):
     """Run a store helper with the secret on stdin. Nothing it says is captured."""
     try:
         proc = subprocess.run(
@@ -895,23 +897,48 @@ def _feed_quiet(argv, text, timeout=30):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=timeout,
+            start_new_session=new_session,
         )
     except FileNotFoundError:
         return 127
     except subprocess.TimeoutExpired:
-        return 62  # a locked keychain parks the helper on a GUI prompt forever
+        # Waiting on a prompt nobody can answer: a locked keychain's GUI dialog,
+        # or a helper reading /dev/tty in an unattended run.
+        return EXIT_STORE_PROMPTED
     return proc.returncode
 
 
 def _store_in_keychain(value):
+    """Write to the login keychain without the key touching argv or a tty.
+
+    `-w` with no value looks like the safe choice, but that is prompt mode and
+    `security` reads the prompt from /dev/tty, not stdin: piping the value in
+    never feeds it, so the call sits at "password data for new item:" until the
+    timeout. Measured on macOS, 2026-08-19.
+
+    `security -i` reads whole commands from stdin instead. The key travels down
+    the pipe, so `ps` never sees it and no terminal is involved. The key is
+    URL-safe base64, but quote it anyway and refuse anything that could break
+    the tokenizer rather than write a truncated secret.
+    """
     service = os.environ.get("HOMING_KEYCHAIN_SERVICE", "homing-api-token")
     account = os.environ.get("HOMING_KEYCHAIN_ACCOUNT") or os.environ.get("USER") or ""
-    argv = ["/usr/bin/security", "add-generic-password", "-U",
-            "-s", service, "-l", "Homing API token", "-w"]
+    if '"' in value or "\\" in value or any(ch.isspace() for ch in value):
+        return EXIT_STORE_UNQUOTABLE
+    command = ['add-generic-password', '-U', '-s', '"%s"' % service,
+               '-l', '"Homing API token"']
     if account:
-        argv[3:3] = ["-a", account]
-    # `-w` last with no value is prompt mode, and prompt mode asks twice.
-    return _feed_quiet(argv, "%s\n%s\n" % (value, value))
+        command += ['-a', '"%s"' % account]
+    command += ['-w', '"%s"' % value]
+    code = _feed_quiet(["/usr/bin/security", "-i"], " ".join(command) + "\n")
+    if code == 0:
+        return 0
+    # Older security builds without -i: fall back to prompt mode with no
+    # controlling terminal, so readpassphrase has to fall back to stdin.
+    return _feed_quiet(
+        ["/usr/bin/security", "add-generic-password", "-U", "-s", service,
+         "-l", "Homing API token"] + (["-a", account] if account else []) + ["-w"],
+        "%s\n%s\n" % (value, value), new_session=True)
 
 
 def _store_in_secret_tool(value):
@@ -1109,7 +1136,27 @@ def _pair_finish(args, response, result):
     store, status = store_token(raw)
     if status:
         result["error_class"] = "store_write_failed"
-        die(EXIT_CONFIG, "the %s store rejected the key (status %s)" % (store, status))
+        # The pairing itself worked; only the write failed. Say which, and say
+        # what to do, because "status 62" tells the person nothing.
+        if status == EXIT_STORE_PROMPTED:
+            die(EXIT_CONFIG,
+                "the %s store asked for something interactively and nothing answered it. "
+                "If this is the macOS keychain, unlock it and run the connect helper again; "
+                "if this ran unattended, run the connect helper once by hand instead."
+                % store)
+        if status == EXIT_STORE_UNQUOTABLE:
+            die(EXIT_CONFIG,
+                "the key contains characters the %s store cannot accept safely. Use "
+                "HOMING_TOKEN_STORE=file with HOMING_TOKEN_FILE to store it in a 0600 file "
+                "instead." % store)
+        if status == 127:
+            die(EXIT_CONFIG,
+                "the %s store helper is not installed on this machine. Use "
+                "HOMING_TOKEN_STORE=file with HOMING_TOKEN_FILE instead." % store)
+        die(EXIT_CONFIG,
+            "the %s store refused the key (exit %s). The pairing succeeded, so approving "
+            "again will not help; fix the store, then run the connect helper again."
+            % (store, status))
 
     verified = _verify_stored_key()
     if not verified:

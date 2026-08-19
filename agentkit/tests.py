@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import sys
 import pathlib
 import shutil
 import stat
@@ -787,3 +788,68 @@ class PairingPrivateStateTests(PairingCLICase):
         self.assertEqual(result["error_class"], "interrupted")
         self.assertEqual(self.mode_of(self.result_file), 0o600)
         self.assertEqual(self.link().status, AgentLink.Status.PENDING)
+
+
+class KeychainWriteAvoidsPromptMode(SimpleTestCase):
+    """`security -w` with no value is prompt mode, and it reads /dev/tty.
+
+    Measured on macOS 2026-08-19: piping the key into that call never feeds it.
+    The helper sat at "password data for new item:" until the 30s timeout and
+    reported a bare "status 62", which is this script's own timeout sentinel and
+    not a Keychain code at all. Pairing had already succeeded, so the key was
+    issued and then dropped.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "package", "scripts"))
+        sys.modules.pop("homing", None)
+        import homing
+        self.homing = homing
+        self.addCleanup(lambda: sys.path.pop(0))
+
+    def test_primary_path_feeds_stdin_not_a_prompt(self):
+        seen = {}
+
+        def fake(argv, text, timeout=30, new_session=False):
+            seen["argv"] = argv
+            seen["text"] = text
+            return 0
+
+        self.homing._feed_quiet = fake
+        self.assertEqual(self.homing._store_in_keychain("abc123-token"), 0)
+        # `security -i` reads whole commands from stdin: no tty, and no argv leak.
+        self.assertEqual(seen["argv"], ["/usr/bin/security", "-i"])
+        self.assertIn("add-generic-password", seen["text"])
+        self.assertIn("abc123-token", seen["text"])
+
+    def test_the_key_never_reaches_argv(self):
+        seen = []
+        self.homing._feed_quiet = lambda argv, text, **kw: seen.append(argv) or 0
+        self.homing._store_in_keychain("super-secret-value")
+        for argv in seen:
+            self.assertNotIn("super-secret-value", " ".join(argv))
+
+    def test_falls_back_without_a_controlling_terminal(self):
+        calls = []
+
+        def fake(argv, text, timeout=30, new_session=False):
+            calls.append((argv, new_session))
+            return 0 if len(calls) > 1 else 1      # -i fails, fallback runs
+
+        self.homing._feed_quiet = fake
+        self.assertEqual(self.homing._store_in_keychain("abc"), 0)
+        self.assertEqual(len(calls), 2)
+        # The fallback is prompt mode, so it must have no tty to prompt on.
+        self.assertTrue(calls[1][1], "fallback must use start_new_session")
+
+    def test_a_key_that_would_break_the_tokenizer_is_refused(self):
+        self.homing._feed_quiet = lambda *a, **k: 0
+        self.assertEqual(self.homing._store_in_keychain('has space'),
+                         self.homing.EXIT_STORE_UNQUOTABLE)
+        self.assertEqual(self.homing._store_in_keychain('has"quote'),
+                         self.homing.EXIT_STORE_UNQUOTABLE)
+
+    def test_timeout_sentinel_is_not_a_plausible_exit_code(self):
+        self.assertEqual(self.homing.EXIT_STORE_PROMPTED, 79)
+        self.assertNotEqual(self.homing.EXIT_STORE_PROMPTED, 62)
