@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| Deployed commit | `f0f2328` |
+| Deployed commit | `8a2f97a` |
 | Rollback target | `9c2dd79` (the commit production ran before this deploy) |
 | Artifact | `/agent/pkg/homing-agent-kit-1.zip`, 17 files |
-| Artifact digest | `sha256:5beaa4e2a063d10779e4484be22a98b565427fd2550d253c1ebe0304dfc1377c` |
+| Artifact digest | `sha256:3e69d4612cc0ab8fce732b7ea49dc367979429c759c72c8ea9bcc161d081605f` |
 | Deployed | 2026-08-19, to `homing.hartphoenix.com` from `/opt/homing` |
 | Owner for post-deployment monitoring | Hart |
 
@@ -32,15 +32,24 @@ and installs a separate lean `homing-check` skill on a schedule.
   is present in its place.
 - `/agent-setup/SKILL.md` → 301 to `/agent/pkg/SKILL.md`.
 - `/health/ready` → 200; web container healthy; no migrations pending.
+- On a real Apple Silicon Mac, device-code pairing stored the issued key in the
+  login Keychain, the installed client read it back, and the authenticated API
+  self-test listed two projects without exposing the key.
+- The same install registered `com.homing.check` with launchd. Its immediate
+  launch wrote `last-run.json`; Homing was already account-paused, so the cycle
+  stopped with the documented exit 3 before search or lead writes.
+- The installed self-test passed 13/13 checks, including file modes, launchd
+  registration, token-leak scan, authenticated API read, and proof that the
+  scheduled model receives only `JUDGE.md` as its prompt.
 
 ## Supported matrix
 
 | | Status |
 |---|---|
-| Homing API + package serving | **Tested** — 246 automated tests, plus HTTP-layer tests over a real socket |
+| Homing API + package serving | **Tested** — 260 automated tests, plus HTTP-layer tests over a real socket |
 | Pairing, file secret store | **Tested** — full protocol coverage incl. secret-hygiene scans |
 | POSIX generated scripts | **Tested** — `sh -n`, plus adversarial payloads executed against a stub |
-| macOS launchd + Keychain | **Untested on real hardware** |
+| macOS launchd + Keychain | **Tested on real hardware** — pair/store/read-back, install, 13/13 self-test, registration and immediate fire |
 | Linux systemd + `systemd-creds` | **Untested on real hardware** |
 | Windows Task Scheduler + DPAPI | **Untested — no PowerShell interpreter has ever parsed these files** |
 | Claude Code, Codex, Gemini, Cursor, Copilot, OpenCode | Implemented, untested end to end |
@@ -49,16 +58,19 @@ and installs a separate lean `homing-check` skill on a schedule.
 
 ## Known limitations
 
-1. No real agent has completed an install end to end on real hardware. The
-   scripts have been driven directly; the agent-driven path is unproven.
-2. No scheduler has ever been registered. Every test uses `scheduler.kind: none`.
-3. The Keychain, `secret-tool` and DPAPI **write** paths have never run. All
-   testing uses the file store.
+1. The real macOS install completed through pairing, Keychain storage, install,
+   self-test and launchd registration. The agent-driven bootstrap path remains
+   unproven, and the account-wide pause prevented a live search/lead upsert.
+2. launchd is tested on real hardware. Linux systemd and Windows Task Scheduler
+   remain untested on real hardware.
+3. The macOS Keychain write/read path is tested. `secret-tool` and DPAPI writes
+   remain untested on real hardware.
 4. `shellcheck` is not in CI; only `sh -n`.
 5. The native-ID change alters the id derived from a `guid` rule when the guid is
    a permalink. Nothing is installed yet, so no state needs migrating — this
    stops being free after the first real install.
-6. Archive is 202,943 of 262,144 permitted bytes (77%). Headroom is thinning.
+6. The production archive is 204,659 of 262,144 permitted bytes (78%). Headroom
+   is thinning.
 
 ## Rollback
 
