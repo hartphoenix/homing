@@ -858,7 +858,8 @@ class CycleContractTests(InstallerCase):
             if command == "projects":
                 body = {"projects": [{"id": self.project_id}], "paused": False}
             elif command == "project":
-                body = {"project": {"name": "Test", "prompt": "a place",
+                body = {"project": {"name": "Test",
+                                    "prompt": getattr(self, "project_prompt", "a place"),
                                     "prompt_revision": 1}}
             elif command == "run-create":
                 body = {"run_id": self.run_id}
@@ -905,6 +906,21 @@ class CycleContractTests(InstallerCase):
                     parsers[script].parse_args(argv[2:])
                 except SystemExit as exc:
                     self.fail("%s rejected %r (exit %s)" % (script, argv[2:], exc.code))
+
+    def test_read_preserves_the_full_project_prompt_for_the_judge(self):
+        self.project_prompt = "specific housing criterion " * 200
+        ctx = self.cycle.Ctx(self.config_path)
+        original = self.cycle.subprocess.run
+        self.cycle.subprocess.run = self.recorder
+        try:
+            self.assertEqual(self.cycle.phase_read(ctx), 0)
+        finally:
+            self.cycle.subprocess.run = original
+
+        plan = ctx.read_json(ctx.path("plan.json"), {})
+        self.assertEqual(plan["projects"][0]["prompt"], self.project_prompt)
+        with open(ctx.path("prompt.txt")) as handle:
+            self.assertIn(self.project_prompt, handle.read())
 
     def test_the_source_calls_use_the_flags_sources_py_actually_has(self):
         self.run_all_phases()

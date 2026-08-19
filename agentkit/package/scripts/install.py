@@ -2572,7 +2572,7 @@ def phase_read(ctx):
         plan["projects"].append({
             "id": project_id,
             "name": str(body.get("name") or "")[:120],
-            "prompt": str(body.get("prompt") or body.get("prompt_text") or "")[:800],
+            "prompt": str(body.get("prompt") or body.get("prompt_text") or ""),
             "prompt_revision": body.get("prompt_revision"),
         })
     ctx.write_json(ctx.path("plan.json"), plan)
