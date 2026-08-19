@@ -283,6 +283,11 @@ def classify(result, fingerprint, prior):
             and prior.get("last_url") and prior["last_url"] != result["url"]:
         return "POISONED", ""
 
+    # HTML is read only to MAX_PAGE_BYTES. A complete JSON-LD block in that
+    # bounded prefix is useful; a truncated prefix with no complete records is
+    # not evidence that the source is genuinely empty.
+    if result.get("truncated") and result.get("listings", 0) == 0:
+        return "SKIPPED-OVERSIZE", ""
     if result.get("listings", 0) == 0:
         return "EMPTY-GENUINE", ""
     return "OK", ""
@@ -1366,11 +1371,16 @@ def cmd_fetch(args):
         wait_for_host(state, host, interval)
         etag = entry.get("etag", "") if index == 0 else ""
         since = entry.get("last_modified", "") if index == 0 else ""
-        result = http_get(target, allowed, etag=etag, last_modified=since)
+        # Do not download a multi-megabyte HTML document only to reject it.
+        # Complete listing data inside the bounded prefix is still usable;
+        # classify() keeps a truncated zero from becoming EMPTY-GENUINE.
+        fetch_cap = MAX_PAGE_BYTES if source["channel"] == "html" else None
+        result = http_get(target, allowed, etag=etag, last_modified=since,
+                          max_bytes=fetch_cap)
         if result["error"]:
             # One retry, and only for a bare network error.
             wait_for_host(state, host, interval)
-            result = http_get(target, allowed)
+            result = http_get(target, allowed, max_bytes=fetch_cap)
         if result["error"]:
             classification, vendor = "NETWORK-ERROR", ""
             out["pages"].append({"url": target, "status": 0, "error": result["error"][:200]})

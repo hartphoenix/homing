@@ -130,7 +130,8 @@ class FakeNet:
 
     def __call__(self, url, allowed_hosts, etag="", last_modified="", method="GET",
                  max_bytes=None):
-        self.calls.append({"url": url, "method": method, "etag": etag})
+        self.calls.append({"url": url, "method": method, "etag": etag,
+                           "max_bytes": max_bytes})
         handler = self.routes.get(url)
         if handler is None:
             raise AssertionError("test fetched an unrouted URL: %s" % url)
@@ -442,6 +443,32 @@ class RobotsTests(PipelineCase):
 
 
 class StatusPropagationTests(PipelineCase):
+
+    def test_html_fetch_uses_bounded_prefix_when_it_contains_complete_records(self):
+        page = result(PAGE_URL, body=NESTED_LD)
+        page["truncated"] = True
+        page["bytes"] = sources.MAX_PAGE_BYTES
+        net = FakeNet({ROBOTS_URL: robots_ok(), PAGE_URL: page})
+        code, emitted, _ = self.fetch(net)
+        self.assertEqual(code, sources.EXIT_OK)
+        self.assertEqual(emitted[-1]["status"], "OK")
+        page_call = [call for call in net.calls if call["url"] == PAGE_URL][0]
+        self.assertEqual(page_call["max_bytes"], sources.MAX_PAGE_BYTES)
+
+        code, emitted, _ = self.extract(FakeNet({}), extra=["--no-revalidate"])
+        self.assertEqual(code, sources.EXIT_OK)
+        self.assertEqual(emitted[-1]["counts"]["parsed"], 2)
+
+    def test_truncated_html_without_complete_records_is_not_genuine_empty(self):
+        page = result(PAGE_URL, body="<html><script type='application/ld+json'>{")
+        page["truncated"] = True
+        page["bytes"] = sources.MAX_PAGE_BYTES
+        net = FakeNet({ROBOTS_URL: robots_ok(), PAGE_URL: page})
+        code, emitted, _ = self.fetch(net)
+        self.assertEqual(code, sources.EXIT_OK)
+        self.assertEqual(emitted[-1]["status"], "SKIPPED-OVERSIZE")
+        self.assertEqual(emitted[-1]["report_as"], "source_unchecked")
+        self.assertEqual(self.read_state()["status"], "cooldown")
 
     def test_not_modified_survives_the_handoff_to_extract(self):
         net = FakeNet({ROBOTS_URL: robots_ok(),
