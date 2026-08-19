@@ -6,7 +6,16 @@ account key, and never invokes a model. It answers three questions per source:
 
     1. reachable?   did the request get a real page instead of a challenge
     2. parseable?   did structured data (JSON-LD / microdata / og:) come back
-    3. useful?      do the extracted records carry a title, a URL, and a price
+    3. useful?      do the extracted records carry a title AND a URL - price and
+                    location are measured and shown, but not required, because
+                    "price on application" is a real listing
+
+**HTML / structured-page lanes only.** Every URL here is probed as `--channel
+html`. A JSON-API candidate needs its `record_path` and field map, which live in
+that source's record in sources.json, so verify it with the tool that can read
+them:
+
+    python3 sources.py probe --sources sources.json --slug <slug> --channel json --url URL
 
 It also runs each source twice - once presenting as a browser, once as a
 self-identified crawler - so the reachability difference is measured on your
@@ -69,18 +78,24 @@ def run(cmd, timeout=120):
     return None, "no JSON on stdout"
 
 
-def probe(url, ua, egress):
-    rec, err = run([sys.executable, SOURCES, "probe",
-                    "--url", url, "--slug", slug_for(url),
-                    "--install-probe", "--ua", ua, "--egress-class", egress])
+def probe(url, ua, egress, samples=0):
+    """One HTML-lane probe. The channel is explicit: this tool checks that lane
+    and no other, so a JSON API is not silently graded as an empty web page."""
+    cmd = [sys.executable, SOURCES, "probe",
+           "--url", url, "--slug", slug_for(url), "--channel", "html",
+           "--install-probe", "--ua", ua, "--egress-class", egress]
+    if samples:
+        cmd += ["--samples", str(min(int(samples), 3))]
+    rec, err = run(cmd)
     if rec is None:
-        return {"status": "ERROR", "reason": err, "vendor": "", "records": 0}
+        return {"status": "ERROR", "reason": err, "vendor": "", "listings": 0,
+                "usable_records": 0}
     return rec
 
 
 BLOCK_FAMILY = ("BLOCKED-EDGE", "BLOCKED-IP", "BLOCKED-JS", "BLOCKED-UNKNOWN",
                 "LOGIN-WALL", "GEOFENCED", "SILENT-DEGRADATION", "POISONED")
-NO_CONSENT = ("RETIRE-NO-ROBOTS", "ROBOTS-DISALLOWED")
+NO_CONSENT = ("ROBOTS-UNAVAILABLE", "ROBOTS-DISALLOWED")
 
 
 def summarize(rec):
@@ -96,23 +111,35 @@ def summarize(rec):
     if rec.get("bytes"):
         bits.append("%dKB" % (rec["bytes"] // 1024))
     bits.append("%d listings" % n)
+    fields = rec.get("fields_present") or {}
+    if n:
+        bits.append("%d usable (%d priced)" % (rec.get("usable_records") or 0,
+                                               fields.get("price") or 0))
     return " · ".join(str(b) for b in bits), n
 
 
 def verdict(rec):
     """reachable / parseable / useful, from the probe record.
 
-    'useful' is the only one that means integrate it: the page came back, the
-    structured-data extractor found listing nodes, and there was at least one.
+    'useful' is the only one that means integrate it, and it is checked, not
+    assumed: the page came back, the structured-data extractor found listing
+    nodes, and at least one of those nodes carries both a title and a URL. A
+    page full of nodes that name no listing and link nowhere is parseable and
+    useless, and used to be graded USEFUL on the node count alone.
+
+    Price and location are counted and printed but not required - plenty of real
+    listings publish "price on application".
+
     EMPTY-GENUINE is reachable and parseable but not useful for THIS query - it
     means the query matched nothing, not that the source is broken.
     """
     status = (rec.get("status") or "").upper()
     n = rec.get("listings") or 0
+    usable = rec.get("usable_records") or 0
     reachable = status not in BLOCK_FAMILY and status not in NO_CONSENT \
         and status not in ("ERROR", "NETWORK-ERROR")
     parseable = reachable and status in ("OK", "EMPTY-GENUINE", "NOT-MODIFIED")
-    useful = parseable and n > 0
+    useful = bool(parseable and n > 0 and usable > 0)
     return reachable, parseable, useful
 
 
@@ -123,8 +150,9 @@ def main():
     ap.add_argument("--urls", help="file with one URL per line")
     ap.add_argument("--both", action="store_true",
                     help="also probe as a self-identified crawler, for comparison")
-    ap.add_argument("--show", action="store_true",
-                    help="print the diagnostic excerpt and any redirect for each source")
+    ap.add_argument("--show", nargs="?", type=int, const=3, default=0, metavar="N",
+                    help="print up to N sample records (default 3) plus the diagnostic "
+                         "excerpt and any redirect for each source")
     ap.add_argument("--egress-class", default=os.environ.get("HOMING_EGRESS_CLASS", "residential"))
     ap.add_argument("--delay", type=float, default=3.0, help="seconds between sources")
     args = ap.parse_args()
@@ -140,7 +168,10 @@ def main():
         sys.exit("sources.py not found next to this script: %s" % SOURCES)
 
     print("Probing %d source(s) as: browser%s" % (len(urls), " and crawler" if args.both else ""))
-    print("Egress class: %s\n" % args.egress_class)
+    print("Egress class: %s" % args.egress_class)
+    print("Lane: HTML / structured page only. A JSON-API source needs its record_path and")
+    print("field map from sources.json - probe those with sources.py probe --channel json.")
+    print("USEFUL means at least one record carried both a title and a URL.\n")
 
     width = max(len(slug_for(u)) for u in urls) + 2
     useful_count = 0
@@ -148,7 +179,7 @@ def main():
 
     for i, url in enumerate(urls):
         slug = slug_for(url)
-        rec = probe(url, "browser", args.egress_class)
+        rec = probe(url, "browser", args.egress_class, args.show)
         line, n = summarize(rec)
         reachable, parseable, useful = verdict(rec)
         mark = "USEFUL " if useful else ("PARSED " if parseable else
@@ -157,7 +188,7 @@ def main():
 
         if args.both:
             time.sleep(args.delay)
-            rec2 = probe(url, "crawler", args.egress_class)
+            rec2 = probe(url, "crawler", args.egress_class, 0)
             line2, _ = summarize(rec2)
             _, _, useful2 = verdict(rec2)
             delta = "" if useful == useful2 else "   <-- differs by identity"
@@ -167,6 +198,10 @@ def main():
             useful_count += 1
         rows.append((slug, url, mark, n, rec))
 
+        for sample in (rec.get("samples") or [])[:args.show]:
+            print("        record: %s | %s | %s" % (sample.get("title", "")[:60],
+                                                    sample.get("price", "") or "no price",
+                                                    sample.get("url", "")[:80]))
         if args.show and rec.get("excerpt"):
             print("        page said: %s" % rec["excerpt"][:200])
         if args.show and rec.get("final_url") and rec["final_url"] != url:
@@ -175,7 +210,8 @@ def main():
         if i + 1 < len(urls):
             time.sleep(args.delay)
 
-    print("\n%d of %d source(s) returned usable listings." % (useful_count, len(urls)))
+    print("\n%d of %d source(s) returned usable listings (HTML lane; title + URL required)."
+          % (useful_count, len(urls)))
     if useful_count:
         print("Integrate these:")
         for slug, url, mark, n, _ in rows:

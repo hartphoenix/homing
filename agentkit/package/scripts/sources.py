@@ -27,8 +27,17 @@ Rules this file enforces mechanically:
     strings. A URL found inside fetched content is fetchable only if its host is
     on that list AND its path matches that source's listing pattern. Nothing
     discovered in content can widen the list.
-  * robots.txt is fetched first and obeyed. A robots.txt that is not 200 means
-    consent cannot be established, which retires the source - it is not a retry.
+  * robots.txt is fetched first and obeyed, evaluated against the one group that
+    matches the identity actually sent (RFC 9309). A 4xx is "unavailable", which
+    the standard defines as no restrictions, so the fetch proceeds at the normal
+    polite rate. A 5xx, a network error, or a 200 that is not text/plain is a
+    non-answer: the source goes into a temporary cooldown and is re-probed. Only
+    a retrievable robots.txt that disallows the path is the publisher's own
+    durable answer, and only that - or three consecutive blocks - retires a
+    source. A transient blip never retires anything.
+  * The sitemap channel is discovery-only. It yields listing URLs and lastmod
+    dates; no detail page is fetched, so title, price and location come back
+    empty by design rather than by failure.
   * EMPTY-GENUINE is the only zero it will report as "nothing new". Every other
     zero reports SOURCE-UNCHECKED. Reporting a block as an empty result lies to
     someone looking for a home.
@@ -42,7 +51,7 @@ Exit codes:
    69   network failure after the one permitted retry
    70   a hard bound was violated
    73   sources.json or the state file failed its closed-schema check
-   77   robots.txt is unavailable or disallows the path (consent, not a retry)
+   77   robots.txt disallows the path for the identity sent (consent, not a retry)
    78   not installed, or sources.json is missing
 """
 
@@ -112,6 +121,8 @@ EXIT_CONSENT = 77
 EXIT_CONFIG = 78
 
 RETIREMENT_DAYS = (7, 30)  # 1st block -> 7d, 2nd -> 30d, 3rd -> retired
+TRANSIENT_COOLDOWN_SECONDS = 3600        # network error, rate limit: try again next hour
+ROBOTS_COOLDOWN_SECONDS = 6 * 3600       # robots.txt did not answer: back off, do not retire
 
 CHANNELS = ("rss", "sitemap", "json", "html")
 
@@ -280,6 +291,12 @@ def classify(result, fingerprint, prior):
 REPORTABLE_ZERO = "EMPTY-GENUINE"
 BLOCK_FAMILY = ("BLOCKED-EDGE", "BLOCKED-IP", "BLOCKED-JS", "BLOCKED-UNKNOWN",
                 "LOGIN-WALL", "GEOFENCED", "SILENT-DEGRADATION", "POISONED")
+# Nothing here is a source decision. These are conditions of the moment - the
+# network, the edge's mood, a robots.txt that did not answer - so they buy a
+# cooldown and never advance the retirement ladder.
+TRANSIENT_FAMILY = ("NETWORK-ERROR", "RATE-LIMITED", "ROBOTS-UNAVAILABLE",
+                    "SKIPPED-COOLDOWN", "SKIPPED-OVERSIZE", "SOURCE-UNCHECKED")
+HEALTHY_ZERO = ("EMPTY-GENUINE", "NOT-MODIFIED")
 
 
 def report_as(classification, count):
@@ -301,6 +318,46 @@ _ID_OK = re.compile(r"^[A-Za-z0-9_.:~-]{1,64}$")
 _ISO = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _WS = re.compile(r"\s+")
+
+
+ID_RULE_FORMS = """path_segment:<index> | path:<index> | query:<name> | feed:guid | guid
+    | jsonld:@id | jsonld:identifier | jsonld:sku | jsonld:url | kyero:<field>
+    | reddit:fullname"""
+
+
+def valid_id_rule(rule):
+    """The id_rule forms references/sources.md documents, and nothing else.
+
+    An unrecognised rule used to fall through to the generic branch and quietly
+    produce a different id than the one the source record claimed, which forks
+    one listing into two leads. It is a configuration error, so say so.
+    """
+    rule = str(rule or "").strip()
+    if not rule:
+        return True                      # absent is legal: use whatever the parser found
+    name, sep, arg = rule.partition(":")
+    name = name.lower()
+    if name in ("path", "path_segment"):
+        if not sep:
+            return False
+        try:
+            int(arg)
+        except ValueError:
+            return False
+        return True
+    if name == "query":
+        return bool(arg)
+    if name == "guid":
+        return arg in ("", "guid", "id")
+    if name == "feed":
+        return arg in ("guid", "id")
+    if name == "jsonld":
+        return arg in ("@id", "identifier", "sku", "url")
+    if name == "kyero":
+        return bool(arg)
+    if name == "reddit":
+        return arg in ("fullname", "name", "id")
+    return False
 
 
 def load_sources(path):
@@ -330,6 +387,19 @@ def load_sources(path):
             die(EXIT_SCHEMA, "source %s has an unknown channel" % source.get("slug"))
         if source.get("lane") and not _LANE.match(str(source["lane"])):
             die(EXIT_SCHEMA, "source %s has a malformed lane" % source["slug"])
+        if not valid_id_rule(source.get("id_rule")):
+            die(EXIT_SCHEMA, "source %s has an unknown id_rule %r; the documented forms are: %s"
+                % (source["slug"], source.get("id_rule"), " ".join(ID_RULE_FORMS.split())))
+        pattern = source.get("listing_url_pattern")
+        if pattern is not None:
+            if not isinstance(pattern, str) or not pattern.strip():
+                die(EXIT_SCHEMA,
+                    "source %s has an empty listing_url_pattern" % source["slug"])
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                die(EXIT_SCHEMA, "source %s has an invalid listing_url_pattern: %s"
+                    % (source["slug"], exc))
     return config
 
 
@@ -449,7 +519,12 @@ def source_state(state, slug):
 
 
 def apply_retirement(entry, classification):
-    """1st block -> 7 days, 2nd -> 30 days, 3rd -> retired. Only a user re-enables."""
+    """1st block -> 7 days, 2nd -> 30 days, 3rd -> retired. Only a user re-enables.
+
+    A transient failure is neither a block nor a success: it takes a short
+    cooldown, leaves the block count where it was, and can never retire the
+    source. Retirement is reserved for a durable answer from the source itself.
+    """
     if classification in BLOCK_FAMILY:
         entry["consecutive_blocks"] = int(entry.get("consecutive_blocks", 0)) + 1
         blocks = entry["consecutive_blocks"]
@@ -459,6 +534,9 @@ def apply_retirement(entry, classification):
         else:
             entry["status"] = "blocked"
             entry["next_eligible"] = iso(now() + RETIREMENT_DAYS[blocks - 1] * 86400)
+    elif classification in TRANSIENT_FAMILY:
+        entry["status"] = "cooldown"
+        entry["next_eligible"] = iso(now() + TRANSIENT_COOLDOWN_SECONDS)
     else:
         entry["consecutive_blocks"] = 0
         entry["status"] = "ok"
@@ -699,16 +777,35 @@ LISTING_TYPES = ("realestatelisting", "apartment", "house", "singlefamilyresiden
                  "accommodation", "offer", "product", "residence", "suite")
 
 
+def _ld_scalar(value):
+    """JSON-LD fields are often objects. str() on a dict yields a fake id."""
+    if isinstance(value, dict):
+        inner = value.get("value") or value.get("@value") or ""
+        return "" if isinstance(inner, (dict, list)) else str(inner or "")
+    if isinstance(value, list):
+        for item in value:
+            found = _ld_scalar(item)
+            if found:
+                return found
+        return ""
+    return "" if value is None else str(value)
+
+
 def _ld_price(node):
+    """Price from a listing's nested Offer, or from an Offer node in its own right.
+
+    A page that publishes the Offer as a sibling node - the common shape - used
+    to lose the currency here, so one listing merged to "2400" and another to
+    "USD 2400" for the same rent.
+    """
     offers = node.get("offers")
     if isinstance(offers, list) and offers:
         offers = offers[0]
-    if isinstance(offers, dict):
-        price = offers.get("price") or offers.get("lowPrice") or ""
-        currency = offers.get("priceCurrency") or ""
-        if price:
-            return "%s %s" % (currency, price)
-    return str(node.get("price") or "")
+    source = offers if isinstance(offers, dict) else node
+    price = _ld_scalar(source.get("price")) or _ld_scalar(source.get("lowPrice"))
+    if not price:
+        return ""
+    return ("%s %s" % (_ld_scalar(source.get("priceCurrency")), price)).strip()
 
 
 def _ld_address(node):
@@ -770,7 +867,14 @@ def parse_html(text, page_url):
             "price": _ld_price(node),
             "where": _ld_address(node),
             "posted": str(node.get("datePosted") or node.get("datePublished") or ""),
-            "native_id": str(node.get("identifier") or node.get("sku") or ""),
+            "native_id": (_ld_scalar(node.get("identifier"))
+                          or _ld_scalar(node.get("sku"))),
+            # Kept beside the row so id_rule can name a specific JSON-LD field
+            # (jsonld:@id) instead of guessing at whatever landed in native_id.
+            "jsonld": {"@id": _ld_scalar(node.get("@id")),
+                       "identifier": _ld_scalar(node.get("identifier")),
+                       "sku": _ld_scalar(node.get("sku")),
+                       "url": _ld_scalar(node.get("url"))},
         })
     if rows:
         return _merge_fragments(rows, page_url), "json-ld"
@@ -789,6 +893,49 @@ def parse_html(text, page_url):
         rows.append({"url": page_url, "title": name, "description": "", "price": "",
                      "where": "", "posted": "", "native_id": ""})
     return rows, ("microdata" if rows else "none")
+
+
+def rows_for_channel(channel, text, page_url, source=None):
+    """Parse one fetched body the way its channel says to. Returns (rows, shape, error).
+
+    Probe and extract both call this, so a source that probes as usable parses
+    the same way when the runtime fetches it. They used to disagree: probe read
+    every body as HTML, which reported a healthy JSON API as EMPTY-GENUINE.
+    """
+    if channel == "rss":
+        rows, error = parse_rss(text)
+        return rows, "rss", error
+    if channel == "sitemap":
+        rows, _children, error = parse_sitemap(text)
+        return rows, "sitemap", error
+    if channel == "json":
+        rows, error = parse_json_api(text, source or {})
+        return rows, "json", error
+    rows, shape = parse_html(text, page_url)
+    return rows, shape, ""
+
+
+COVERAGE_FIELDS = ("title", "url", "price", "where")
+
+
+def field_coverage(rows):
+    """How many parsed rows carry each field, and how many are usable as a lead.
+
+    "Usable" means title and URL: without a title there is nothing for a person
+    to read, and without a URL there is nowhere for them to go. Price is counted
+    and reported but not required - "price on application" is a real listing.
+    """
+    coverage = dict((field, 0) for field in COVERAGE_FIELDS)
+    usable = 0
+    for row in rows:
+        present = set()
+        for field in COVERAGE_FIELDS:
+            if str(row.get(field) or "").strip():
+                coverage[field] += 1
+                present.add(field)
+        if {"title", "url"} <= present:
+            usable += 1
+    return coverage, usable
 
 
 def dig(blob, dotted):
@@ -836,28 +983,64 @@ def parse_json_api(text, source):
 RECORD_LIMITS = (("title", 120), ("text", 240), ("price", 32), ("where", 80))
 
 
+def _id_from_value(value):
+    """A native id routinely arrives as a permalink (RSS guid, JSON-LD @id).
+
+    Sanitizing a whole URL against the id charset yields "https:example.test123",
+    which is stable but unreadable and collides across paths. Take the segment
+    that actually identifies the listing instead.
+    """
+    text = str(value or "").strip()
+    if text.lower().startswith(("http://", "https://")):
+        parts = urllib.parse.urlsplit(text)
+        segments = [s for s in parts.path.split("/") if s]
+        text = segments[-1] if segments else parts.query
+    return re.sub(r"[^A-Za-z0-9_.:~-]", "", text)[:64]
+
+
 def native_id_for(source, row):
-    rule = source.get("id_rule") or ""
+    """Extract source_listing_id per the source's id_rule.
+
+        path_segment:<i> / path:<i>   URL path segment; negative counts from the end
+        query:<name>                  query parameter
+        feed:guid / guid              the feed item's <guid> or <id>
+        jsonld:@id|identifier|sku|url the JSON-LD node's own field
+        kyero:<field>                 a named field of a Kyero v3 record
+        reddit:fullname               the t3_ fullname
+        (absent)                      whatever the parser called native_id
+
+    A rule that finds nothing falls back to the parser's native_id, then to "".
+    An empty id is deliberate: the server hashes the canonical URL rather than
+    this worker inventing an identity that would fork the lead across workers.
+    Unknown rules never reach here - load_sources rejects them.
+    """
+    rule = str(source.get("id_rule") or "").strip()
+    name, _sep, arg = rule.partition(":")
+    name = name.lower()
     url = str(row.get("url") or "")
-    if rule.startswith("path:"):
+    jsonld = row.get("jsonld") if isinstance(row.get("jsonld"), dict) else {}
+    candidate = ""
+    if name in ("path", "path_segment"):
         segments = [s for s in urllib.parse.urlsplit(url).path.split("/") if s]
         try:
-            candidate = segments[int(rule.split(":", 1)[1])]
+            candidate = segments[int(arg)]
         except (ValueError, IndexError):
             candidate = ""
-    elif rule.startswith("query:"):
+    elif name == "query":
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
-        candidate = (query.get(rule.split(":", 1)[1]) or [""])[0]
-    elif rule == "guid":
+        candidate = (query.get(arg) or [""])[0]
+    elif name == "jsonld":
+        candidate = str(jsonld.get(arg) or "")
+        if not candidate and arg == "url":
+            candidate = url
+    elif name == "kyero":
+        candidate = str(row.get(arg) or "")
+    elif name == "reddit":
+        candidate = str(row.get("fullname") or row.get("name") or "")
+    # feed:guid, guid and "no rule at all" all mean: whatever the parser found.
+    if not candidate:
         candidate = str(row.get("native_id") or "")
-    else:
-        candidate = str(row.get("native_id") or "")
-    candidate = re.sub(r"[^A-Za-z0-9_.:~-]", "", candidate)[:64]
-    if candidate:
-        return candidate
-    # No usable native id: let the server hash the canonical URL rather than
-    # inventing a per-worker identity that would fork the lead across workers.
-    return ""
+    return _id_from_value(candidate)
 
 
 def canonical_url(url):
@@ -912,17 +1095,27 @@ def cmd_probe(args):
     elif not args.install_probe:
         die(EXIT_USAGE, "refuse: pass --sources, or --install-probe when a person is present")
 
+    source = None
+    for candidate in (config.get("sources") if config else []) or []:
+        if candidate.get("slug") == args.slug:
+            source = candidate
+            break
+    channel = args.channel or (source or {}).get("channel", "")
+
     record = {"slug": args.slug, "url_template": args.url, "egress_class": args.egress_class,
-              "channel": args.channel or "", "vendor": "", "permitted_by": "",
+              "channel": channel, "vendor": "", "permitted_by": "",
               "checked_at": iso()}
     allows, delay, sitemaps, robots_status = check_robots(args.url, allowed)
     record["robots_status"] = robots_status
     record["crawl_delay"] = delay
     record["sitemaps"] = sitemaps[:10]
     if robots_status != 200:
-        record["status"] = "RETIRE-NO-ROBOTS"
+        # A 5xx, a network error, or a 200 that is not text/plain. None of those
+        # is the publisher answering, so none of them is a verdict on the source.
+        record["status"] = "ROBOTS-UNAVAILABLE"
         record["report_as"] = "source_unchecked"
-        record["reason"] = "robots.txt is not retrievable, so consent cannot be established"
+        record["reason"] = ("robots.txt did not answer (status %s); this is temporary, "
+                            "re-probe rather than retire" % robots_status)
         emit(record)
         return
     if not allows:
@@ -949,12 +1142,33 @@ def cmd_probe(args):
     # nested Offer, and sometimes an ApartmentComplex. Report what a run would
     # actually yield as leads, so a probe and a fetch agree on the number.
     ctype = (result.get("content_type") or "")
-    if not ctype or ctype.startswith("text/html"):   # some hosts send no Content-Type
-        rows, _ = parse_html(result["text"], args.url)
-        merged = len([r for r in rows if r.get("title") and r.get("url", "").startswith("http")])
-        if merged:
+    if not channel and ctype.startswith("application/json"):
+        channel = "json"
+        record["channel"] = channel
+    rows, shape, parse_error = [], "", ""
+    if channel or not ctype or ctype.startswith("text/html"):
+        rows, shape, parse_error = rows_for_channel(
+            channel or "html", result["text"], args.url, source)
+        if channel in ("", "html"):
+            rows = [r for r in rows
+                    if r.get("title") and str(r.get("url") or "").startswith("http")]
+        if rows:
             record["listing_nodes"] = result["listings"]
-            result["listings"] = merged
+            result["listings"] = len(rows)
+        record["shape"] = shape
+        if parse_error:
+            record["parse_error"] = parse_error[:200]
+    coverage, usable = field_coverage(rows)
+    record["fields_present"] = coverage
+    record["usable_records"] = usable
+    if channel == "sitemap":
+        # A sitemap says where the listings are, not what they say.
+        record["record_shape"] = "discovery-only"
+    if args.samples:
+        record["samples"] = [
+            {"title": _clean(row.get("title"), 120), "url": str(row.get("url") or "")[:300],
+             "price": _clean(row.get("price"), 32), "where": _clean(row.get("where"), 80)}
+            for row in rows[:max(0, min(int(args.samples), 3))]]
     classification, vendor = classify(result, {}, {"robots_allows": allows})
     record.update({"status": classification, "vendor": vendor, "bytes": result["bytes"],
                    "http_status": result["status"], "content_type": result["content_type"],
@@ -966,7 +1180,13 @@ def cmd_probe(args):
     emit(record)
 
 
-def count_listings(result, fingerprint):
+def count_listings(result, fingerprint, channel="", source=None):
+    """How many listings this body actually holds.
+
+    A calibrated listing_selector wins. Failing that, the source's channel is
+    the answer: counting JSON-LD <script> blocks in a JSON API's response finds
+    zero and reports a working API as EMPTY-GENUINE.
+    """
     selector = (fingerprint or {}).get("listing_selector") or ""
     text = result.get("text") or ""
     if selector.startswith("ld+json:"):
@@ -979,6 +1199,10 @@ def count_listings(result, fingerprint):
         return len(re.findall(r"<url[\s>]", text, re.I))
     if selector.startswith("substring:"):
         return text.lower().count(selector.split(":", 1)[1].lower())
+    if channel:
+        rows, _shape, _error = rows_for_channel(
+            channel, text, result.get("final_url") or result.get("url") or "", source)
+        return len(rows)
     if result.get("content_type", "").endswith("xml") or text.lstrip().startswith("<?xml"):
         return len(re.findall(r"<(?:item|entry|url)[\s>]", text, re.I))
     return len([n for n in parse_json_ld(text)
@@ -1040,6 +1264,25 @@ def cmd_calibrate(args):
           "usable": bool(both) and best_gap > 0})
 
 
+def meta_path_for(out_dir, slug):
+    return os.path.join(out_dir, "%s.meta.json" % slug)
+
+
+def write_meta(out_dir, slug, payload):
+    """The fetch/extract handoff. It carries the final status, not a draft of it.
+
+    This file used to be written before the status was decided, so extract read
+    a status-less record and fell back to BLOCKED-UNKNOWN - a healthy 304 or a
+    cooldown arrived at the person as "this source is blocked".
+    """
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    path = meta_path_for(out_dir, slug)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(payload, sort_keys=True))
+    return path
+
+
 def cmd_fetch(args):
     config = load_sources(args.sources)
     source = find_source(config, args.slug)
@@ -1052,7 +1295,13 @@ def cmd_fetch(args):
     ready, reason = eligible(entry, args.egress_class)
     if not ready:
         out.update({"status": "SKIPPED-COOLDOWN", "report_as": "source_unchecked",
-                    "reason": reason})
+                    "reason": reason, "source_status": entry.get("status", ""),
+                    "next_eligible": entry.get("next_eligible", ""),
+                    "consecutive_blocks": int(entry.get("consecutive_blocks", 0)),
+                    "meta_file": meta_path_for(args.out_dir, args.slug)})
+        # Extract still runs in the generated cycle; without metadata it would
+        # have no way to tell "we deliberately skipped this" from "we failed".
+        write_meta(args.out_dir, args.slug, out)
         emit(out)
         return
     entry["egress_class"] = args.egress_class
@@ -1067,12 +1316,39 @@ def cmd_fetch(args):
         entry.update({"robots_allows": bool(allows), "crawl_delay": delay,
                       "robots_checked_at": now()})
         if robots_status != 200:
-            entry["status"] = "retired"
+            # A 5xx, a network error, or a 200 that is not text/plain (a challenge
+            # interstitial wearing robots.txt's URL). The publisher has not spoken,
+            # so this buys a cooldown and re-probe - never a retirement.
+            entry["robots_checked_at"] = 0        # do not cache a non-answer
+            entry["status"] = "cooldown"
+            entry["next_eligible"] = iso(now() + ROBOTS_COOLDOWN_SECONDS)
+            entry["last_checked"] = iso()
             save_state(args.state, state)
-            die(EXIT_CONSENT, "robots.txt for %s is not retrievable; retiring the source" % url)
+            out.update({"status": "ROBOTS-UNAVAILABLE", "report_as": "source_unchecked",
+                        "robots_status": robots_status,
+                        "reason": "robots.txt for %s did not answer (status %s); cooling down "
+                                  "until %s" % (url, robots_status, entry["next_eligible"]),
+                        "source_status": entry["status"],
+                        "next_eligible": entry["next_eligible"],
+                        "consecutive_blocks": int(entry.get("consecutive_blocks", 0)),
+                        "meta_file": meta_path_for(args.out_dir, args.slug)})
+            write_meta(args.out_dir, args.slug, out)
+            emit(out)
+            return
         if not allows:
+            # A retrievable robots.txt that disallows the path is the publisher's
+            # own durable answer. This is the one non-negotiable retirement.
             entry["status"] = "retired"
+            entry["next_eligible"] = ""
+            entry["last_checked"] = iso()
             save_state(args.state, state)
+            out.update({"status": "ROBOTS-DISALLOWED", "report_as": "source_unchecked",
+                        "robots_status": robots_status,
+                        "reason": "robots.txt disallows %s for %s" % (url, UA_TOKEN),
+                        "source_status": entry["status"],
+                        "meta_file": meta_path_for(args.out_dir, args.slug)})
+            write_meta(args.out_dir, args.slug, out)
+            emit(out)
             die(EXIT_CONSENT, "robots.txt disallows %s for %s" % (url, UA_TOKEN))
 
     interval = max(float(source.get("min_interval_seconds") or DEFAULT_INTERVAL),
@@ -1083,7 +1359,7 @@ def cmd_fetch(args):
     targets = [url]
     fingerprint = source.get("fingerprint") or {}
     classification, vendor, index = "BLOCKED-UNKNOWN", "", 0
-    max_pages = min(int(source.get("max_pages") or MAX_PAGES), MAX_PAGES)
+    max_pages = max(1, min(int(source.get("max_pages") or MAX_PAGES), MAX_PAGES))
 
     while targets and index < max_pages:
         target = targets.pop(0)
@@ -1100,7 +1376,7 @@ def cmd_fetch(args):
             out["pages"].append({"url": target, "status": 0, "error": result["error"][:200]})
             break
 
-        result["listings"] = count_listings(result, fingerprint)
+        result["listings"] = count_listings(result, fingerprint, source["channel"], source)
         classification, vendor = classify(result, fingerprint, entry)
         page = {"url": target, "final_url": result["final_url"], "status": result["status"],
                 "bytes": result["bytes"], "classification": classification, "vendor": vendor,
@@ -1143,15 +1419,15 @@ def cmd_fetch(args):
     entry["last_fetch_at"] = now()
     save_state(args.state, state)
 
-    meta = os.path.join(args.out_dir, "%s.meta.json" % args.slug)
-    fd = os.open(meta, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write(json.dumps(out, sort_keys=True))
     out.update({"status": classification, "vendor": vendor,
                 "report_as": report_as(classification,
                                        sum(p.get("listings", 0) for p in out["pages"])),
                 "consecutive_blocks": entry["consecutive_blocks"],
-                "source_status": entry["status"], "meta_file": meta})
+                "source_status": entry["status"],
+                "next_eligible": entry.get("next_eligible", ""),
+                "channel": source["channel"],
+                "meta_file": meta_path_for(args.out_dir, args.slug)})
+    write_meta(args.out_dir, args.slug, out)
     emit(out)
 
 
@@ -1189,17 +1465,25 @@ def cmd_extract(args):
     interval = max(float(source.get("min_interval_seconds") or DEFAULT_INTERVAL),
                    float(entry.get("crawl_delay") or 0))
 
-    meta_path = os.path.join(args.in_dir, "%s.meta.json" % args.slug)
+    meta_path = meta_path_for(args.in_dir, args.slug)
     try:
         with open(meta_path) as handle:
             meta = json.load(handle)
     except (OSError, ValueError):
         die(EXIT_USAGE, "no fetch metadata at %s; run fetch first" % meta_path)
 
-    counts = dict((k, 0) for k in ("parsed", "new", "duplicate", "urls_refused", "gone",
-                                   "revalidate_unchecked", "dropped_oversize",
-                                   "dropped_cap", "no_structured_data"))
     channel = source["channel"]
+    if args.revalidate and not str(source.get("listing_url_pattern") or "").strip():
+        # Revalidation compares the final URL against this pattern. Without it
+        # every check returned "unchecked" and the run reported leads as
+        # revalidated that had never been checked at all. Say so instead.
+        die(EXIT_SCHEMA,
+            "source %s has no listing_url_pattern, so revalidation cannot check anything; "
+            "add the pattern to sources.json or pass --no-revalidate" % args.slug)
+
+    counts = dict((k, 0) for k in ("parsed", "new", "duplicate", "stale", "urls_refused",
+                                   "gone", "revalidate_unchecked", "dropped_oversize",
+                                   "dropped_cap", "no_structured_data"))
     rows, parse_error = [], ""
     for page in meta.get("pages") or []:
         path = page.get("file")
@@ -1207,16 +1491,12 @@ def cmd_extract(args):
             continue
         with open(path, "rb") as handle:
             text = handle.read(MAX_FETCH_BYTES).decode("utf-8", "replace")
-        if channel == "rss":
-            page_rows, parse_error = parse_rss(text)
-        elif channel == "sitemap":
-            page_rows, _children, parse_error = parse_sitemap(text)
-        elif channel == "json":
-            page_rows, parse_error = parse_json_api(text, source)
-        else:
-            page_rows, shape = parse_html(text, page.get("final_url") or page.get("url", ""))
-            if shape == "none":
-                counts["no_structured_data"] += 1
+        page_rows, shape, page_error = rows_for_channel(
+            channel, text, page.get("final_url") or page.get("url", ""), source)
+        if page_error and not parse_error:
+            parse_error = page_error
+        if channel == "html" and shape == "none":
+            counts["no_structured_data"] += 1
         rows.extend(page_rows)
     counts["parsed"] = len(rows)
 
@@ -1245,6 +1525,7 @@ def cmd_extract(args):
             continue
         posted = str(row.get("posted") or "")
         if floor and _ISO.match(posted) and posted < floor:
+            counts["stale"] += 1      # older than the cursor: healthy, not missing
             continue
         record = build_record(source, row, channel)
         if record is None:
@@ -1280,16 +1561,61 @@ def cmd_extract(args):
         entry["cursor"] = newest
     save_state(args.state, state)
 
-    classification = "OK" if counts["new"] else (meta.get("status") or "BLOCKED-UNKNOWN")
-    for page in meta.get("pages") or []:
-        if page.get("classification") in BLOCK_FAMILY:
-            classification = page["classification"]
+    classification = extract_status(meta, counts)
     emit({"slug": args.slug, "lane": source.get("lane", ""), "counts": counts,
           "records_written": len(records), "candidates_file": args.out,
           "cursor": entry.get("cursor", ""), "parse_error": parse_error[:200],
+          "channel": channel, "fetch_status": fetch_status(meta),
+          "source_status": entry.get("status", ""),
+          # A sitemap says where the listings are, not what they say: these rows
+          # carry a URL and a date, and no detail page is fetched to fill in a
+          # title, a price or a location.
+          "record_shape": "discovery-only" if channel == "sitemap" else "full",
           "status": classification,
-          "report_as": report_as(classification if counts["new"] == 0 else "OK",
-                                 counts["new"])})
+          "report_as": extract_report_as(classification, counts)})
+
+
+def fetch_status(meta):
+    """What the fetch decided, or the best reconstruction of it.
+
+    The fallback matters: a metadata file written by an older build has no
+    status, and guessing "blocked" there is exactly the lie this pipeline is
+    built to avoid. An unknown status is SOURCE-UNCHECKED, which is transient.
+    """
+    status = str(meta.get("status") or "").strip()
+    if status:
+        return status
+    for page in reversed(meta.get("pages") or []):
+        if page.get("classification"):
+            return str(page["classification"])
+    return "SOURCE-UNCHECKED"
+
+
+def extract_status(meta, counts):
+    """Carry the fetch's status forward; a block on any page still wins."""
+    status = fetch_status(meta)
+    for page in meta.get("pages") or []:
+        if page.get("classification") in BLOCK_FAMILY:
+            return str(page["classification"])
+    if status in BLOCK_FAMILY or status in TRANSIENT_FAMILY or status == "NOT-MODIFIED":
+        return status
+    return "OK" if counts.get("new") else status
+
+
+def extract_report_as(classification, counts):
+    """What the person is told. Only a real zero may be reported as a zero."""
+    if classification in BLOCK_FAMILY or classification in TRANSIENT_FAMILY:
+        return "source_unchecked"
+    if counts.get("new"):
+        return "ok"
+    if classification in HEALTHY_ZERO:
+        return "nothing_new"
+    if classification == "OK" and (counts.get("duplicate") or counts.get("stale")
+                                   or counts.get("gone")):
+        # The page came back healthy and every row on it was already seen, older
+        # than the cursor, or confirmed delisted. That is a genuine "nothing new".
+        return "nothing_new"
+    return "source_unchecked"
 
 
 def _epoch(value):
@@ -1308,22 +1634,34 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="sources.py",
         description="Fetch listing sources and extract bounded records. No key, no model.",
-        epilog=("The User-Agent is honest and fixed; there is no impersonation flag and no "
-                "challenge-bypass path, by design. Only hosts named in sources.json are "
-                "fetched. EMPTY-GENUINE is the only zero reported as 'nothing new'. "
-                "Exit codes are documented at the top of this file."))
+        epilog=("Requests present this machine's browser identity by default; --ua crawler "
+                "sends the self-identified HomingAgent token instead, and robots.txt is "
+                "evaluated against whichever group matches the identity actually sent. "
+                "There is no CAPTCHA-solving, proxy-rotation, fingerprint-evasion or "
+                "cookie-replay path anywhere in this file. Only hosts named in sources.json "
+                "are fetched. EMPTY-GENUINE is the only zero reported as 'nothing new'; a "
+                "transient failure reports as unchecked and cools down rather than retiring "
+                "a source. The sitemap channel is discovery-only - URLs and dates, no detail "
+                "pages. Exit codes are documented at the top of this file."))
     subparsers = parser.add_subparsers(dest="command")
 
-    probe = subparsers.add_parser("probe", help="classify one source's reachability")
+    probe = subparsers.add_parser(
+        "probe", help="classify one source's reachability",
+        description="Classify one source: robots posture, reachability, and how many "
+                    "records the configured channel actually yields.")
     probe.add_argument("--url", required=True)
     probe.add_argument("--slug", required=True)
-    probe.add_argument("--channel", default="", choices=("",) + CHANNELS)
+    probe.add_argument("--channel", default="", choices=("",) + CHANNELS,
+                       help="how to parse the body (default: this slug's channel in "
+                            "--sources, else html)")
     probe.add_argument("--sources", default="")
     probe.add_argument("--install-probe", action="store_true",
                        help="allow a host that is not yet in sources.json (installer only)")
     probe.add_argument("--egress-class", default=os.environ.get("HOMING_EGRESS_CLASS", "unknown"))
     probe.add_argument("--ua", default="browser", choices=("browser", "crawler"),
                        help="which client identity to present (default: browser)")
+    probe.add_argument("--samples", type=int, default=0, metavar="N",
+                       help="include up to N (max 3) cleaned sample records in the output")
 
     cal = subparsers.add_parser("calibrate",
                                 help="record the populated-vs-empty fingerprint for a source")
@@ -1340,16 +1678,23 @@ def build_parser():
     fetch.add_argument("--out-dir", required=True)
     fetch.add_argument("--egress-class", default=os.environ.get("HOMING_EGRESS_CLASS", "unknown"))
 
-    extract = subparsers.add_parser("extract",
-                                    help="turn fetched pages into bounded candidate records")
+    extract = subparsers.add_parser(
+        "extract", help="turn fetched pages into bounded candidate records",
+        description="Turn fetched pages into bounded candidate records, carrying the "
+                    "fetch's status forward. A sitemap source is discovery-only: its "
+                    "records carry a URL and a date, never a title, price or location, "
+                    "because no detail page is fetched.")
     extract.add_argument("--slug", required=True)
     extract.add_argument("--sources", required=True)
     extract.add_argument("--state", default=os.environ.get("HOMING_SOURCES_STATE", ""))
     extract.add_argument("--in-dir", required=True)
     extract.add_argument("--out", required=True, help="candidates.jsonl to append to")
     extract.add_argument("--max-records", type=int, default=MAX_RECORDS)
-    extract.add_argument("--revalidate", dest="revalidate", action="store_true", default=True)
-    extract.add_argument("--no-revalidate", dest="revalidate", action="store_false")
+    extract.add_argument("--revalidate", dest="revalidate", action="store_true", default=True,
+                         help="check each listing is still live (default); requires the "
+                              "source to define listing_url_pattern")
+    extract.add_argument("--no-revalidate", dest="revalidate", action="store_false",
+                         help="write records without checking they are still live")
     return parser
 
 
