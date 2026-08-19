@@ -838,9 +838,10 @@ def read_stored_token(manifest, allowed):
     if kind == "keychain":
         service = store.get("service") or "homing-api-token"
         account = store.get("account") or os.environ.get("USER") or ""
-        argv = ["/usr/bin/security", "find-generic-password", "-s", service, "-w"]
+        argv = ["/usr/bin/security", "find-generic-password", "-s", service]
         if account:
-            argv[3:3] = ["-a", account]
+            argv += ["-a", account]
+        argv += ["-w"]
         out, code = run_quiet(argv)
     elif kind in ("secret-tool", "libsecret"):
         out, code = run_quiet(["secret-tool", "lookup", "service",

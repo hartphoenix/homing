@@ -194,9 +194,10 @@ def _run_quiet(argv, timeout=20):
 def _token_from_keychain():
     service = os.environ.get("HOMING_KEYCHAIN_SERVICE", "homing-api-token")
     account = os.environ.get("HOMING_KEYCHAIN_ACCOUNT") or os.environ.get("USER") or ""
-    argv = ["/usr/bin/security", "find-generic-password", "-s", service, "-w"]
+    argv = ["/usr/bin/security", "find-generic-password", "-s", service]
     if account:
-        argv[3:3] = ["-a", account]
+        argv += ["-a", account]
+    argv += ["-w"]
     out, rc = _run_quiet(argv)
     if rc == 44:
         die(EXIT_CONFIG, "no key in the login keychain; run set-token.sh")
@@ -931,9 +932,10 @@ def _keychain_names():
 
 def _keychain_read(service, account):
     """Read the item back without dying. Returns the value or None."""
-    argv = ["/usr/bin/security", "find-generic-password", "-s", service, "-w"]
+    argv = ["/usr/bin/security", "find-generic-password", "-s", service]
     if account:
-        argv[3:3] = ["-a", account]
+        argv += ["-a", account]
+    argv += ["-w"]
     out, rc = _run_quiet(argv)
     if rc != 0 or not out:
         return None

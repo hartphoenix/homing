@@ -277,6 +277,7 @@ class AgentKitOriginResolutionTests(SimpleTestCase):
 # ---------------------------------------------------------------------------
 
 HOMING_PY = pathlib.Path(__file__).resolve().parent / "package" / "scripts" / "homing.py"
+SELFTEST_PY = pathlib.Path(__file__).resolve().parent / "package" / "scripts" / "selftest.py"
 PAIR_ORIGIN = "https://homing.example"
 
 
@@ -812,6 +813,44 @@ class KeychainWriteIsProvenNotAssumed(SimpleTestCase):
         self.homing._feed_quiet = lambda *a, **k: 0
         self.homing._keychain_read = lambda s, a: "the-key"
         self.assertEqual(self.homing._store_in_keychain("the-key"), 0)
+
+    def test_keychain_read_puts_the_account_after_the_service_value(self):
+        calls = []
+        self.homing._run_quiet = lambda argv: (calls.append(argv) or (b"the-key\n", 0))
+        self.assertEqual(self.homing._keychain_read("homing-api-token", "alice"), "the-key")
+        self.assertEqual(calls, [[
+            "/usr/bin/security", "find-generic-password",
+            "-s", "homing-api-token", "-a", "alice", "-w",
+        ]])
+
+    def test_runtime_keychain_read_uses_the_same_valid_argument_order(self):
+        calls = []
+        self.homing._run_quiet = lambda argv: (calls.append(argv) or (b"the-key\n", 0))
+        with mock.patch.dict(os.environ, {
+            "HOMING_KEYCHAIN_SERVICE": "homing-api-token",
+            "HOMING_KEYCHAIN_ACCOUNT": "alice",
+        }):
+            self.assertEqual(self.homing._token_from_keychain(), "the-key")
+        self.assertEqual(calls, [[
+            "/usr/bin/security", "find-generic-password",
+            "-s", "homing-api-token", "-a", "alice", "-w",
+        ]])
+
+    def test_selftest_keychain_read_uses_the_same_valid_argument_order(self):
+        spec = importlib.util.spec_from_file_location("selftest_under_test", SELFTEST_PY)
+        selftest = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(selftest)
+        calls = []
+        selftest.run_quiet = lambda argv, **kw: (calls.append(argv) or (b"the-key\n", 0))
+        manifest = {"secret_store": {
+            "kind": "keychain", "service": "homing-api-token", "account": "alice",
+        }}
+        token, error = selftest.read_stored_token(manifest, True)
+        self.assertEqual((token, error), ("the-key", ""))
+        self.assertEqual(calls, [[
+            "/usr/bin/security", "find-generic-password",
+            "-s", "homing-api-token", "-a", "alice", "-w",
+        ]])
 
     def test_exit_zero_is_not_enough(self):
         """The exact second failure: the helper succeeds, the item is absent."""
