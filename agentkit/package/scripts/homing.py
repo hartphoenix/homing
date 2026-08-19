@@ -93,6 +93,7 @@ EXIT_AUTH = 77
 EXIT_CONFIG = 78
 EXIT_STORE_PROMPTED = 79    # the store helper waited on a prompt
 EXIT_STORE_UNQUOTABLE = 80  # the key has characters the store cannot take
+EXIT_STORE_UNVERIFIED = 81  # written, but it did not read back
 
 LOG = logging.getLogger("homing")
 
@@ -908,37 +909,61 @@ def _feed_quiet(argv, text, timeout=30, new_session=False):
     return proc.returncode
 
 
-def _store_in_keychain(value):
-    """Write to the login keychain without the key touching argv or a tty.
-
-    `-w` with no value looks like the safe choice, but that is prompt mode and
-    `security` reads the prompt from /dev/tty, not stdin: piping the value in
-    never feeds it, so the call sits at "password data for new item:" until the
-    timeout. Measured on macOS, 2026-08-19.
-
-    `security -i` reads whole commands from stdin instead. The key travels down
-    the pipe, so `ps` never sees it and no terminal is involved. The key is
-    URL-safe base64, but quote it anyway and refuse anything that could break
-    the tokenizer rather than write a truncated secret.
-    """
+def _keychain_names():
     service = os.environ.get("HOMING_KEYCHAIN_SERVICE", "homing-api-token")
     account = os.environ.get("HOMING_KEYCHAIN_ACCOUNT") or os.environ.get("USER") or ""
-    if '"' in value or "\\" in value or any(ch.isspace() for ch in value):
-        return EXIT_STORE_UNQUOTABLE
-    command = ['add-generic-password', '-U', '-s', '"%s"' % service,
-               '-l', '"Homing API token"']
+    return service, account
+
+
+def _keychain_read(service, account):
+    """Read the item back without dying. Returns the value or None."""
+    argv = ["/usr/bin/security", "find-generic-password", "-s", service, "-w"]
     if account:
-        command += ['-a', '"%s"' % account]
-    command += ['-w', '"%s"' % value]
-    code = _feed_quiet(["/usr/bin/security", "-i"], " ".join(command) + "\n")
-    if code == 0:
+        argv[3:3] = ["-a", account]
+    out, rc = _run_quiet(argv)
+    if rc != 0 or not out:
+        return None
+    return out.decode("utf-8", "replace").strip("\r\n")
+
+
+def _store_in_keychain(value):
+    """Write to the login keychain, and prove it by reading the value back.
+
+    Two things went wrong on real hardware before this. `-w` with no value is
+    prompt mode and `security` reads that prompt from /dev/tty, not stdin, so a
+    piped key never reached it and the call timed out. Then `security -i` exited
+    0 without the item becoming findable -- a write that reports success it
+    cannot demonstrate is worse than one that fails loudly.
+
+    So: try each mechanism, and after each one read the item back and compare.
+    Nothing here returns 0 on an exit code alone.
+    """
+    service, account = _keychain_names()
+    if any(bad in value for bad in ('"', "\\")) or any(ch.isspace() for ch in value):
+        return EXIT_STORE_UNQUOTABLE
+    for field in (service, account):
+        if any(bad in field for bad in ('"', "\\")) or any(ch.isspace() for ch in field):
+            return EXIT_STORE_UNQUOTABLE
+
+    base = ["/usr/bin/security", "add-generic-password", "-U", "-s", service,
+            "-l", "Homing API token"] + (["-a", account] if account else [])
+    last = EXIT_STORE_PROMPTED
+
+    # 1. Prompt mode with no controlling terminal. Detached from /dev/tty,
+    #    readpassphrase has to fall back to stdin, which is our pipe.
+    last = _feed_quiet(base + ["-w"], "%s\n%s\n" % (value, value), new_session=True)
+    if _keychain_read(service, account) == value:
         return 0
-    # Older security builds without -i: fall back to prompt mode with no
-    # controlling terminal, so readpassphrase has to fall back to stdin.
-    return _feed_quiet(
-        ["/usr/bin/security", "add-generic-password", "-U", "-s", service,
-         "-l", "Homing API token"] + (["-a", account] if account else []) + ["-w"],
-        "%s\n%s\n" % (value, value), new_session=True)
+
+    # 2. Interactive command stream. Unquoted: `security -i` does not strip
+    #    shell quotes, so quoting the service name stores it with the quotes
+    #    still attached and nothing can find it afterwards.
+    command = " ".join(base[1:] + ["-w", value])
+    last = _feed_quiet(["/usr/bin/security", "-i"], command + "\n")
+    if _keychain_read(service, account) == value:
+        return 0
+
+    return last or EXIT_STORE_UNVERIFIED
 
 
 def _store_in_secret_tool(value):
@@ -1144,6 +1169,11 @@ def _pair_finish(args, response, result):
                 "If this is the macOS keychain, unlock it and run the connect helper again; "
                 "if this ran unattended, run the connect helper once by hand instead."
                 % store)
+        if status == EXIT_STORE_UNVERIFIED:
+            die(EXIT_CONFIG,
+                "the key was written to the %s store but could not be read back, so it "
+                "cannot be trusted. Re-run with HOMING_TOKEN_STORE=file and "
+                "HOMING_TOKEN_FILE=<path> to store it in a 0600 file instead." % store)
         if status == EXIT_STORE_UNQUOTABLE:
             die(EXIT_CONFIG,
                 "the key contains characters the %s store cannot accept safely. Use "
