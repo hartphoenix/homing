@@ -25,6 +25,8 @@ from accounts.models import AgentLink
 from projects.models import Project, ProjectMembership
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+with open(os.path.join(REPO, "agentkit", "package", "VERSION")) as _version_file:
+    PACKAGE_VERSION = int(_version_file.read().strip())
 
 
 def post_json(url, payload):
@@ -144,7 +146,9 @@ class ServedArtifactInstalls(LiveServerTestCase):
     def test_installer_accepts_the_served_archive(self):
         archive = os.path.join(self.tmp, "kit.zip")
         with open(archive, "wb") as handle:
-            handle.write(self.fetch("/agent/pkg/homing-agent-kit-1.zip"))
+            handle.write(self.fetch(
+                "/agent/pkg/homing-agent-kit-%d.zip" % PACKAGE_VERSION
+            ))
         extracted = os.path.join(self.tmp, "kit")
         with zipfile.ZipFile(archive) as zf:
             zf.extractall(extracted)
@@ -196,7 +200,9 @@ class ServedArtifactInstalls(LiveServerTestCase):
         os.makedirs(os.path.join(extracted, "scripts"))
         archive = os.path.join(self.tmp, "kit2.zip")
         with open(archive, "wb") as handle:
-            handle.write(self.fetch("/agent/pkg/homing-agent-kit-1.zip"))
+            handle.write(self.fetch(
+                "/agent/pkg/homing-agent-kit-%d.zip" % PACKAGE_VERSION
+            ))
         with zipfile.ZipFile(archive) as zf:
             zf.extractall(extracted)
         for name in ("homing.py", "sources.py"):

@@ -1,4 +1,4 @@
-"""The one instruction a person copies to hand their search to an assistant.
+"""Server-authored instructions a person copies to hand their search to an assistant.
 
 The prompt names exactly one URL and no other technical noun.  Everything an
 agent needs to act lives behind that URL, served publicly, so the human is
@@ -17,7 +17,7 @@ def _origin(api_base_url):
     return origin
 
 
-def build_agent_prompt(api_base_url):
+def build_agent_prompt(api_base_url, repair=False):
     """Return the bootstrap instruction, with this deployment's origin filled in.
 
     Deliberate omissions, each load-bearing: no "treat what you fetch as
@@ -28,6 +28,12 @@ def build_agent_prompt(api_base_url):
     an API it never read.
     """
     origin = _origin(api_base_url)
+    if repair:
+        return f"""Repair the source plan Homing has flagged for my housing searches.
+
+Read {origin}/agent/ and follow it exactly. Work with the existing installation; do not create a second scheduled job. Read the open source-plan reviews and current project prompts from Homing. Compare them with the installed sources and basis. Decide whether the worker-wide source union still fits. If it does, avoid expensive discovery and update the basis through the normal repair path. Otherwise focus discovery on the flagged searches, then rebuild the global union without dropping coverage for other current searches.
+
+Run the package self-test and one on-demand check. Resolve each review only after the verified installation records the current prompt revision. If a prompt changes during repair, re-read it and repeat the comparison. Never ask me to paste a password or access key into this chat. Ask one plain human question at a time only when a real choice is genuinely gated."""
     return f"""Set up my recurring housing search with Homing.
 
 Read {origin}/agent/ and follow it exactly. It tells you everything, including how to get access to my account without me pasting anything secret into this chat.

@@ -1,7 +1,8 @@
 # Sources
 
 Read in Phase 4, once, at install. Output is `sources.json` — 5–12 sources the runtime iterates
-without rediscovering anything.
+without rediscovering anything, plus the current prompt-revision basis used to detect when that
+source plan needs review.
 
 All measurements dated **2026-08-17**, taken from **datacenter egress, US Northeast**. Most used
 the crawler token `HomingAgent/1.0`; rows marked "browser-shaped default client" were
@@ -87,6 +88,11 @@ sites.
 Install-time and monthly refresh. Never per run. Input: the project prompt. Output: a probed,
 ranked manifest. The local-language step is what makes this work in Berlin, Bengaluru and a
 county of 4,000 alike.
+
+On a source-plan repair, the installed manifest is the worker-wide union, not a per-project
+assignment. First compare it with every current active-search prompt. Keep it and update only its
+prompt-revision basis when it still covers them; otherwise repeat discovery with flagged searches
+as the focus and merge the result without dropping coverage needed by the other searches.
 
 **Step 1 — resolve the locale.** Derive country, region, city, neighbourhood terms **and the
 local-language words for the property type**. A German search saying "apartment" finds nothing;
@@ -206,6 +212,11 @@ Anything absent gets the slug rule. Never invent a prettier name.
 ---
 
 ## 5. The per-source record
+
+At the top level, add `project_prompt_revisions`: an object mapping every active project UUID read
+fresh in Phase 3 to its non-negative integer `prompt_revision`. This is the source plan's review
+basis, not cached search criteria. Store no project prompt, criteria, name, or description in
+`sources.json`. On repair, refresh the entire mapping immediately before running the installer.
 
 One object per source in `sources.json`, which is also the runtime's **fetch host allowlist** —
 a host absent from it is never fetched.

@@ -23,6 +23,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
 from django.test import SimpleTestCase
 
@@ -273,6 +274,176 @@ class InvocationContractTests(InstallerCase):
         with self.assertRaises(install.Refuse):
             install.clean_invocation_argv({"invocation": "claude\t-p\nrm -rf /"})
 
+
+class SourcePlanBasisTests(InstallerCase):
+    """Prompt revisions round-trip without allowing prompt text into sources.json."""
+
+    def test_basis_round_trips_into_the_read_only_sources_document(self):
+        project_id = str(uuid.uuid4())
+        sources = json.loads(json.dumps(BASE_SOURCES))
+        sources["project_prompt_revisions"] = {project_id: 12}
+        plan, _manifest = self.apply(self.plan_config(sources=sources))
+        with open(os.path.join(plan.config_dir, "sources.json")) as handle:
+            installed = json.load(handle)
+        self.assertEqual(installed["project_prompt_revisions"], {project_id: 12})
+        self.assertNotIn('"prompt":', json.dumps(installed))
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(plan.config_dir, "sources.json")).st_mode),
+                         0o400)
+
+    def test_basis_rejects_uuid_revision_and_range_mistakes(self):
+        project_id = str(uuid.uuid4())
+        for key, revision in (
+                ("not-a-uuid", 1), (project_id, True), (project_id, 1.0),
+                (project_id, -1), (project_id, install.MAX_PROMPT_REVISION + 1)):
+            with self.subTest(key=key, revision=revision):
+                sources = json.loads(json.dumps(BASE_SOURCES))
+                sources["project_prompt_revisions"] = {key: revision}
+                with self.assertRaises(install.Refuse):
+                    install.Plan(self.plan_config(sources=sources))
+
+    def test_legacy_sources_without_a_basis_still_install(self):
+        plan, _manifest = self.apply(self.plan_config())
+        with open(os.path.join(plan.config_dir, "sources.json")) as handle:
+            self.assertNotIn("project_prompt_revisions", json.load(handle))
+
+    def test_file_replacement_failure_restores_the_previous_install(self):
+        plan, _manifest = self.apply(self.plan_config())
+        paths = [os.path.join(plan.config_dir, name)
+                 for name in ("config.json", "sources.json")]
+        before = {}
+        for path in paths:
+            with open(path, "rb") as handle:
+                before[path] = handle.read()
+        original = install.write_file
+
+        def fail_on_sources(path, text, mode):
+            if path == paths[1]:
+                raise RuntimeError("injected replacement failure")
+            return original(path, text, mode)
+
+        with mock.patch.object(install, "write_file", side_effect=fail_on_sources):
+            with self.assertRaises(RuntimeError):
+                install.apply_plan(install.Plan(self.plan_config()))
+        for path in paths:
+            with self.subTest(path=path):
+                with open(path, "rb") as handle:
+                    self.assertEqual(handle.read(), before[path])
+        self.assertEqual([name for name in os.listdir(plan.config_dir)
+                          if name.startswith(".homing-")], [])
+
+
+class RepairInstallerTests(InstallerCase):
+    """Repair is a projection of the installed record, never a new guessed plan."""
+
+    def test_repair_preserves_installed_decisions_and_state(self):
+        project_id = str(uuid.uuid4())
+        sources = json.loads(json.dumps(BASE_SOURCES))
+        sources["project_prompt_revisions"] = {project_id: 4}
+        config = self.plan_config(
+            sources=sources,
+            worker={"role": "local", "machine_slug": "kept-box", "label": "homing/kept"},
+            runtime={"kind": "none", "invocation_argv": []},
+            limits={"max_projects": 1, "writes_per_run": 17},
+            notes={"egress_class": "datacenter"},
+            paths={"extra_skill_dirs": [self.path("other-skills")]},
+        )
+        plan, manifest = self.apply(config)
+        state_path = os.path.join(plan.state_dir, "state.json")
+        with open(state_path, "rb") as handle:
+            state_before = handle.read()
+        replacement = self.path("replacement-sources.json")
+        updated = json.loads(json.dumps(sources))
+        updated["project_prompt_revisions"][project_id] = 5
+        with open(replacement, "w") as handle:
+            json.dump(updated, handle)
+
+        repaired = install.repair_plan(
+            os.path.join(plan.state_dir, "install-manifest.json"), replacement)
+        self.assertEqual(repaired.config_dir, plan.config_dir)
+        self.assertEqual(repaired.state_dir, plan.state_dir)
+        self.assertEqual(repaired.identifier, plan.identifier)
+        self.assertEqual(repaired.cadence_minutes, plan.cadence_minutes)
+        self.assertEqual(repaired.invocation_argv, plan.invocation_argv)
+        self.assertEqual(repaired.isolation_rung, plan.isolation_rung)
+        self.assertEqual(repaired.lanes, plan.lanes)
+        self.assertEqual(repaired.egress_class, plan.egress_class)
+        self.assertEqual(repaired.limits, plan.limits)
+        self.assertEqual(repaired.package_version, install.read_package_version())
+        install.apply_plan(repaired)
+        with open(state_path, "rb") as handle:
+            self.assertEqual(handle.read(), state_before)
+        with open(os.path.join(plan.config_dir, "sources.json")) as handle:
+            self.assertEqual(json.load(handle)["project_prompt_revisions"][project_id], 5)
+
+    def test_basis_only_repair_updates_revisions_without_rewriting_sources(self):
+        project_id = str(uuid.uuid4())
+        sources = json.loads(json.dumps(BASE_SOURCES))
+        sources["project_prompt_revisions"] = {project_id: 4}
+        plan, _manifest = self.apply(self.plan_config(sources=sources))
+        basis_path = self.path("basis.json")
+        with open(basis_path, "w") as handle:
+            json.dump({"project_prompt_revisions": {project_id: 5}}, handle)
+
+        repaired = install.repair_plan(
+            os.path.join(plan.state_dir, "install-manifest.json"), basis_path=basis_path)
+        self.assertEqual(repaired.sources["sources"], sources["sources"])
+        self.assertEqual(repaired.sources["project_prompt_revisions"], {project_id: 5})
+
+        with open(basis_path, "w") as handle:
+            json.dump({"project_prompt_revisions": {project_id: 5}, "reason": "moving"}, handle)
+        with self.assertRaises(install.Refuse):
+            install.repair_plan(
+                os.path.join(plan.state_dir, "install-manifest.json"), basis_path=basis_path)
+
+    def test_repair_rejects_origin_and_manifest_config_mismatches(self):
+        plan, manifest = self.apply(self.plan_config())
+        manifest_path = os.path.join(plan.state_dir, "install-manifest.json")
+        with open(os.path.join(plan.config_dir, "config.json")) as handle:
+            config = json.load(handle)
+        config["api_base_url"] = "https://other.example/api/v1"
+        os.chmod(os.path.join(plan.config_dir, "config.json"), 0o600)
+        with open(os.path.join(plan.config_dir, "config.json"), "w") as handle:
+            json.dump(config, handle)
+        with self.assertRaises(install.Refuse):
+            install.repair_plan(manifest_path)
+
+        # Restore the config, then make the manifest disagree with its installed
+        # config. Repair must stop before constructing any plan.
+        config["api_base_url"] = "http://127.0.0.1:8099/api/v1"
+        os.chmod(os.path.join(plan.config_dir, "config.json"), 0o600)
+        with open(os.path.join(plan.config_dir, "config.json"), "w") as handle:
+            json.dump(config, handle)
+        manifest["package_version"] = manifest["package_version"] + 1
+        with open(manifest_path, "w") as handle:
+            json.dump(manifest, handle)
+        with self.assertRaises(install.Refuse):
+            install.repair_plan(manifest_path)
+
+    def test_repair_keeps_unrelated_extra_skill_files(self):
+        extra = self.path("other-skills")
+        config = self.plan_config(paths={"extra_skill_dirs": [extra]})
+        plan, _manifest = self.apply(config)
+        unrelated = os.path.join(extra, "homing-check", "unrelated.txt")
+        with open(unrelated, "w") as handle:
+            handle.write("keep me")
+        repaired = install.repair_plan(os.path.join(plan.state_dir, "install-manifest.json"))
+        install.apply_plan(repaired)
+        with open(unrelated) as handle:
+            self.assertEqual(handle.read(), "keep me")
+
+    def test_repair_does_not_restart_or_reenable_the_existing_scheduler(self):
+        config = self.plan_config(
+            scheduler={"kind": "systemd-user", "identifier": "homing-test"},
+            paths={"config": self.path("cfg-sched"), "state": self.path("state-sched"),
+                   "logs": self.path("logs-sched"), "skill": self.path("skills-sched"),
+                   "scheduler": self.path("sched-sched")},
+        )
+        with mock.patch.object(install, "run_command", return_value=0):
+            plan, _manifest = self.apply(config)
+        manifest_path = os.path.join(plan.state_dir, "install-manifest.json")
+        with mock.patch.object(install, "run_command") as run:
+            install.apply_plan(install.repair_plan(manifest_path))
+        run.assert_not_called()
 
 # --- quoting, proven by running a shell ---------------------------------------------
 
@@ -858,7 +1029,8 @@ class CycleContractTests(InstallerCase):
             if command == "projects":
                 body = {"projects": [{"id": self.project_id}], "paused": False}
             elif command == "project":
-                body = {"project": {"name": "Test", "prompt": "a place",
+                body = {"project": {"name": "Test",
+                                    "prompt": getattr(self, "project_prompt", "a place"),
                                     "prompt_revision": 1}}
             elif command == "run-create":
                 body = {"run_id": self.run_id}
@@ -905,6 +1077,21 @@ class CycleContractTests(InstallerCase):
                     parsers[script].parse_args(argv[2:])
                 except SystemExit as exc:
                     self.fail("%s rejected %r (exit %s)" % (script, argv[2:], exc.code))
+
+    def test_read_preserves_the_full_project_prompt_for_the_judge(self):
+        self.project_prompt = "specific housing criterion " * 200
+        ctx = self.cycle.Ctx(self.config_path)
+        original = self.cycle.subprocess.run
+        self.cycle.subprocess.run = self.recorder
+        try:
+            self.assertEqual(self.cycle.phase_read(ctx), 0)
+        finally:
+            self.cycle.subprocess.run = original
+
+        plan = ctx.read_json(ctx.path("plan.json"), {})
+        self.assertEqual(plan["projects"][0]["prompt"], self.project_prompt)
+        with open(ctx.path("prompt.txt")) as handle:
+            self.assertIn(self.project_prompt, handle.read())
 
     def test_the_source_calls_use_the_flags_sources_py_actually_has(self):
         self.run_all_phases()
@@ -971,6 +1158,130 @@ class CycleContractTests(InstallerCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(code, self.cycle.LOCAL)
         self.assertIn("request budget", err)
+
+
+class SourceReviewRuntimeTests(InstallerCase):
+    """Report prompt drift before the first source-fetching phase."""
+
+    def setUp(self):
+        super().setUp()
+        self.cycle = load_generated_cycle("homing_cycle_source_review_test")
+        self.addCleanup(os.unlink, self.cycle.__source_path__)
+        project_id = str(uuid.uuid4())
+        sources = json.loads(json.dumps(BASE_SOURCES))
+        sources["project_prompt_revisions"] = {project_id: 1}
+        self.plan, _manifest = self.apply(self.plan_config(sources=sources))
+        self.project_id = project_id
+        self.ctx = self.cycle.Ctx(os.path.join(self.plan.config_dir, "config.json"))
+
+    def fake_read(self, calls, report_code=0):
+        def call(ctx, script, *args):
+            calls.append((script, args))
+            command = args[0] if args else ""
+            if command == "projects":
+                return 0, {"projects": [{"id": self.project_id}]}, ""
+            if command == "project":
+                return 0, {"project": {"name": "Test", "prompt": "a place",
+                                        "prompt_revision": 2}}, ""
+            if command == "source-plan-review":
+                return report_code, None, "401 from Homing" if report_code else ""
+            if command == "changes":
+                return 0, {"items": []}, ""
+            return 0, {}, ""
+        return call
+
+    def test_a_stale_install_reports_every_run_without_mutating_project_state(self):
+        state_path = os.path.join(self.plan.state_dir, "state.json")
+        with open(state_path) as handle:
+            state = json.load(handle)
+        state["projects"] = {self.project_id: {"last_run_at": "old"}}
+        self.ctx.write_json(state_path, state)
+        calls = []
+        self.cycle.call = self.fake_read(calls)
+        self.assertEqual(self.cycle.phase_read(self.ctx), self.cycle.OK)
+        names = [args[0] for _script, args in calls]
+        self.assertLess(names.index("source-plan-review"), names.index("changes"))
+        with open(state_path) as handle:
+            saved = json.load(handle)["projects"][self.project_id]
+        self.assertEqual(saved["last_run_at"], "old")
+        self.assertNotIn("last_reported_prompt_revision", saved)
+
+        calls[:] = []
+        self.assertEqual(self.cycle.phase_read(self.ctx), self.cycle.OK)
+        self.assertIn("source-plan-review", [args[0] for _script, args in calls])
+
+    def test_project_removed_from_the_active_set_opens_a_review_on_a_remaining_project(self):
+        removed = str(uuid.uuid4())
+        sources_path = os.path.join(self.plan.config_dir, "sources.json")
+        with open(sources_path) as handle:
+            sources = json.load(handle)
+        sources["project_prompt_revisions"][self.project_id] = 2
+        sources["project_prompt_revisions"][removed] = 9
+        self.ctx.write_json(sources_path, sources)
+        self.ctx.prompt_basis = self.ctx._read_prompt_basis()
+
+        calls = []
+        self.cycle.call = self.fake_read(calls)
+        self.assertEqual(self.cycle.phase_read(self.ctx), self.cycle.OK)
+        reports = [args for _script, args in calls if args and args[0] == "source-plan-review"]
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0][2], self.project_id)
+        self.assertEqual(reports[0][4], "2")
+
+    def test_report_failure_stops_before_change_feed_or_source_fetch(self):
+        calls = []
+        self.cycle.call = self.fake_read(calls, report_code=self.cycle.AUTH)
+        self.assertEqual(self.cycle.phase_read(self.ctx), self.cycle.AUTH)
+        names = [args[0] for _script, args in calls]
+        self.assertNotIn("changes", names)
+        self.assertFalse(os.path.exists(os.path.join(self.plan.state_dir, "plan.json")))
+
+    def test_project_missing_from_an_existing_basis_is_reported(self):
+        sources_path = os.path.join(self.plan.config_dir, "sources.json")
+        with open(sources_path) as handle:
+            sources = json.load(handle)
+        sources["project_prompt_revisions"] = {}
+        self.ctx.write_json(sources_path, sources)
+        self.ctx.prompt_basis = self.ctx._read_prompt_basis()
+
+        calls = []
+        self.cycle.call = self.fake_read(calls)
+        self.assertEqual(self.cycle.phase_read(self.ctx), self.cycle.OK)
+        self.assertIn("source-plan-review", [args[0] for _script, args in calls])
+
+    def test_source_review_scans_active_projects_before_max_projects(self):
+        second = str(uuid.uuid4())
+        sources_path = os.path.join(self.plan.config_dir, "sources.json")
+        with open(sources_path) as handle:
+            sources = json.load(handle)
+        sources["project_prompt_revisions"][second] = 1
+        self.ctx.write_json(sources_path, sources)
+        config_path = os.path.join(self.plan.config_dir, "config.json")
+        with open(config_path) as handle:
+            config = json.load(handle)
+        config["limits"]["max_projects"] = 1
+        self.ctx.write_json(config_path, config)
+        ctx = self.cycle.Ctx(config_path)
+        calls = []
+
+        def call(_ctx, script, *args):
+            calls.append((script, args))
+            command = args[0] if args else ""
+            if command == "projects":
+                return 0, {"projects": [{"id": self.project_id}, {"id": second}]}, ""
+            if command == "project":
+                return 0, {"project": {"name": "Test", "prompt": "a place",
+                                        "prompt_revision": 2}}, ""
+            if command in ("source-plan-review", "changes"):
+                return 0, {"items": []}, ""
+            return 0, {}, ""
+
+        self.cycle.call = call
+        self.assertEqual(self.cycle.phase_read(ctx), self.cycle.OK)
+        reviews = [args[2] for _script, args in calls if args and args[0] == "source-plan-review"]
+        self.assertEqual(set(reviews), {self.project_id, second})
+        changes = [args[2] for _script, args in calls if args and args[0] == "changes"]
+        self.assertEqual(changes, [self.project_id])
 
 
 class CompletionAcknowledgementTests(InstallerCase):
@@ -1181,6 +1492,46 @@ class InstallerCliTests(InstallerCase):
         # The canary proves the uninstall's own shell-free removal touched nothing else.
         self.assert_canary_clean()
 
+    def test_repair_cli_dry_run_uses_the_existing_manifest(self):
+        config_path = self.path("plan.json")
+        with open(config_path, "w") as handle:
+            json.dump(self.plan_config(python=sys.executable), handle)
+        result = self.run_installer("--config", config_path)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        manifest_path = os.path.join(self.path("state"), "install-manifest.json")
+        result = self.run_installer("--repair", "--manifest", manifest_path, "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(b"Nothing was created", result.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(self.path("state"), "state.json")))
+
+    def test_repair_cli_can_update_only_the_basis_and_does_not_request_pairing(self):
+        config_path = self.path("plan.json")
+        with open(config_path, "w") as handle:
+            json.dump(self.plan_config(python=sys.executable), handle)
+        result = self.run_installer("--config", config_path)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        manifest_path = os.path.join(self.path("state"), "install-manifest.json")
+        project_id = str(uuid.uuid4())
+        basis_path = self.path("basis.json")
+        with open(basis_path, "w") as handle:
+            json.dump({"project_prompt_revisions": {project_id: 7}}, handle)
+
+        result = self.run_installer(
+            "--repair", "--manifest", manifest_path, "--basis", basis_path)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(b"Repaired the existing Homing installation in place", result.stdout)
+        self.assertNotIn(b"approve the connection", result.stdout)
+        with open(os.path.join(self.path("cfg"), "sources.json")) as handle:
+            self.assertEqual(json.load(handle)["project_prompt_revisions"], {project_id: 7})
+
+    def test_repair_cli_requires_a_manifest_not_a_new_config(self):
+        config_path = self.path("plan.json")
+        with open(config_path, "w") as handle:
+            json.dump(self.plan_config(python=sys.executable), handle)
+        result = self.run_installer("--repair", "--config", config_path, "--dry-run")
+        self.assertEqual(result.returncode, install.EXIT_USAGE)
+        self.assert_canary_clean()
+
     def test_a_hostile_plan_exits_with_the_config_code_and_writes_nothing(self):
         config = self.plan_config(
             scheduler={"kind": "systemd-user"}, isolation_rung=3,
@@ -1229,6 +1580,18 @@ class SelftestFalsePositives(SimpleTestCase):
         line = 'SKILLS=/Users/someone/.claude/skills/homing-check'
         cleaned = self.selftest.without_paths(self.selftest.strip_comment(line))
         self.assertIsNone(self.selftest.MODEL_INVOCATION.search(cleaned))
+
+    def test_legacy_sources_report_source_review_tracking_unavailable(self):
+        root = tempfile.mkdtemp(prefix="homing-selftest-basis-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        os.makedirs(os.path.join(root, "config"))
+        with open(os.path.join(root, "config", "sources.json"), "w") as handle:
+            json.dump(BASE_SOURCES, handle)
+        report = self.selftest.Report()
+        self.selftest.check_source_review_tracking(report, {"config": os.path.join(root, "config")})
+        self.assertEqual(report.checks[-1]["id"], "source-review-tracking")
+        self.assertEqual(report.checks[-1]["status"], self.selftest.SKIP)
+        self.assertIn("unavailable", report.checks[-1]["summary"])
 
     def test_a_real_model_invocation_is_still_caught(self):
         line = 'run_bounded 180 claude -p --permission-mode dontAsk'

@@ -13,6 +13,12 @@
     <nav aria-label="Account"><a href="{% url 'tracker:agent-setup' %}">Equip an agent</a><a href="{% url 'tracker:profile' %}">{{ request.user.display_name|default:request.user.email }}</a><form method="post" action="{% url 'logout' %}" class="inline-form">{% csrf_token %}<button class="link-button">Sign out</button></form></nav>
     {% endif %}
   </div></header>
+  {% if request.user.is_authenticated and source_plan_review_count %}
+  <aside class="source-plan-banner shell" aria-label="Source plan review">
+    <p><strong>Your installed source plan needs review</strong> for {{ source_plan_review_count }} active search{{ source_plan_review_count|pluralize }}.</p>
+    <a class="button button-primary" href="{% url 'tracker:agent-setup' %}">Review with your assistant</a>
+  </aside>
+  {% endif %}
   <main id="main" class="shell">{% include 'tracker/_messages.html' %}{% block content %}{% endblock %}</main>
   <script src="{% static 'js/app.js' %}" defer></script>{% block scripts %}{% endblock %}
 </body></html>

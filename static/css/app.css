@@ -30,6 +30,9 @@ a:hover { color: var(--green-dark); }
 .link-button { padding: 0; border: 0; color: var(--green); background: none; font: inherit; text-decoration: underline; cursor: pointer; }
 .skip-link { position: absolute; left: -10000px; }
 .skip-link:focus { left: 1rem; top: 1rem; z-index: 10; padding: .55rem .75rem; background: var(--card); }
+.source-plan-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding: 12px 16px; color: #614a14; border: 1px solid #d2b05f; border-radius: 9px; background: var(--amber-soft); }
+.source-plan-banner p { margin: 0; }
+.source-plan-banner .button { flex: 0 0 auto; }
 
 .project-nav { display: flex; align-items: center; gap: 19px; overflow-x: auto; padding: 18px 0; border-bottom: 1px solid var(--line); font-size: .88rem; }
 .project-nav .project-name { margin-right: auto; color: var(--ink); font-weight: 800; text-decoration: none; white-space: nowrap; }
@@ -187,6 +190,9 @@ p { margin: .5rem 0 1rem; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 
 .agent-heading .muted { max-width: 720px; }
+.source-review-panel { margin: 0 0 16px; border-color: #d2b05f; background: var(--amber-soft); }
+.source-review-panel h2 { font-size: 1.55rem; }
+.source-review-panel .prompt-preview { border-color: rgba(138, 84, 0, .25); }
 .setup-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
 .setup-step { position: relative; padding: 26px; }
 .setup-step h2 { padding-right: 42px; font-size: 1.55rem; }
@@ -244,6 +250,7 @@ p { margin: .5rem 0 1rem; }
   .header-inner { align-items: flex-start; padding: 12px 0; }
   .site-header nav { justify-content: flex-end; flex-wrap: wrap; row-gap: 7px; }
   .site-header nav a { max-width: 120px; }
+  .source-plan-banner { align-items: flex-start; flex-direction: column; }
 }
 
 @media (prefers-reduced-motion: reduce) {
